@@ -10,7 +10,9 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const QRCode = require('qrcode');
 const qrcodeTerminal = require('qrcode-terminal');
-const { Client, LocalAuth } = require('whatsapp-web.js');
+
+const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+
 
 /* ===== env ===== */
 const PORT = process.env.PORT || 3000;
@@ -74,7 +76,9 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(
   express.json({
-    limit: '256kb',
+
+    limit: '2mb',
+
     verify: (req, _res, buf) => {
       req.rawBody = buf.toString('utf8');
     },
@@ -188,6 +192,31 @@ function toggleNineBR(e164) {
 function requestId() {
   return (crypto.randomUUID && crypto.randomUUID()) || crypto.randomBytes(16).toString('hex');
 }
+
+
+function sanitizeBase64(input) {
+  return String(input || '').replace(/\r?\n|\s/g, '');
+}
+
+function parseMediaPayload(media) {
+  if (!media || typeof media !== 'object') {
+    return { error: 'media payload is required' };
+  }
+  const mimetype = String(media.mimetype || '').trim();
+  const filename = media.filename ? String(media.filename).trim() : undefined;
+  if (!mimetype) return { error: 'media.mimetype is required' };
+  if (!media.data) return { error: 'media.data is required' };
+  const base64 = sanitizeBase64(media.data);
+  if (!base64) return { error: 'media.data is empty' };
+  try {
+    // Validate base64 by decoding; Buffer throws on invalid length/characters.
+    Buffer.from(base64, 'base64');
+  } catch (error) {
+    return { error: `invalid base64 media data: ${error.message}` };
+  }
+  return { media: new MessageMedia(mimetype, base64, filename) };
+}
+
 
 /* ===== whatsapp client ===== */
 log('Iniciando cliente WhatsApp...');
@@ -337,6 +366,63 @@ app.post('/send', auth, async (req, res) => {
     return res.status(500).json({ ok: false, error: String(error), requestId: rid });
   }
 });
+
+
+app.post('/send-media', auth, async (req, res) => {
+  const rid = requestId();
+  if (!verifySignedRequest(req, '/send-media')) {
+    warn(`[MEDIA][${rid}] 403 invalid signature /send-media`);
+    return res.status(403).json({ ok: false, error: 'invalid signature', requestId: rid });
+  }
+  if (!isReady)
+    return res.status(503).json({ ok: false, error: 'whatsapp not ready', requestId: rid });
+
+  const { phone, caption, media } = req.body || {};
+  if (!phone || !media) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'phone and media are required', requestId: rid });
+  }
+  const rawPhone = String(phone);
+  const normalized = normalizeBR(rawPhone);
+  log(
+    `[MEDIA][${rid}] POST recebido | ip=${ip(req)} | raw_phone=${rawPhone} | normalized=${normalized}`,
+  );
+
+  const parsed = parseMediaPayload(media);
+  if (parsed.error) {
+    warn(`[MEDIA][${rid}] payload inválido: ${parsed.error}`);
+    return res.status(400).json({ ok: false, error: parsed.error, requestId: rid });
+  }
+
+  try {
+    const { id: numberId, tried } = await resolveWhatsAppNumber(client, normalized);
+    if (!numberId) {
+      warn(`[MEDIA][${rid}] Número não está no WhatsApp | tried=${tried.join(',')}`);
+      return res
+        .status(404)
+        .json({ ok: false, error: 'not_on_whatsapp', requestId: rid, tried });
+    }
+    const to = numberId._serialized;
+    const options = caption ? { caption: String(caption) } : undefined;
+    const response = await client.sendMessage(to, parsed.media, options);
+    log(
+      `[MEDIA OK][${rid}] to=${to} id=${response.id?._serialized || 'n/a'} tried=${tried.join(',')}`,
+    );
+    return res.json({
+      ok: true,
+      requestId: rid,
+      to,
+      msgId: response.id?._serialized || null,
+      normalized,
+      tried,
+    });
+  } catch (error) {
+    err(`[MEDIA][${rid}] ERRO`, error);
+    return res.status(500).json({ ok: false, error: String(error), requestId: rid });
+  }
+});
+
 
 app.listen(PORT, () => {
   log(`🚀 API ouvindo em ${PORT}`);
