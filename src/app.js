@@ -10,7 +10,9 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const QRCode = require('qrcode');
 const qrcodeTerminal = require('qrcode-terminal');
+
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
+
 
 /* ===== env ===== */
 const PORT = process.env.PORT || 3000;
@@ -74,7 +76,9 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(
   express.json({
+
     limit: '2mb',
+
     verify: (req, _res, buf) => {
       req.rawBody = buf.toString('utf8');
     },
@@ -189,6 +193,7 @@ function requestId() {
   return (crypto.randomUUID && crypto.randomUUID()) || crypto.randomBytes(16).toString('hex');
 }
 
+
 function sanitizeBase64(input) {
   return String(input || '').replace(/\r?\n|\s/g, '');
 }
@@ -211,6 +216,7 @@ function parseMediaPayload(media) {
   }
   return { media: new MessageMedia(mimetype, base64, filename) };
 }
+
 
 /* ===== whatsapp client ===== */
 log('Iniciando cliente WhatsApp...');
@@ -361,6 +367,7 @@ app.post('/send', auth, async (req, res) => {
   }
 });
 
+
 app.post('/send-media', auth, async (req, res) => {
   const rid = requestId();
   if (!verifySignedRequest(req, '/send-media')) {
@@ -415,6 +422,7 @@ app.post('/send-media', auth, async (req, res) => {
     return res.status(500).json({ ok: false, error: String(error), requestId: rid });
   }
 });
+
 
 app.listen(PORT, () => {
   log(`🚀 API ouvindo em ${PORT}`);
