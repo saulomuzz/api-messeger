@@ -1,0 +1,9 @@
+# Arquivo de números para receber snapshots da câmera
+# Formato: um número por linha (com ou sem +55)
+# Copie este arquivo para numbers.txt e adicione os números reais
+# 
+# Exemplos:
+# +5511999999999
+# 11999999999
+# 5511999999999
+
