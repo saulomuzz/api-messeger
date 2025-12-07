@@ -6,6 +6,8 @@ API REST para integração com o WhatsApp utilizando [whatsapp-web.js](https://g
 
 - ✅ Envio de mensagens de texto via WhatsApp
 - ✅ Envio de snapshots de câmera IP (via ESP32)
+- ✅ **Otimização automática de imagens** (compressão e redimensionamento)
+- ✅ **Envio paralelo** para múltiplos números (mais rápido)
 - ✅ Autenticação por token e whitelist de IPs
 - ✅ Suporte a autenticação Basic e Digest HTTP para câmeras
 - ✅ Validação de autorização ESP32
@@ -16,6 +18,7 @@ API REST para integração com o WhatsApp utilizando [whatsapp-web.js](https://g
 - Node.js 18 ou superior
 - Navegador Chromium (fornecido automaticamente pelo `whatsapp-web.js`)
 - Acesso a uma câmera IP (opcional, para funcionalidade de snapshot)
+- **Sharp** (biblioteca para otimização de imagens - instalada automaticamente via `npm install`)
 
 ## Configuração Rápida
 
@@ -67,6 +70,12 @@ DEBUG=false
 CAMERA_SNAPSHOT_URL=http://10.10.0.240/cgi-bin/snapshot.cgi?channel=1
 CAMERA_USER=admin
 CAMERA_PASS=senha
+
+# Otimização de Imagem (opcional)
+MAX_IMAGE_SIZE_KB=500        # Tamanho máximo antes de comprimir (padrão: 500KB)
+MAX_IMAGE_WIDTH=1920         # Largura máxima (padrão: 1920px)
+MAX_IMAGE_HEIGHT=1080        # Altura máxima (padrão: 1080px)
+JPEG_QUALITY=85              # Qualidade JPEG 1-100 (padrão: 85)
 
 # Segurança ESP32
 ESP32_TOKEN=token_secreto_esp32

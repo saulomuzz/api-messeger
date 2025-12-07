@@ -333,3 +333,4 @@ Os logs são salvos no arquivo configurado em `LOG_PATH`. Use `DEBUG=true` para 
 
 Este projeto baseia-se no trabalho de [BenyFilho/whatsapp-web.js](https://github.com/BenyFilho/whatsapp-web.js) e nos termos da licença MIT.
 
+
