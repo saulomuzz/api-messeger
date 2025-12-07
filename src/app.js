@@ -1229,8 +1229,8 @@ async function compressVideoIfNeeded(inputFile, message = null) {
         
         resolve(compressedFile);
       })
-      .on('error', (err) => {
-        err(`[COMPRESS] Erro na compressão:`, err.message);
+      .on('error', (ffmpegError) => {
+        err(`[COMPRESS] Erro na compressão:`, ffmpegError.message);
         // Se falhar, retorna o original
         resolve(inputFile);
       })
