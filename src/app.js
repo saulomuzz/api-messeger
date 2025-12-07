@@ -49,6 +49,19 @@ const VIDEO_CRF = parseInt(process.env.VIDEO_CRF || '32', 10); // CRF para compr
 // Cache de tipo de autenticação por URL (evita tentar Basic se já sabemos que é Digest)
 const authTypeCache = new Map();
 
+/* ===== Tuya API ===== */
+const TUYA_CLIENT_ID = process.env.TUYA_CLIENT_ID || '';
+const TUYA_CLIENT_SECRET = process.env.TUYA_CLIENT_SECRET || '';
+const TUYA_REGION = process.env.TUYA_REGION || 'us'; // us, eu, cn, in
+const TUYA_UID = process.env.TUYA_UID || ''; // UID padrão do usuário
+const TUYA_BASE_URL = `https://openapi.tuya${TUYA_REGION === 'us' ? 'us' : TUYA_REGION === 'eu' ? 'eu' : TUYA_REGION === 'in' ? 'in' : 'cn'}.com`;
+let tuyaAccessToken = null;
+let tuyaTokenExpiry = 0;
+// Cache para lista de dispositivos (indexado por número/nome)
+let tuyaDevicesCache = null;
+let tuyaDevicesCacheTime = 0;
+const TUYA_DEVICES_CACHE_TTL = 5 * 60 * 1000; // 5 minutos
+
 /* ===== logging ===== */
 try {
   fs.mkdirSync(path.dirname(LOG_PATH), { recursive: true });
@@ -356,8 +369,11 @@ client.on('message', async (message) => {
 
     log(`[MSG] Mensagem recebida de ${message.from}: "${message.body}"`);
 
+    const msgBody = message.body.trim();
+    const msgLower = msgBody.toLowerCase();
+
     // Responde ao comando !ping (sem diferenciar maiúsculas/minúsculas)
-    if (message.body.toLowerCase() === '!ping') {
+    if (msgLower === '!ping') {
         log(`[CMD] Comando !ping recebido de ${message.from}. Respondendo...`);
         try {
             await message.reply('pong');
@@ -367,6 +383,7 @@ client.on('message', async (message) => {
         }
         return;
     }
+<<<<<<< HEAD
     
     // Comando !record - Grava vídeo RTSP
     const recordMatch = message.body.match(/^!record(?:\s+(\d+))?$/i);
@@ -581,6 +598,158 @@ client.on('message', async (message) => {
         })();
         
         return;
+    }
+
+    // Comandos Tuya - verifica se está habilitado
+    if (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) {
+        // Verifica se o número está autorizado no arquivo numbers.txt
+        const senderNumber = message.from.split('@')[0];
+        const isAuthorized = isNumberAuthorized(senderNumber, NUMBERS_FILE);
+        
+        if (!isAuthorized && !msgLower.startsWith('!tuya help')) {
+            dbg(`[CMD-TUYA] Número ${senderNumber} não está autorizado no arquivo numbers.txt. Ignorando comando.`);
+            return;
+        }
+
+        // Comando: !tuya help
+        if (msgLower === '!tuya help' || msgLower === '!tuya') {
+            log(`[CMD-TUYA] Comando help recebido de ${message.from}`);
+            try {
+                const helpMsg = formatTuyaHelpMessage();
+                await message.reply(helpMsg);
+                log(`[CMD-TUYA] Mensagem de ajuda enviada para ${message.from}.`);
+            } catch (e) {
+                err(`[CMD-TUYA] Falha ao enviar ajuda para ${message.from}:`, e.message);
+            }
+            return;
+        }
+
+        // Comando: !tuya list
+        if (msgLower === '!tuya list') {
+            log(`[CMD-TUYA] Comando list recebido de ${message.from}`);
+            try {
+                await message.reply('⏳ Buscando seus dispositivos...');
+                
+                const devices = await getCachedTuyaDevices();
+                const responseMsg = formatDevicesListMessage(devices);
+                await message.reply(responseMsg);
+                log(`[CMD-TUYA] Lista de ${devices.length} dispositivo(s) enviada para ${message.from}.`);
+            } catch (e) {
+                err(`[CMD-TUYA] Erro ao listar dispositivos para ${message.from}:`, e.message);
+                if (e.message.includes('UID não configurado')) {
+                    await message.reply(`❌ *Erro:* UID não configurado.\n\nConfigure TUYA_UID no arquivo .env ou use: \`!tuya devices <uid>\``);
+                } else {
+                    await message.reply(`❌ *Erro ao listar dispositivos:*\n${e.message}`);
+                }
+            }
+            return;
+        }
+
+        // Comando: !tuya status <número, nome ou deviceId>
+        if (msgLower.startsWith('!tuya status ')) {
+            const identifier = msgBody.substring(13).trim();
+            if (!identifier) {
+                await message.reply('❌ *Erro:* Identificador não fornecido.\nUse: `!tuya status 1` ou `!tuya status Nome do Dispositivo`');
+                return;
+            }
+
+            log(`[CMD-TUYA] Comando status recebido de ${message.from} para identificador: ${identifier}`);
+            try {
+                await message.reply('⏳ Consultando dispositivo...');
+                
+                // Primeiro tenta buscar na lista em cache
+                let device = null;
+                let deviceId = identifier;
+                
+                try {
+                    const devices = await getCachedTuyaDevices();
+                    device = findDeviceByIdentifier(identifier, devices);
+                    if (device) {
+                        deviceId = device.id;
+                        log(`[CMD-TUYA] Dispositivo encontrado: ${device.name} (${deviceId})`);
+                    }
+                } catch (e) {
+                    dbg(`[CMD-TUYA] Não foi possível buscar na lista, tentando diretamente com ID: ${e.message}`);
+                }
+                
+                const status = await getTuyaDeviceStatus(deviceId);
+                
+                const poweredOn = status.filter(s => {
+                    const code = s.code?.toLowerCase() || '';
+                    const value = s.value;
+                    if (code.includes('switch') || code.includes('power')) {
+                        return value === true || value === 1 || value === 'true' || value === 'on';
+                    }
+                    return false;
+                }).length > 0;
+
+                const deviceName = device ? device.name : deviceId;
+                const responseMsg = formatDeviceStatusMessage(deviceName, status, poweredOn);
+                await message.reply(responseMsg);
+                log(`[CMD-TUYA] Status do dispositivo ${deviceId} enviado para ${message.from}.`);
+            } catch (e) {
+                err(`[CMD-TUYA] Erro ao consultar status para ${message.from}:`, e.message);
+                await message.reply(`❌ *Erro ao consultar dispositivo:*\n${e.message}\n\n💡 *Dica:* Use \`!tuya list\` para ver todos os dispositivos disponíveis.`);
+            }
+            return;
+        }
+
+        // Comando: !tuya devices <uid>
+        if (msgLower.startsWith('!tuya devices ')) {
+            const uid = msgBody.substring(14).trim();
+            if (!uid) {
+                await message.reply('❌ *Erro:* UID não fornecido.\nUse: `!tuya devices <uid>`');
+                return;
+            }
+
+            log(`[CMD-TUYA] Comando devices recebido de ${message.from} para UID ${uid}`);
+            try {
+                await message.reply('⏳ Consultando dispositivos...');
+                
+                const devices = await getTuyaDevices(uid);
+                
+                const devicesWithStatus = await Promise.all(devices.map(async (device) => {
+                    try {
+                        const status = await getTuyaDeviceStatus(device.id);
+                        const poweredOn = status.filter(s => {
+                            const code = s.code?.toLowerCase() || '';
+                            const value = s.value;
+                            if (code.includes('switch') || code.includes('power')) {
+                                return value === true || value === 1 || value === 'true' || value === 'on';
+                            }
+                            return false;
+                        });
+
+                        return {
+                            id: device.id,
+                            name: device.name,
+                            online: device.online || false,
+                            category: device.category,
+                            poweredOn: poweredOn.length > 0,
+                            poweredOnCount: poweredOn.length
+                        };
+                    } catch (e) {
+                        warn(`[CMD-TUYA] Erro ao obter status do dispositivo ${device.id}:`, e.message);
+                        return {
+                            id: device.id,
+                            name: device.name,
+                            online: device.online || false,
+                            category: device.category,
+                            error: e.message
+                        };
+                    }
+                }));
+
+                const responseMsg = formatDevicesListMessage(devicesWithStatus);
+                await message.reply(responseMsg);
+                log(`[CMD-TUYA] Lista de ${devicesWithStatus.length} dispositivo(s) enviada para ${message.from}.`);
+            } catch (e) {
+                err(`[CMD-TUYA] Erro ao listar dispositivos para ${message.from}:`, e.message);
+                await message.reply(`❌ *Erro ao listar dispositivos:*\n${e.message}\n\nVerifique se o UID está correto.`);
+            }
+            return;
+        }
+>>>>>>> b267b6e (feat: Integração com API Tuya e comandos WhatsApp - Adiciona integração completa com API Tuya para controle de dispositivos via WhatsApp - Implementa comandos: !tuya help, !tuya list, !tuya status - Adiciona autenticação HMAC-SHA256 e gerenciamento de tokens - Cria script de teste test-tuya-sign.js para debug - Adiciona documentação completa (TUYA_INTEGRATION.md, TUYA_TROUBLESHOOTING.md) - Usa numbers.txt para autorização de comandos Tuya)
     }
 });
 
@@ -1094,6 +1263,7 @@ function readNumbersFromFile(filePath) {
   }
 }
 
+<<<<<<< HEAD
 /**
  * Verifica se um número está cadastrado no arquivo
  * @param {string} phoneNumber - Número a verificar (pode estar em qualquer formato)
@@ -1372,6 +1542,360 @@ async function recordRTSPVideo(rtspUrl, durationSeconds, message) {
   });
 }
 
+function isNumberAuthorized(senderPhoneNumber, numbersFile) {
+  try {
+    const authorizedNumbers = readNumbersFromFile(numbersFile);
+    if (authorizedNumbers.length === 0) {
+      // Se o arquivo estiver vazio ou não existir, permite todos (comportamento padrão)
+      dbg(`[NUMBERS] Arquivo vazio ou não encontrado. Permitindo acesso.`);
+      return true;
+    }
+
+    // Remove @c.us se presente e normaliza
+    const cleanSender = senderPhoneNumber.split('@')[0];
+    const senderDigits = digitsOnly(cleanSender);
+    const senderNormalized = normalizeBR(cleanSender);
+
+    // Verifica se o número está na lista (com várias tentativas de normalização)
+    const isAuthorized = authorizedNumbers.some(authorized => {
+      const authorizedDigits = digitsOnly(authorized);
+      const authorizedNormalized = normalizeBR(authorized);
+      
+      // Compara apenas dígitos (sem +, espaços, etc)
+      if (senderDigits === authorizedDigits) return true;
+      
+      // Compara formatos normalizados completos
+      if (senderNormalized === authorizedNormalized) return true;
+      
+      // Remove o + e compara
+      const senderNoPlus = senderNormalized.replace(/^\+/, '');
+      const authorizedNoPlus = authorizedNormalized.replace(/^\+/, '');
+      if (senderNoPlus === authorizedNoPlus) return true;
+      
+      return false;
+    });
+    
+    if (!isAuthorized) {
+      dbg(`[NUMBERS] Número ${cleanSender} não autorizado. Arquivo tem ${authorizedNumbers.length} número(s) cadastrado(s).`);
+    }
+    
+    return isAuthorized;
+  } catch (e) {
+    err(`[NUMBERS] Erro ao verificar autorização:`, e.message);
+    // Em caso de erro, permite acesso (comportamento seguro padrão)
+    return true;
+  }
+}
+
+/* ===== funções para API Tuya ===== */
+function generateTuyaSign(clientId, secret, timestamp, method, path, body = '') {
+  // Para GET sem body, o body é string vazia
+  const bodyStr = body || '';
+  // Calcula SHA256 do body (string vazia = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855)
+  const bodyHash = crypto.createHash('sha256').update(bodyStr, 'utf8').digest('hex').toLowerCase();
+  
+  // Formato do stringToSign: method\nbodyHash\n\npath
+  const stringToSign = method + '\n' + bodyHash + '\n\n' + path;
+  
+  // String para assinar: client_id + secret + timestamp + stringToSign
+  const signStr = clientId + secret + timestamp + stringToSign;
+  
+  // Gera HMAC-SHA256 e retorna em maiúsculas
+  const sign = crypto.createHmac('sha256', secret).update(signStr, 'utf8').digest('hex').toUpperCase();
+  
+  if (DEBUG) {
+    dbg(`[TUYA-SIGN] Method: ${method}`);
+    dbg(`[TUYA-SIGN] Path: ${path}`);
+    dbg(`[TUYA-SIGN] Body: "${bodyStr}" (length: ${bodyStr.length})`);
+    dbg(`[TUYA-SIGN] BodyHash: ${bodyHash}`);
+    dbg(`[TUYA-SIGN] StringToSign: ${JSON.stringify(stringToSign)}`);
+    dbg(`[TUYA-SIGN] SignStr (sem secret): ${clientId}***${timestamp}${stringToSign.substring(0, 50)}...`);
+    dbg(`[TUYA-SIGN] Sign: ${sign.substring(0, 20)}...`);
+  }
+  
+  return sign;
+}
+
+async function getTuyaAccessToken() {
+  if (tuyaAccessToken && Date.now() < tuyaTokenExpiry) {
+    return tuyaAccessToken;
+  }
+
+  if (!TUYA_CLIENT_ID || !TUYA_CLIENT_SECRET) {
+    throw new Error('TUYA_CLIENT_ID e TUYA_CLIENT_SECRET devem estar configurados');
+  }
+
+  try {
+    const timestamp = Date.now().toString();
+    const method = 'GET';
+    // Para requisições GET, o path no stringToSign deve incluir a query string
+    const path = `/v1.0/token?grant_type=1`;
+    
+    const sign = generateTuyaSign(TUYA_CLIENT_ID, TUYA_CLIENT_SECRET, timestamp, method, path);
+
+    dbg(`[TUYA] Solicitando access token... (timestamp: ${timestamp})`);
+
+    const response = await axios.get(`${TUYA_BASE_URL}${path}`, {
+      headers: {
+        'client_id': TUYA_CLIENT_ID,
+        'sign': sign,
+        't': timestamp,
+        'sign_method': 'HMAC-SHA256'
+      },
+      timeout: 10000
+    });
+
+    if (response.data && response.data.success && response.data.result) {
+      tuyaAccessToken = response.data.result.access_token;
+      const expiresIn = (response.data.result.expire_time || 7200) * 1000; // converter para ms
+      tuyaTokenExpiry = Date.now() + expiresIn - 60000; // renova 1 minuto antes
+      log(`[TUYA] Access token obtido com sucesso (expira em ${Math.floor(expiresIn / 1000 / 60)} minutos)`);
+      return tuyaAccessToken;
+    } else {
+      throw new Error(`Falha ao obter token: ${JSON.stringify(response.data)}`);
+    }
+  } catch (e) {
+    err(`[TUYA] Erro ao obter access token:`, e.response?.data || e.message);
+    throw e;
+  }
+}
+
+async function getTuyaDeviceStatus(deviceId) {
+  if (!TUYA_CLIENT_ID || !TUYA_CLIENT_SECRET) {
+    throw new Error('TUYA_CLIENT_ID e TUYA_CLIENT_SECRET devem estar configurados');
+  }
+
+  try {
+    const accessToken = await getTuyaAccessToken();
+    const timestamp = Date.now().toString();
+    const method = 'GET';
+    const path = `/v1.0/iot-03/devices/${deviceId}/status`;
+    const sign = generateTuyaSign(TUYA_CLIENT_ID, TUYA_CLIENT_SECRET, timestamp, method, path);
+
+    dbg(`[TUYA] Consultando status do dispositivo ${deviceId}...`);
+
+    const response = await axios.get(`${TUYA_BASE_URL}${path}`, {
+      headers: {
+        'client_id': TUYA_CLIENT_ID,
+        'access_token': accessToken,
+        'sign': sign,
+        't': timestamp,
+        'sign_method': 'HMAC-SHA256'
+      },
+      timeout: 10000
+    });
+
+    if (response.data && response.data.success) {
+      return response.data.result;
+    } else {
+      throw new Error(`Falha ao obter status: ${JSON.stringify(response.data)}`);
+    }
+  } catch (e) {
+    err(`[TUYA] Erro ao obter status do dispositivo ${deviceId}:`, e.response?.data || e.message);
+    throw e;
+  }
+}
+
+async function getTuyaDevices(uid) {
+  if (!TUYA_CLIENT_ID || !TUYA_CLIENT_SECRET) {
+    throw new Error('TUYA_CLIENT_ID e TUYA_CLIENT_SECRET devem estar configurados');
+  }
+
+  if (!uid) {
+    throw new Error('UID do usuário é necessário para listar dispositivos');
+  }
+
+  try {
+    const accessToken = await getTuyaAccessToken();
+    const timestamp = Date.now().toString();
+    const method = 'GET';
+    const path = `/v1.0/users/${uid}/devices`;
+    const sign = generateTuyaSign(TUYA_CLIENT_ID, TUYA_CLIENT_SECRET, timestamp, method, path);
+
+    dbg(`[TUYA] Listando dispositivos para usuário ${uid}...`);
+
+    const response = await axios.get(`${TUYA_BASE_URL}${path}`, {
+      headers: {
+        'client_id': TUYA_CLIENT_ID,
+        'access_token': accessToken,
+        'sign': sign,
+        't': timestamp,
+        'sign_method': 'HMAC-SHA256'
+      },
+      timeout: 10000
+    });
+
+    if (response.data && response.data.success) {
+      return response.data.result || [];
+    } else {
+      throw new Error(`Falha ao listar dispositivos: ${JSON.stringify(response.data)}`);
+    }
+  } catch (e) {
+    err(`[TUYA] Erro ao listar dispositivos:`, e.response?.data || e.message);
+    throw e;
+  }
+}
+
+/* ===== funções auxiliares para formatação de mensagens Tuya no WhatsApp ===== */
+function formatDeviceStatusMessage(deviceNameOrId, status, poweredOn) {
+  let message = `*📱 Status do Dispositivo Tuya*\n\n`;
+  message += `*Nome:* ${deviceNameOrId}\n`;
+  message += `*Status:* ${poweredOn ? '🟢 LIGADO' : '🔴 DESLIGADO'}\n\n`;
+  
+  if (status && status.length > 0) {
+    message += `*Propriedades:*\n`;
+    status.forEach(s => {
+      const code = s.code || 'N/A';
+      const value = s.value;
+      const emoji = (code.toLowerCase().includes('switch') || code.toLowerCase().includes('power')) 
+        ? (value === true || value === 1 || value === 'true' || value === 'on' ? '🟢' : '🔴')
+        : '⚙️';
+      message += `${emoji} *${code}:* ${value}\n`;
+    });
+  }
+  
+  return message;
+}
+
+function formatDevicesListMessage(devices) {
+  if (!devices || devices.length === 0) {
+    return `*📱 Dispositivos Tuya*\n\nNenhum dispositivo encontrado.`;
+  }
+  
+  let message = `*📱 Seus Dispositivos Tuya*\n\n`;
+  message += `*Total:* ${devices.length}\n`;
+  
+  const poweredOnCount = devices.filter(d => d.poweredOn).length;
+  message += `*Ligados:* ${poweredOnCount}\n\n`;
+  message += `*Para consultar status, use:*\n`;
+  message += `\`!tuya status 1\` (número da lista)\n`;
+  message += `\`!tuya status Nome do Dispositivo\` (nome)\n\n`;
+  message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+  
+  devices.forEach((device, index) => {
+    const statusEmoji = device.poweredOn ? '🟢' : '🔴';
+    const onlineEmoji = device.online ? '🟢' : '🔴';
+    message += `${index + 1}. ${statusEmoji} *${device.name || device.id}*\n`;
+    message += `   ${onlineEmoji} Online: ${device.online ? 'Sim' : 'Não'}\n`;
+    if (device.category) {
+      message += `   📦 Categoria: ${device.category}\n`;
+    }
+    if (device.poweredOnCount > 0) {
+      message += `   ⚡ ${device.poweredOnCount} propriedade(s) ligada(s)\n`;
+    }
+    message += `\n`;
+  });
+  
+  return message;
+}
+
+function formatTuyaHelpMessage() {
+  let message = `*🤖 Comandos Tuya*\n\n`;
+  message += `*Comandos disponíveis:*\n\n`;
+  message += `*!tuya list*\n`;
+  message += `Lista todos os seus dispositivos\n`;
+  message += `Exemplo: !tuya list\n\n`;
+  message += `*!tuya status <número ou nome>*\n`;
+  message += `Consulta o status de um dispositivo\n`;
+  message += `Você pode usar:\n`;
+  message += `- Número da lista: !tuya status 1\n`;
+  message += `- Nome do dispositivo: !tuya status Lâmpada Sala\n`;
+  message += `- ID completo: !tuya status bf1234567890abcdef\n\n`;
+  message += `*!tuya help*\n`;
+  message += `Mostra esta mensagem de ajuda\n\n`;
+  message += `*Dica:* Use \`!tuya list\` para ver todos os dispositivos disponíveis.`;
+  
+  return message;
+}
+
+/* ===== funções auxiliares para cache e busca de dispositivos ===== */
+async function getCachedTuyaDevices(uid) {
+  const now = Date.now();
+  
+  // Verifica se há cache válido
+  if (tuyaDevicesCache && (now - tuyaDevicesCacheTime) < TUYA_DEVICES_CACHE_TTL) {
+    dbg(`[TUYA] Usando cache de dispositivos (${Math.floor((now - tuyaDevicesCacheTime) / 1000)}s de idade)`);
+    return tuyaDevicesCache;
+  }
+  
+  // Busca dispositivos
+  if (!uid) {
+    if (!TUYA_UID) {
+      throw new Error('UID não configurado. Configure TUYA_UID no .env ou forneça o UID no comando.');
+    }
+    uid = TUYA_UID;
+  }
+  
+  const devices = await getTuyaDevices(uid);
+  
+  // Processa status de cada dispositivo
+  const devicesWithStatus = await Promise.all(devices.map(async (device) => {
+    try {
+      const status = await getTuyaDeviceStatus(device.id);
+      const poweredOn = status.filter(s => {
+        const code = s.code?.toLowerCase() || '';
+        const value = s.value;
+        if (code.includes('switch') || code.includes('power')) {
+          return value === true || value === 1 || value === 'true' || value === 'on';
+        }
+        return false;
+      });
+
+      return {
+        id: device.id,
+        name: device.name || device.id,
+        online: device.online || false,
+        category: device.category,
+        poweredOn: poweredOn.length > 0,
+        poweredOnCount: poweredOn.length
+      };
+    } catch (e) {
+      warn(`[TUYA] Erro ao obter status do dispositivo ${device.id}:`, e.message);
+      return {
+        id: device.id,
+        name: device.name || device.id,
+        online: device.online || false,
+        category: device.category,
+        error: e.message
+      };
+    }
+  }));
+  
+  // Atualiza cache
+  tuyaDevicesCache = devicesWithStatus;
+  tuyaDevicesCacheTime = now;
+  
+  return devicesWithStatus;
+}
+
+function findDeviceByIdentifier(identifier, devices) {
+  if (!identifier || !devices || devices.length === 0) {
+    return null;
+  }
+  
+  const idLower = identifier.toLowerCase().trim();
+  
+  // Tenta por número da lista (1, 2, 3...)
+  const index = parseInt(idLower) - 1;
+  if (!isNaN(index) && index >= 0 && index < devices.length) {
+    return devices[index];
+  }
+  
+  // Tenta por ID completo
+  const byId = devices.find(d => d.id.toLowerCase() === idLower);
+  if (byId) return byId;
+  
+  // Tenta por nome (busca parcial, case-insensitive)
+  const byName = devices.find(d => {
+    const name = (d.name || '').toLowerCase();
+    return name === idLower || name.includes(idLower) || idLower.includes(name);
+  });
+  if (byName) return byName;
+  
+  return null;
+>>>>>>> b267b6e (feat: Integração com API Tuya e comandos WhatsApp - Adiciona integração completa com API Tuya para controle de dispositivos via WhatsApp - Implementa comandos: !tuya help, !tuya list, !tuya status - Adiciona autenticação HMAC-SHA256 e gerenciamento de tokens - Cria script de teste test-tuya-sign.js para debug - Adiciona documentação completa (TUYA_INTEGRATION.md, TUYA_TROUBLESHOOTING.md) - Usa numbers.txt para autorização de comandos Tuya)
+}
+
 /* ===== endpoints ===== */
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'whatsapp-web.js', ready: isReady, ts: nowISO() }));
 
@@ -1572,6 +2096,191 @@ app.post('/trigger-snapshot', (req, res, next) => {
   } catch (e) {
     err(`[SNAPSHOT][${rid}] ERRO`, e);
     return res.status(500).json({ ok: false, error: String(e), requestId: rid });
+  }
+});
+
+/* ===== endpoints Tuya ===== */
+app.get('/tuya/devices', auth, async (req, res) => {
+  const rid = requestId();
+  const { uid } = req.query;
+  log(`[TUYA-DEVICES][${rid}] Listando dispositivos | ip=${ip(req)} | uid=${uid || 'não fornecido'}`);
+
+  if (!uid) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Parâmetro uid é necessário (query: ?uid=seu_uid)',
+      requestId: rid
+    });
+  }
+
+  try {
+    const devices = await getTuyaDevices(uid);
+    
+    // Processa cada dispositivo para obter status
+    const devicesWithStatus = await Promise.all(devices.map(async (device) => {
+      try {
+        const status = await getTuyaDeviceStatus(device.id);
+        
+        // Identifica quais estão ligados
+        const poweredOn = status.filter(s => {
+          const code = s.code?.toLowerCase() || '';
+          const value = s.value;
+          
+          if (code.includes('switch') || code.includes('power')) {
+            return value === true || value === 1 || value === 'true' || value === 'on';
+          }
+          return false;
+        });
+
+        return {
+          id: device.id,
+          name: device.name,
+          online: device.online || false,
+          category: device.category,
+          poweredOn: poweredOn.length > 0,
+          poweredOnCount: poweredOn.length,
+          status: status
+        };
+      } catch (e) {
+        warn(`[TUYA-DEVICES][${rid}] Erro ao obter status do dispositivo ${device.id}:`, e.message);
+        return {
+          id: device.id,
+          name: device.name,
+          online: device.online || false,
+          category: device.category,
+          status: null,
+          error: e.message
+        };
+      }
+    }));
+
+    const poweredOnDevices = devicesWithStatus.filter(d => d.poweredOn);
+    log(`[TUYA-DEVICES][${rid}] ${devicesWithStatus.length} dispositivo(s) encontrado(s), ${poweredOnDevices.length} ligado(s)`);
+    return res.json({
+      ok: true,
+      requestId: rid,
+      total: devicesWithStatus.length,
+      poweredOn: poweredOnDevices.length,
+      devices: devicesWithStatus,
+      timestamp: nowISO()
+    });
+  } catch (e) {
+    err(`[TUYA-DEVICES][${rid}] ERRO`, e);
+    const statusCode = e.response?.status || 500;
+    return res.status(statusCode).json({
+      ok: false,
+      error: String(e),
+      requestId: rid
+    });
+  }
+});
+
+app.get('/tuya/device/:deviceId/status', auth, async (req, res) => {
+  const rid = requestId();
+  const { deviceId } = req.params;
+  log(`[TUYA-STATUS][${rid}] Consultando status do dispositivo ${deviceId} | ip=${ip(req)}`);
+
+  try {
+    const status = await getTuyaDeviceStatus(deviceId);
+    
+    // Identifica quais dispositivos estão ligados
+    const poweredOn = status.filter(s => {
+      const code = s.code?.toLowerCase() || '';
+      const value = s.value;
+      
+      // Verifica códigos comuns de ligado/desligado
+      if (code.includes('switch') || code.includes('power')) {
+        return value === true || value === 1 || value === 'true' || value === 'on';
+      }
+      return false;
+    });
+
+    log(`[TUYA-STATUS][${rid}] Status obtido: ${status.length} propriedade(s), ${poweredOn.length} ligado(s)`);
+    return res.json({
+      ok: true,
+      requestId: rid,
+      deviceId: deviceId,
+      status: status,
+      poweredOn: poweredOn.length > 0,
+      poweredOnCount: poweredOn.length,
+      timestamp: nowISO()
+    });
+  } catch (e) {
+    err(`[TUYA-STATUS][${rid}] ERRO`, e);
+    const statusCode = e.response?.status || 500;
+    return res.status(statusCode).json({
+      ok: false,
+      error: String(e),
+      requestId: rid,
+      deviceId: deviceId
+    });
+  }
+});
+
+app.post('/tuya/devices/status', auth, async (req, res) => {
+  const rid = requestId();
+  const { deviceIds } = req.body || {};
+  log(`[TUYA-MULTI-STATUS][${rid}] Consultando status de múltiplos dispositivos | ip=${ip(req)}`);
+
+  if (!deviceIds || !Array.isArray(deviceIds) || deviceIds.length === 0) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Array deviceIds é necessário no corpo da requisição',
+      requestId: rid
+    });
+  }
+
+  try {
+    const devicesStatus = [];
+
+    for (const deviceId of deviceIds) {
+      try {
+        const status = await getTuyaDeviceStatus(deviceId);
+        
+        // Identifica quais estão ligados
+        const poweredOn = status.filter(s => {
+          const code = s.code?.toLowerCase() || '';
+          const value = s.value;
+          
+          if (code.includes('switch') || code.includes('power')) {
+            return value === true || value === 1 || value === 'true' || value === 'on';
+          }
+          return false;
+        });
+
+        devicesStatus.push({
+          id: deviceId,
+          poweredOn: poweredOn.length > 0,
+          poweredOnCount: poweredOn.length,
+          status: status
+        });
+      } catch (e) {
+        warn(`[TUYA-MULTI-STATUS][${rid}] Erro ao obter status do dispositivo ${deviceId}:`, e.message);
+        devicesStatus.push({
+          id: deviceId,
+          error: e.message
+        });
+      }
+    }
+
+    const poweredOnDevices = devicesStatus.filter(d => d.poweredOn && !d.error);
+    log(`[TUYA-MULTI-STATUS][${rid}] ${poweredOnDevices.length}/${devicesStatus.length} dispositivo(s) ligado(s)`);
+
+    return res.json({
+      ok: true,
+      requestId: rid,
+      total: devicesStatus.length,
+      poweredOn: poweredOnDevices.length,
+      devices: devicesStatus,
+      timestamp: nowISO()
+    });
+  } catch (e) {
+    err(`[TUYA-MULTI-STATUS][${rid}] ERRO`, e);
+    return res.status(500).json({
+      ok: false,
+      error: String(e),
+      requestId: rid
+    });
   }
 });
 
