@@ -383,7 +383,6 @@ client.on('message', async (message) => {
         }
         return;
     }
-<<<<<<< HEAD
     
     // Comando !record - Grava vídeo RTSP
     const recordMatch = message.body.match(/^!record(?:\s+(\d+))?$/i);
@@ -392,7 +391,7 @@ client.on('message', async (message) => {
         log(`[CMD] Comando !record recebido de ${message.from} (${fromNumber})`);
         
         // Verifica se o número está cadastrado
-        if (!isNumberRegistered(fromNumber)) {
+        if (!isNumberAuthorized(fromNumber, NUMBERS_FILE)) {
             log(`[CMD] Número ${fromNumber} não está cadastrado. Negando acesso.`);
             const denyMsg = '❌ Você não está autorizado a usar este comando. Seu número precisa estar cadastrado no arquivo de números.';
             log(`[CMD] Enviando mensagem de negação: "${denyMsg}"`);
@@ -749,7 +748,6 @@ client.on('message', async (message) => {
             }
             return;
         }
->>>>>>> b267b6e (feat: Integração com API Tuya e comandos WhatsApp - Adiciona integração completa com API Tuya para controle de dispositivos via WhatsApp - Implementa comandos: !tuya help, !tuya list, !tuya status - Adiciona autenticação HMAC-SHA256 e gerenciamento de tokens - Cria script de teste test-tuya-sign.js para debug - Adiciona documentação completa (TUYA_INTEGRATION.md, TUYA_TROUBLESHOOTING.md) - Usa numbers.txt para autorização de comandos Tuya)
     }
 });
 
@@ -1260,24 +1258,6 @@ function readNumbersFromFile(filePath) {
   } catch (e) {
     err(`[NUMBERS] Erro ao ler arquivo de números:`, e.message);
     return [];
-  }
-}
-
-<<<<<<< HEAD
-/**
- * Verifica se um número está cadastrado no arquivo
- * @param {string} phoneNumber - Número a verificar (pode estar em qualquer formato)
- * @returns {boolean}
- */
-function isNumberRegistered(phoneNumber) {
-  try {
-    const numbers = readNumbersFromFile(NUMBERS_FILE);
-    const normalized = normalizeBR(phoneNumber);
-    const normalizedNumbers = numbers.map(n => normalizeBR(n));
-    return normalizedNumbers.includes(normalized);
-  } catch (e) {
-    err(`[NUMBERS] Erro ao verificar número:`, e.message);
-    return false;
   }
 }
 
@@ -1893,7 +1873,6 @@ function findDeviceByIdentifier(identifier, devices) {
   if (byName) return byName;
   
   return null;
->>>>>>> b267b6e (feat: Integração com API Tuya e comandos WhatsApp - Adiciona integração completa com API Tuya para controle de dispositivos via WhatsApp - Implementa comandos: !tuya help, !tuya list, !tuya status - Adiciona autenticação HMAC-SHA256 e gerenciamento de tokens - Cria script de teste test-tuya-sign.js para debug - Adiciona documentação completa (TUYA_INTEGRATION.md, TUYA_TROUBLESHOOTING.md) - Usa numbers.txt para autorização de comandos Tuya)
 }
 
 /* ===== endpoints ===== */
