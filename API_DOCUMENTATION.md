@@ -58,6 +58,12 @@ cp .env.example .env
 - `ESP32_TOKEN`: Token secreto para autenticação de dispositivos ESP32
 - `ESP32_ALLOWED_IPS`: Lista de IPs permitidos (separados por vírgula, suporta CIDR)
 
+**Tuya API (opcional):**
+- `TUYA_CLIENT_ID`: Client ID da API Tuya
+- `TUYA_CLIENT_SECRET`: Client Secret da API Tuya
+- `TUYA_REGION`: Região da API Tuya (`us`, `eu`, `cn`, `in`) - padrão: `us`
+- **Nota:** Os comandos Tuya via WhatsApp usam o mesmo arquivo `numbers.txt` para autorização
+
 **Assinatura RSA (Opcional):**
 - `REQUIRE_SIGNED_REQUESTS`: Exige assinaturas RSA para `/send` (`true`/`false`)
 - `PUBLIC_KEY_PATH`: Caminho para a chave pública RSA
@@ -188,6 +194,66 @@ Envia mensagens de texto para um número brasileiro.
 - `401`: Token inválido ou IP não autorizado
 - `400`: Câmera não configurada ou snapshot falhou
 - `503`: WhatsApp não está pronto
+
+### GET /tuya/device/:deviceId/status
+
+Consulta o status de um dispositivo Tuya específico e identifica se está ligado.
+
+**Autenticação:** Requer `X-API-Token` se `API_TOKEN` estiver configurado.
+
+**Parâmetros:**
+- `deviceId` (path): ID do dispositivo Tuya
+
+**Resposta de Sucesso:**
+```json
+{
+  "ok": true,
+  "requestId": "uuid",
+  "deviceId": "bf1234567890abcdef",
+  "status": [
+    {
+      "code": "switch_led",
+      "value": true,
+      "t": 1234567890
+    }
+  ],
+  "poweredOn": true,
+  "poweredOnCount": 1,
+  "timestamp": "2024-01-01T12:00:00.000Z"
+}
+```
+
+Para documentação completa sobre a integração Tuya, consulte **[TUYA_INTEGRATION.md](TUYA_INTEGRATION.md)**.
+
+### GET /tuya/devices
+
+Lista todos os dispositivos de um usuário Tuya e seus status.
+
+**Autenticação:** Requer `X-API-Token` se `API_TOKEN` estiver configurado.
+
+**Parâmetros:**
+- `uid` (query): ID do usuário Tuya (obrigatório)
+
+**Exemplo:**
+```
+GET /tuya/devices?uid=az1234567890abcdef
+```
+
+### POST /tuya/devices/status
+
+Consulta o status de múltiplos dispositivos Tuya de uma vez.
+
+**Autenticação:** Requer `X-API-Token` se `API_TOKEN` estiver configurado.
+
+**Corpo da Requisição:**
+```json
+{
+  "deviceIds": [
+    "bf1234567890abcdef",
+    "bf0987654321fedcba"
+  ]
+}
+```
 
 ### GET /esp32/validate
 
