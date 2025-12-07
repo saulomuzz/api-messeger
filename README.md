@@ -8,6 +8,7 @@ API REST para integração com o WhatsApp utilizando [whatsapp-web.js](https://g
 - ✅ Envio de snapshots de câmera IP (via ESP32)
 - ✅ **Otimização automática de imagens** (compressão e redimensionamento)
 - ✅ **Envio paralelo** para múltiplos números (mais rápido)
+- ✅ Integração com API Tuya para consultar status de dispositivos inteligentes via WhatsApp ou API REST
 - ✅ Autenticação por token e whitelist de IPs
 - ✅ Suporte a autenticação Basic e Digest HTTP para câmeras
 - ✅ Validação de autorização ESP32
@@ -47,6 +48,7 @@ Para documentação detalhada, consulte:
 - **[API_DOCUMENTATION.md](API_DOCUMENTATION.md)** - Documentação completa da API
 - **[ESP32_VALIDATION.md](ESP32_VALIDATION.md)** - Endpoint de validação ESP32
 - **[CAMERA_CONFIG.md](CAMERA_CONFIG.md)** - Configuração de câmera IP
+- **[TUYA_INTEGRATION.md](TUYA_INTEGRATION.md)** - Integração com API Tuya
 - **[TEST_CURL.md](TEST_CURL.md)** - Exemplos de teste com curl
 
 ## Endpoints Principais
@@ -57,6 +59,9 @@ Para documentação detalhada, consulte:
 - `POST /send` - Envia mensagem de texto
 - `POST /trigger-snapshot` - **ESP32** - Envia snapshot de câmera
 - `GET /esp32/validate` - **ESP32** - Valida autorização
+- `GET /tuya/device/:deviceId/status` - **Tuya** - Consulta status de dispositivo
+- `GET /tuya/devices` - **Tuya** - Lista dispositivos do usuário
+- `POST /tuya/devices/status` - **Tuya** - Consulta status de múltiplos dispositivos
 
 ## Variáveis de Ambiente Principais
 
@@ -80,6 +85,11 @@ JPEG_QUALITY=85              # Qualidade JPEG 1-100 (padrão: 85)
 # Segurança ESP32
 ESP32_TOKEN=token_secreto_esp32
 ESP32_ALLOWED_IPS=10.10.0.4,10.10.0.0/24
+
+# Tuya API (opcional)
+TUYA_CLIENT_ID=seu_client_id
+TUYA_CLIENT_SECRET=seu_client_secret
+TUYA_REGION=us
 
 # Números de telefone
 NUMBERS_FILE=/opt/whatsapp-api/numbers.txt
