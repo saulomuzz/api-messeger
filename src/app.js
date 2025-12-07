@@ -12,6 +12,9 @@ const QRCode = require('qrcode');
 const qrcodeTerminal = require('qrcode-terminal');
 const axios = require('axios');
 const http = require('http');
+const sharp = require('sharp');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegPath = require('ffmpeg-static');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 
 /* ===== env ===== */
@@ -26,11 +29,25 @@ const PUBLIC_KEY_PATH_RAW = process.env.PUBLIC_KEY_PATH || '';
 const CAMERA_SNAPSHOT_URL = process.env.CAMERA_SNAPSHOT_URL || '';
 const CAMERA_USER = process.env.CAMERA_USER || '';
 const CAMERA_PASS = process.env.CAMERA_PASS || '';
+const CAMERA_RTSP_URL = process.env.CAMERA_RTSP_URL || '';
+const RECORD_DURATION_SEC = parseInt(process.env.RECORD_DURATION_SEC || '30', 10); // Duração padrão: 30 segundos
 const APP_ROOT = process.env.APP_ROOT || '/opt/whatsapp-api';
+const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(APP_ROOT, 'recordings');
 const NUMBERS_FILE = process.env.NUMBERS_FILE || path.join(APP_ROOT, 'numbers.txt');
 const AUTH_DATA_PATH = process.env.AUTH_DATA_PATH || path.join(APP_ROOT, '.wwebjs_auth');
 const ESP32_TOKEN = process.env.ESP32_TOKEN || '';
 const ESP32_ALLOWED_IPS = process.env.ESP32_ALLOWED_IPS ? process.env.ESP32_ALLOWED_IPS.split(',').map(ip => ip.trim()) : [];
+// Configurações de otimização de imagem
+const MAX_IMAGE_SIZE_KB = parseInt(process.env.MAX_IMAGE_SIZE_KB || '500', 10); // Tamanho máximo em KB antes de comprimir
+const MAX_IMAGE_WIDTH = parseInt(process.env.MAX_IMAGE_WIDTH || '1920', 10); // Largura máxima (WhatsApp recomenda até 1920px)
+const MAX_IMAGE_HEIGHT = parseInt(process.env.MAX_IMAGE_HEIGHT || '1080', 10); // Altura máxima
+const JPEG_QUALITY = parseInt(process.env.JPEG_QUALITY || '85', 10); // Qualidade JPEG (1-100)
+// Configurações de otimização de vídeo
+const MAX_VIDEO_SIZE_MB = parseFloat(process.env.MAX_VIDEO_SIZE_MB || '8', 10); // Tamanho máximo em MB antes de comprimir (WhatsApp aceita até ~16MB)
+const VIDEO_CRF = parseInt(process.env.VIDEO_CRF || '32', 10); // CRF para compressão (maior = menor qualidade, menor arquivo, padrão: 32)
+
+// Cache de tipo de autenticação por URL (evita tentar Basic se já sabemos que é Digest)
+const authTypeCache = new Map();
 
 /* ===== logging ===== */
 try {
@@ -46,10 +63,41 @@ const out = (lvl, ...a) => {
   else if (lvl === 'WARN') console.warn(line.trim());
   else console.log(line.trim());
 };
-const log  = (...a) => out('INFO', ...a);
-const dbg  = (...a) => { if (DEBUG) out('DEBUG', ...a); };
+const log  = (...a) => out('INFO', ...a);
+const dbg  = (...a) => { if (DEBUG) out('DEBUG', ...a); };
 const warn = (...a) => out('WARN', ...a);
-const err  = (...a) => out('ERROR', ...a);
+const err  = (...a) => out('ERROR', ...a);
+
+// Configura caminho do ffmpeg (depois das funções de logging)
+let ffmpegConfigured = false;
+if (ffmpegPath) {
+  try {
+    ffmpeg.setFfmpegPath(ffmpegPath);
+    // Verifica se o arquivo existe
+    if (fs.existsSync(ffmpegPath)) {
+      ffmpegConfigured = true;
+      log(`[INIT] FFmpeg configurado: ${ffmpegPath}`);
+    } else {
+      warn(`[INIT] FFmpeg path não encontrado: ${ffmpegPath}`);
+    }
+  } catch (e) {
+    warn(`[INIT] Erro ao configurar ffmpeg-static:`, e.message);
+  }
+}
+
+// Fallback: tenta usar ffmpeg do sistema
+if (!ffmpegConfigured) {
+  const { execSync } = require('child_process');
+  try {
+    // Verifica se ffmpeg está disponível no PATH
+    execSync('which ffmpeg', { stdio: 'ignore' });
+    // Se chegou aqui, ffmpeg está disponível
+    ffmpegConfigured = true;
+    log(`[INIT] Usando ffmpeg do sistema (PATH)`);
+  } catch (e) {
+    warn(`[INIT] FFmpeg não encontrado no sistema. Instale ffmpeg ou use ffmpeg-static.`);
+  }
+}
 
 /* ===== load public key ===== */
 const expandHome = p => (p && p.startsWith('~/')) ? path.join(os.homedir(), p.slice(2)) : p;
@@ -260,7 +308,10 @@ const client = new Client({
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-gpu',
-            '--disable-dev-shm-usage'
+            '--disable-dev-shm-usage',
+            '--disable-web-security',           // Permite WebAssembly para processamento de vídeo
+            '--disable-features=IsolateOrigins', // Necessário para WebAssembly
+            '--disable-site-isolation-trials'    // Permite unsafe-eval para WebAssembly
         ]
     }
 });
@@ -314,8 +365,230 @@ client.on('message', async (message) => {
         } catch (e) {
             err(`[CMD] Falha ao responder 'pong' para ${message.from}:`, e.message);
         }
+        return;
+    }
+    
+    // Comando !record - Grava vídeo RTSP
+    const recordMatch = message.body.match(/^!record(?:\s+(\d+))?$/i);
+    if (recordMatch) {
+        const fromNumber = message.from.replace('@c.us', '');
+        log(`[CMD] Comando !record recebido de ${message.from} (${fromNumber})`);
+        
+        // Verifica se o número está cadastrado
+        if (!isNumberRegistered(fromNumber)) {
+            log(`[CMD] Número ${fromNumber} não está cadastrado. Negando acesso.`);
+            const denyMsg = '❌ Você não está autorizado a usar este comando. Seu número precisa estar cadastrado no arquivo de números.';
+            log(`[CMD] Enviando mensagem de negação: "${denyMsg}"`);
+            try {
+                await message.reply(denyMsg);
+                log(`[CMD] Mensagem de negação enviada`);
+            } catch (e) {
+                err(`[CMD] Falha ao responder negação para ${message.from}:`, e.message);
+            }
+            return;
+        }
+        
+        // Constrói URL RTSP com credenciais
+        const rtspUrl = buildRTSPUrl();
+        if (!rtspUrl) {
+            log(`[CMD] RTSP não configurado`);
+            const configMsg = '❌ Gravação não configurada. Configure CAMERA_RTSP_URL ou CAMERA_USER/CAMERA_PASS.';
+            log(`[CMD] Enviando mensagem de erro de configuração: "${configMsg}"`);
+            try {
+                await message.reply(configMsg);
+                log(`[CMD] Mensagem de erro de configuração enviada`);
+            } catch (e) {
+                err(`[CMD] Falha ao responder erro de configuração:`, e.message);
+            }
+            return;
+        }
+        
+        // Extrai duração (padrão: RECORD_DURATION_SEC)
+        const duration = recordMatch[1] ? parseInt(recordMatch[1], 10) : RECORD_DURATION_SEC;
+        const finalDuration = Math.min(Math.max(5, duration), 120); // Entre 5 e 120 segundos (limite máximo)
+        
+        if (duration > 120) {
+            const limitMsg = `⚠️ Duração limitada a 120 segundos (solicitado: ${duration}s)`;
+            log(`[CMD] ${limitMsg}`);
+            try {
+                await message.reply(limitMsg);
+            } catch (e) {
+                err(`[CMD] Falha ao enviar mensagem de limite:`, e.message);
+            }
+        }
+        
+        log(`[CMD] Iniciando gravação de ${finalDuration} segundos para ${message.from}`);
+        
+        // Processa gravação em background para não bloquear
+        (async () => {
+            try {
+                const result = await recordRTSPVideo(rtspUrl, finalDuration, message);
+                
+                if (result.success && result.filePath && fs.existsSync(result.filePath)) {
+                    // Guarda caminho original para limpeza posterior
+                    const originalFilePath = result.filePath;
+                    
+                    // Lê o arquivo de vídeo
+                    const fileStats = fs.statSync(originalFilePath);
+                    log(`[RECORD] Arquivo gerado: ${originalFilePath} (${(fileStats.size / 1024 / 1024).toFixed(2)} MB)`);
+                    
+                    // Comprime vídeo se necessário
+                    const finalVideoPath = await compressVideoIfNeeded(originalFilePath, message);
+                    const finalStats = fs.statSync(finalVideoPath);
+                    log(`[RECORD] Arquivo final para envio: ${finalVideoPath} (${(finalStats.size / 1024 / 1024).toFixed(2)} MB)`);
+                    
+                    const videoBuffer = fs.readFileSync(finalVideoPath);
+                    
+                    // Valida se o vídeo não está vazio ou corrompido
+                    if (videoBuffer.length === 0) {
+                        throw new Error('Vídeo está vazio ou corrompido');
+                    }
+                    
+                    // Verifica se o tamanho não excede 16MB (limite do WhatsApp)
+                    const sizeMB = videoBuffer.length / 1024 / 1024;
+                    if (sizeMB > 16) {
+                        throw new Error(`Vídeo muito grande (${sizeMB.toFixed(2)} MB). Limite do WhatsApp: 16 MB`);
+                    }
+                    
+                    const videoBase64 = videoBuffer.toString('base64');
+                    log(`[RECORD] Vídeo convertido para base64: ${sizeMB.toFixed(2)} MB`);
+                    log(`[RECORD] Base64 length: ${videoBase64.length} caracteres`);
+                    
+                    // Cria MessageMedia com nome de arquivo simples (sem caracteres especiais)
+                    const fileName = `video_${Date.now()}.mp4`;
+                    const videoMedia = new MessageMedia('video/mp4', videoBase64, fileName);
+                    const caption = `🎥 Gravação de ${finalDuration} segundos`;
+                    log(`[RECORD] Enviando vídeo para ${message.from} com caption: "${caption}"`);
+                    log(`[RECORD] MessageMedia criado: mimetype=video/mp4, filename=${fileName}, size=${(videoBuffer.length / 1024).toFixed(2)} KB`);
+                    
+                    // Tenta enviar vídeo como VÍDEO primeiro (com thumbnail e player)
+                    // Se falhar, usa sendMediaAsDocument como fallback
+                    try {
+                        log(`[RECORD] Tentando enviar vídeo como VÍDEO (com thumbnail)...`);
+                        // Tenta primeiro como vídeo normal (sem sendMediaAsDocument)
+                        const sendResult = await client.sendMessage(message.from, videoMedia, { caption });
+                        log(`[CMD] Vídeo enviado com sucesso como VÍDEO | id=${sendResult.id?._serialized || 'n/a'}`);
+                        
+                        // Limpa arquivos imediatamente após envio bem-sucedido
+                        cleanupVideoFile(finalVideoPath, 'após envio bem-sucedido (como vídeo)');
+                        if (originalFilePath !== finalVideoPath && fs.existsSync(originalFilePath)) {
+                            cleanupVideoFile(originalFilePath, 'após envio (arquivo original restante)');
+                        }
+                    } catch (sendError) {
+                        err(`[CMD] Erro ao enviar vídeo como VÍDEO:`, sendError.message);
+                        
+                        // Fallback 1: Tenta com message.reply() (pode ter tratamento diferente)
+                        try {
+                            log(`[RECORD] Tentando via message.reply() como vídeo...`);
+                            const replyResult = await message.reply(videoMedia, undefined, { caption });
+                            log(`[CMD] Vídeo enviado via message.reply() | id=${replyResult.id?._serialized || 'n/a'}`);
+                            
+                            cleanupVideoFile(finalVideoPath, 'após envio (message.reply como vídeo)');
+                            if (originalFilePath !== finalVideoPath && fs.existsSync(originalFilePath)) {
+                                cleanupVideoFile(originalFilePath, 'após envio (arquivo original restante)');
+                            }
+                        } catch (replyError) {
+                            err(`[CMD] Erro ao enviar via message.reply():`, replyError.message);
+                            
+                            // Fallback 2: Tenta sem caption
+                            try {
+                                log(`[RECORD] Tentando sem caption como vídeo...`);
+                                const result2 = await message.reply(videoMedia);
+                                log(`[CMD] Vídeo enviado sem caption | id=${result2.id?._serialized || 'n/a'}`);
+                                await message.reply(caption);
+                                
+                                cleanupVideoFile(finalVideoPath, 'após envio (sem caption como vídeo)');
+                                if (originalFilePath !== finalVideoPath && fs.existsSync(originalFilePath)) {
+                                    cleanupVideoFile(originalFilePath, 'após envio (arquivo original restante)');
+                                }
+                            } catch (sendError2) {
+                                err(`[CMD] Erro ao enviar vídeo sem caption:`, sendError2.message);
+                                
+                                // Fallback 3: ÚLTIMO RECURSO - Envia como documento (sem thumbnail, mas funciona)
+                                try {
+                                    log(`[RECORD] Fallback final: enviando como documento (sendMediaAsDocument: true)...`);
+                                    const result3 = await client.sendMessage(message.from, videoMedia, { 
+                                        caption: `${caption}\n\n⚠️ Enviado como documento devido a limitação do WhatsApp Web.`,
+                                        sendMediaAsDocument: true
+                                    });
+                                    log(`[CMD] Vídeo enviado como documento (fallback) | id=${result3.id?._serialized || 'n/a'}`);
+                                    
+                                    cleanupVideoFile(finalVideoPath, 'após envio como documento (fallback)');
+                                    if (originalFilePath !== finalVideoPath && fs.existsSync(originalFilePath)) {
+                                        cleanupVideoFile(originalFilePath, 'após envio como documento (original)');
+                                    }
+                                } catch (sendError3) {
+                                    err(`[CMD] Erro ao enviar como documento:`, sendError3.message);
+                                    
+                                    // Limpa arquivos após erro
+                                    cleanupVideoFile(finalVideoPath, 'após erro no envio');
+                                    if (originalFilePath !== finalVideoPath && fs.existsSync(originalFilePath)) {
+                                        cleanupVideoFile(originalFilePath, 'após erro (original)');
+                                    }
+                                    
+                                    // Tenta enviar mensagem de erro
+                                    try {
+                                        await message.reply(`❌ Erro ao enviar vídeo. Tamanho: ${(videoBuffer.length / 1024 / 1024).toFixed(2)} MB. Erro: ${sendError3.message}\n\n💡 O vídeo foi gravado mas não pôde ser enviado. Este é um problema conhecido do WhatsApp Web ao processar vídeos com WebAssembly.`);
+                                    } catch (e2) {
+                                        err(`[CMD] Falha ao enviar mensagem de erro do vídeo:`, e2.message);
+                                    }
+                                    throw sendError3; // Re-lança para ser capturado pelo catch externo
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    const failMsg = `❌ Falha na gravação: ${result.error || 'Erro desconhecido'}`;
+                    log(`[RECORD] Enviando mensagem de falha: "${failMsg}"`);
+                    try {
+                        await message.reply(failMsg);
+                        log(`[RECORD] Mensagem de falha enviada`);
+                    } catch (e) {
+                        err(`[RECORD] Erro ao enviar mensagem de falha:`, e.message);
+                    }
+                    
+                    // Limpa arquivo se existir após falha na gravação
+                    if (result.filePath && fs.existsSync(result.filePath)) {
+                        cleanupVideoFile(result.filePath, 'após falha na gravação');
+                    }
+                }
+            } catch (e) {
+                err(`[CMD] Erro ao processar gravação:`, e.message);
+                err(`[CMD] Stack trace completo:`, e.stack);
+                if (e.cause) {
+                    err(`[CMD] Causa do erro:`, e.cause);
+                }
+                
+                // Limpa arquivos em caso de erro geral (se result existir)
+                try {
+                    if (typeof result !== 'undefined' && result && result.filePath && fs.existsSync(result.filePath)) {
+                        cleanupVideoFile(result.filePath, 'após erro geral');
+                    }
+                } catch (cleanupErr) {
+                    warn(`[CLEANUP] Erro ao limpar após erro geral:`, cleanupErr.message);
+                }
+                
+                const errorMsg = `❌ Erro ao processar gravação: ${e.message}`;
+                log(`[RECORD] Enviando mensagem de erro: "${errorMsg}"`);
+                try {
+                    await message.reply(errorMsg);
+                    log(`[RECORD] Mensagem de erro enviada`);
+                } catch (e2) {
+                    err(`[CMD] Falha ao enviar mensagem de erro:`, e2.message);
+                    err(`[CMD] Stack trace do erro de envio:`, e2.stack);
+                }
+            }
+        })();
+        
+        return;
     }
 });
+
+// Garante que diretórios necessários existem
+if (!fs.existsSync(RECORDINGS_DIR)) {
+  fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+  log(`[INIT] Diretório de gravações criado: ${RECORDINGS_DIR}`);
+}
 
 client.initialize().catch(e => err('[INIT] Falha ao inicializar o cliente:', e.message));
 
@@ -336,77 +609,184 @@ async function resolveWhatsAppNumber(client, e164) {
 }
 
 /* ===== funções para snapshot da câmera ===== */
+/**
+ * Otimiza imagem: redimensiona e comprime se necessário
+ * @param {Buffer} imageBuffer - Buffer da imagem original
+ * @param {string} mimeType - Tipo MIME da imagem
+ * @returns {Promise<{buffer: Buffer, mimeType: string, optimized: boolean}>}
+ */
+async function optimizeImage(imageBuffer, mimeType) {
+  const originalSizeKB = imageBuffer.length / 1024;
+  let optimized = false;
+  let processedBuffer = imageBuffer;
+  
+  try {
+    // Só processa se for JPEG/PNG e se o tamanho for maior que o limite
+    if (!mimeType.match(/^image\/(jpeg|jpg|png)$/i)) {
+      if (DEBUG) {
+        dbg(`[OPTIMIZE] Tipo ${mimeType} não suportado para otimização, mantendo original`);
+      }
+      return { buffer: imageBuffer, mimeType, optimized: false };
+    }
+    
+    let sharpImage = sharp(imageBuffer);
+    const metadata = await sharpImage.metadata();
+    
+    // Verifica se precisa redimensionar
+    const needsResize = metadata.width > MAX_IMAGE_WIDTH || metadata.height > MAX_IMAGE_HEIGHT;
+    const needsCompress = originalSizeKB > MAX_IMAGE_SIZE_KB;
+    
+    if (!needsResize && !needsCompress) {
+      if (DEBUG) {
+        dbg(`[OPTIMIZE] Imagem já otimizada: ${originalSizeKB.toFixed(1)}KB, ${metadata.width}x${metadata.height}px`);
+      }
+      return { buffer: imageBuffer, mimeType, optimized: false };
+    }
+    
+    if (DEBUG) {
+      dbg(`[OPTIMIZE] Otimizando imagem: ${originalSizeKB.toFixed(1)}KB, ${metadata.width}x${metadata.height}px`);
+    }
+    
+    // Redimensiona mantendo aspect ratio
+    if (needsResize) {
+      sharpImage = sharpImage.resize(MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT, {
+        fit: 'inside',
+        withoutEnlargement: true
+      });
+      if (DEBUG) {
+        dbg(`[OPTIMIZE] Redimensionando para máximo ${MAX_IMAGE_WIDTH}x${MAX_IMAGE_HEIGHT}px`);
+      }
+    }
+    
+    // Comprime JPEG
+    if (mimeType.match(/^image\/(jpeg|jpg)$/i)) {
+      processedBuffer = await sharpImage
+        .jpeg({ quality: JPEG_QUALITY, mozjpeg: true })
+        .toBuffer();
+      optimized = true;
+    } else if (mimeType.match(/^image\/png$/i)) {
+      // Para PNG, converte para JPEG (mais compacto)
+      processedBuffer = await sharpImage
+        .jpeg({ quality: JPEG_QUALITY, mozjpeg: true })
+        .toBuffer();
+      mimeType = 'image/jpeg';
+      optimized = true;
+    }
+    
+    const newSizeKB = processedBuffer.length / 1024;
+    const reduction = ((originalSizeKB - newSizeKB) / originalSizeKB * 100).toFixed(1);
+    
+    if (optimized) {
+      log(`[OPTIMIZE] Imagem otimizada: ${originalSizeKB.toFixed(1)}KB → ${newSizeKB.toFixed(1)}KB (${reduction}% redução)`);
+    }
+    
+    return { buffer: processedBuffer, mimeType, optimized };
+  } catch (error) {
+    warn(`[OPTIMIZE] Erro ao otimizar imagem, usando original:`, error.message);
+    return { buffer: imageBuffer, mimeType, optimized: false };
+  }
+}
+
+/**
+ * Adiciona parâmetros de otimização na URL da câmera (se suportado)
+ * Tenta múltiplos formatos de parâmetros (diferentes modelos de câmera)
+ */
+function optimizeCameraUrl(url) {
+  try {
+    const urlObj = new URL(url);
+    const baseUrl = urlObj.origin + urlObj.pathname;
+    
+    // Tenta diferentes formatos de parâmetros (alguns modelos usam width/height, outros resolution)
+    if (!urlObj.searchParams.has('resolution') && !urlObj.searchParams.has('width')) {
+      // Tenta resolution primeiro
+      urlObj.searchParams.set('resolution', `${MAX_IMAGE_WIDTH}x${MAX_IMAGE_HEIGHT}`);
+      // Se não funcionar, alguns modelos usam width/height separados
+      // urlObj.searchParams.set('width', String(MAX_IMAGE_WIDTH));
+      // urlObj.searchParams.set('height', String(MAX_IMAGE_HEIGHT));
+    }
+    if (!urlObj.searchParams.has('quality')) {
+      urlObj.searchParams.set('quality', String(JPEG_QUALITY));
+    }
+    if (!urlObj.searchParams.has('compression')) {
+      urlObj.searchParams.set('compression', 'high');
+    }
+    // Alguns modelos usam 'subtype' ou 'subType' para qualidade
+    if (!urlObj.searchParams.has('subtype') && !urlObj.searchParams.has('subType')) {
+      urlObj.searchParams.set('subtype', '0'); // 0 = JPEG, 1 = MJPEG
+    }
+    
+    return urlObj.toString();
+  } catch (e) {
+    // Se falhar ao parsear URL, retorna original
+    return url;
+  }
+}
+
 async function downloadSnapshot(url, username, password) {
   if (!username || !password) {
     throw new Error('CAMERA_USER e CAMERA_PASS devem estar configurados');
   }
   
   const cleanUrl = url.replace(/\/\/[^@]+@/, '//');
-  const displayUrl = cleanUrl;
+  
+  // Tenta otimizar URL com parâmetros (se a câmera suportar)
+  const optimizedUrl = optimizeCameraUrl(cleanUrl);
+  const displayUrl = optimizedUrl !== cleanUrl ? `${cleanUrl} [otimizado]` : cleanUrl;
   
   log(`[SNAPSHOT] Baixando snapshot de ${displayUrl}`);
   
   // Debug: mostra credenciais se DEBUG estiver ativo
   if (DEBUG) {
     dbg(`[SNAPSHOT] Credenciais - User: ${username}, Pass: ${password}`);
-    dbg(`[SNAPSHOT] URL: ${cleanUrl}`);
+    dbg(`[SNAPSHOT] URL original: ${cleanUrl}`);
+    if (optimizedUrl !== cleanUrl) {
+      dbg(`[SNAPSHOT] URL otimizada: ${optimizedUrl}`);
+    }
   }
   
-  // Tenta primeiro com autenticação básica
-  try {
+  // Usa URL otimizada para download
+  const downloadUrl = optimizedUrl;
+  
+  // Verifica cache de tipo de autenticação (evita tentar Basic se já sabemos que é Digest)
+  const cachedAuthType = authTypeCache.get(cleanUrl);
+  
+  // Se cache indica Digest, faz requisição inicial para obter nonce
+  if (cachedAuthType === 'digest') {
     if (DEBUG) {
-      dbg(`[SNAPSHOT] Tentando autenticação Basic HTTP`);
+      dbg(`[SNAPSHOT] Cache indica Digest - fazendo requisição inicial para obter nonce`);
     }
-    
-    const response = await axios.get(cleanUrl, {
-      responseType: 'arraybuffer',
-      timeout: 15000,
-      auth: { username, password },
-      validateStatus: (status) => status === 200,
-      headers: {
-        'User-Agent': 'WhatsApp-API/1.0',
-        'Accept': 'image/*,*/*'
-      }
-    });
-    
-    if (!response.data || response.data.length === 0) {
-      throw new Error('Resposta vazia da câmera');
-    }
-    
-    const buffer = Buffer.from(response.data);
-    const base64 = buffer.toString('base64');
-    const mimeType = response.headers['content-type'] || 'image/jpeg';
-    
-    log(`[SNAPSHOT] Snapshot baixado com sucesso (Basic): ${buffer.length} bytes, tipo: ${mimeType}`);
-    return { base64, mimeType, buffer };
-  } catch (e1) {
-    // Se receber 401, verifica se é Digest e tenta novamente
-    if (e1.response?.status === 401) {
-      const wwwAuth = e1.response?.headers['www-authenticate'] || '';
-      const isDigest = wwwAuth.toLowerCase().includes('digest');
+    try {
+      // Faz requisição inicial sem auth para obter WWW-Authenticate header
+      const initialResponse = await axios.get(downloadUrl, {
+        responseType: 'arraybuffer',
+        timeout: 3000,
+        validateStatus: () => true,  // Aceita qualquer status
+        headers: {
+          'User-Agent': 'WhatsApp-API/1.0',
+          'Accept': 'image/*,*/*',
+          'Connection': 'keep-alive'
+        }
+      });
       
-      if (DEBUG) {
-        dbg(`[SNAPSHOT] Resposta 401 recebida`);
-        dbg(`[SNAPSHOT] Status: ${e1.response?.status}`);
-        dbg(`[SNAPSHOT] Status Text: ${e1.response?.statusText}`);
-        dbg(`[SNAPSHOT] WWW-Authenticate header: ${wwwAuth || '(não presente)'}`);
-        dbg(`[SNAPSHOT] Todos os headers da resposta:`, JSON.stringify(e1.response?.headers || {}, null, 2));
-        dbg(`[SNAPSHOT] Tipo de autenticação detectado: ${isDigest ? 'Digest' : 'Basic (ou não especificado)'}`);
-        dbg(`[SNAPSHOT] Corpo da resposta (primeiros 200 chars):`, e1.response?.data ? String(e1.response.data).slice(0, 200) : '(vazio)');
+      // Se por acaso funcionou sem auth (improvável), processa
+      if (initialResponse.status === 200 && initialResponse.data) {
+        let buffer = Buffer.from(initialResponse.data);
+        let mimeType = initialResponse.headers['content-type'] || 'image/jpeg';
+        const optimized = await optimizeImage(buffer, mimeType);
+        buffer = optimized.buffer;
+        mimeType = optimized.mimeType;
+        const base64 = buffer.toString('base64');
+        log(`[SNAPSHOT] Snapshot baixado (sem auth): ${buffer.length} bytes, tipo: ${mimeType}${optimized.optimized ? ' [OTIMIZADO]' : ''}`);
+        return { base64, mimeType, buffer };
       }
       
-      // Se for Digest, implementa autenticação Digest manualmente
-      if (isDigest) {
-        try {
-          if (DEBUG) {
-            dbg(`[SNAPSHOT] Tentando autenticação Digest HTTP`);
-            dbg(`[SNAPSHOT] Parsing WWW-Authenticate: ${wwwAuth}`);
-          }
-          
-          // Parse do header WWW-Authenticate (formato: Digest realm="...", qop="...", nonce="...", opaque="...")
-          const digestParams = {};
-          
-          // Extrai realm (pode ter espaços, então precisa de parsing mais cuidadoso)
+      // Esperamos 401 com WWW-Authenticate
+      if (initialResponse.status === 401) {
+        const wwwAuth = initialResponse.headers['www-authenticate'] || '';
+        const isDigest = wwwAuth.toLowerCase().includes('digest');
+        
+        if (isDigest) {
+          // Parse do header WWW-Authenticate
           const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
           const nonceMatch = wwwAuth.match(/nonce="([^"]+)"/);
           const qopMatch = wwwAuth.match(/qop="([^"]+)"/);
@@ -418,7 +798,7 @@ async function downloadSnapshot(url, username, password) {
           const opaque = opaqueMatch ? opaqueMatch[1] : '';
           
           // Implementação de Digest Authentication
-          const urlObj = new URL(cleanUrl);
+          const urlObj = new URL(downloadUrl);
           const uri = urlObj.pathname + urlObj.search;
           const method = 'GET';
           
@@ -437,8 +817,6 @@ async function downloadSnapshot(url, username, password) {
           
           // cnonce (client nonce)
           const cnonce = crypto.randomBytes(8).toString('hex');
-          
-          // nc (nonce count) - sempre 00000001 para primeira requisição
           const nc = '00000001';
           
           // response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
@@ -453,13 +831,10 @@ async function downloadSnapshot(url, username, password) {
           }
           
           if (DEBUG) {
-            dbg(`[SNAPSHOT] HA1 input: "${ha1Input}" -> HA1: ${ha1}`);
-            dbg(`[SNAPSHOT] HA2 input: "${ha2Input}" -> HA2: ${ha2}`);
-            dbg(`[SNAPSHOT] Response input: "${responseInput}" -> Response: ${responseHash}`);
-            dbg(`[SNAPSHOT] cnonce: ${cnonce}, nc: ${nc}`);
+            dbg(`[SNAPSHOT] HA1: ${ha1}, HA2: ${ha2}, Response: ${responseHash}`);
           }
           
-          // Monta o header Authorization (ordem específica pode ser importante)
+          // Monta o header Authorization
           let authHeader = `Digest username="${username}", realm="${realm}", nonce="${nonce}", uri="${uri}", response="${responseHash}"`;
           if (qop) {
             authHeader += `, qop="${qop}", nc=${nc}, cnonce="${cnonce}"`;
@@ -468,33 +843,200 @@ async function downloadSnapshot(url, username, password) {
             authHeader += `, opaque="${opaque}"`;
           }
           
-          if (DEBUG) {
-            dbg(`[SNAPSHOT] Authorization header: ${authHeader}`);
-          }
-          
           // Faz a requisição com o header Authorization
-          const response = await axios.get(cleanUrl, {
+          const response = await axios.get(downloadUrl, {
             responseType: 'arraybuffer',
-            timeout: 15000,
+            timeout: 20000,
             headers: {
               'User-Agent': 'WhatsApp-API/1.0',
               'Accept': 'image/*,*/*',
-              'Authorization': authHeader
+              'Authorization': authHeader,
+              'Connection': 'keep-alive'
             },
-            validateStatus: (status) => status === 200
+            validateStatus: (status) => status === 200,
+            maxRedirects: 0
           });
           
           if (!response.data || response.data.length === 0) {
             throw new Error('Resposta vazia da câmera');
           }
           
-          const buffer = Buffer.from(response.data);
-          const base64 = buffer.toString('base64');
-          const mimeType = response.headers['content-type'] || 'image/jpeg';
+          let buffer = Buffer.from(response.data);
+          let mimeType = response.headers['content-type'] || 'image/jpeg';
           
-          log(`[SNAPSHOT] Snapshot baixado com sucesso (Digest): ${buffer.length} bytes, tipo: ${mimeType}`);
+          // Otimiza a imagem se necessário
+          const optimized = await optimizeImage(buffer, mimeType);
+          buffer = optimized.buffer;
+          mimeType = optimized.mimeType;
+          
+          const base64 = buffer.toString('base64');
+          log(`[SNAPSHOT] Snapshot baixado com sucesso (Digest - cache): ${buffer.length} bytes, tipo: ${mimeType}${optimized.optimized ? ' [OTIMIZADO]' : ''}`);
           return { base64, mimeType, buffer };
-        } catch (e2) {
+        }
+      }
+      
+      // Se não for 401 ou não for Digest, tenta Basic mesmo assim
+      throw new Error('Unexpected response from camera');
+    } catch (e) {
+      // Se falhar, limpa cache e tenta Basic
+      if (DEBUG) {
+        dbg(`[SNAPSHOT] Erro ao usar cache Digest, limpando cache e tentando Basic:`, e.message);
+      }
+      authTypeCache.delete(cleanUrl);
+      // Continua com o fluxo normal abaixo (tenta Basic)
+    }
+  }
+  
+  // Tenta primeiro com autenticação básica (se cache não indica Digest ou se cache foi limpo)
+  const currentCache = authTypeCache.get(cleanUrl);
+  if (currentCache !== 'digest') {
+    try {
+      if (DEBUG) {
+        dbg(`[SNAPSHOT] Tentando autenticação Basic HTTP`);
+      }
+      
+      const response = await axios.get(downloadUrl, {
+        responseType: 'arraybuffer',
+        timeout: 5000,  // Reduzido para 5s (se for Digest, vai falhar rápido)
+        auth: { username, password },
+        validateStatus: (status) => status === 200,
+        headers: {
+          'User-Agent': 'WhatsApp-API/1.0',
+          'Accept': 'image/*,*/*',
+          'Connection': 'keep-alive'  // Reutiliza conexão
+        },
+        maxRedirects: 0  // Evita redirects desnecessários
+      });
+      
+      if (!response.data || response.data.length === 0) {
+        throw new Error('Resposta vazia da câmera');
+      }
+      
+      let buffer = Buffer.from(response.data);
+      let mimeType = response.headers['content-type'] || 'image/jpeg';
+      
+      // Otimiza a imagem se necessário
+      const optimized = await optimizeImage(buffer, mimeType);
+      buffer = optimized.buffer;
+      mimeType = optimized.mimeType;
+      
+      const base64 = buffer.toString('base64');
+      log(`[SNAPSHOT] Snapshot baixado com sucesso (Basic): ${buffer.length} bytes, tipo: ${mimeType}${optimized.optimized ? ' [OTIMIZADO]' : ''}`);
+      // Cache: Basic funcionou
+      authTypeCache.set(cleanUrl, 'basic');
+      return { base64, mimeType, buffer };
+    } catch (e1) {
+      // Se receber 401, verifica se é Digest e tenta novamente
+      if (e1.response?.status === 401) {
+        const wwwAuth = e1.response?.headers['www-authenticate'] || '';
+        const isDigest = wwwAuth.toLowerCase().includes('digest');
+        
+        if (DEBUG) {
+          dbg(`[SNAPSHOT] Resposta 401 recebida`);
+          dbg(`[SNAPSHOT] Status: ${e1.response?.status}`);
+          dbg(`[SNAPSHOT] Status Text: ${e1.response?.statusText}`);
+          dbg(`[SNAPSHOT] WWW-Authenticate header: ${wwwAuth || '(não presente)'}`);
+          dbg(`[SNAPSHOT] Tipo de autenticação detectado: ${isDigest ? 'Digest' : 'Basic (ou não especificado)'}`);
+        }
+        
+        // Cache: é Digest
+        authTypeCache.set(cleanUrl, 'digest');
+        
+        // Se for Digest, implementa autenticação Digest manualmente
+        if (isDigest) {
+          try {
+            if (DEBUG) {
+              dbg(`[SNAPSHOT] Tentando autenticação Digest HTTP`);
+              dbg(`[SNAPSHOT] Parsing WWW-Authenticate: ${wwwAuth}`);
+            }
+            
+            // Parse do header WWW-Authenticate
+            const realmMatch = wwwAuth.match(/realm="([^"]+)"/);
+            const nonceMatch = wwwAuth.match(/nonce="([^"]+)"/);
+            const qopMatch = wwwAuth.match(/qop="([^"]+)"/);
+            const opaqueMatch = wwwAuth.match(/opaque="([^"]+)"/);
+            
+            const realm = realmMatch ? realmMatch[1] : '';
+            const nonce = nonceMatch ? nonceMatch[1] : '';
+            const qop = qopMatch ? qopMatch[1] : '';
+            const opaque = opaqueMatch ? opaqueMatch[1] : '';
+            
+            // Implementação de Digest Authentication
+            const urlObj = new URL(downloadUrl);
+            const uri = urlObj.pathname + urlObj.search;
+            const method = 'GET';
+            
+            if (DEBUG) {
+              dbg(`[SNAPSHOT] Digest params - realm: "${realm}", nonce: "${nonce}", qop: "${qop}", opaque: "${opaque}"`);
+              dbg(`[SNAPSHOT] URI: "${uri}", Method: "${method}"`);
+            }
+            
+            // HA1 = MD5(username:realm:password)
+            const ha1Input = `${username}:${realm}:${password}`;
+            const ha1 = crypto.createHash('md5').update(ha1Input).digest('hex');
+            
+            // HA2 = MD5(method:uri)
+            const ha2Input = `${method}:${uri}`;
+            const ha2 = crypto.createHash('md5').update(ha2Input).digest('hex');
+            
+            // cnonce (client nonce)
+            const cnonce = crypto.randomBytes(8).toString('hex');
+            const nc = '00000001';
+            
+            // response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+            let responseHash = '';
+            let responseInput = '';
+            if (qop) {
+              responseInput = `${ha1}:${nonce}:${nc}:${cnonce}:${qop}:${ha2}`;
+              responseHash = crypto.createHash('md5').update(responseInput).digest('hex');
+            } else {
+              responseInput = `${ha1}:${nonce}:${ha2}`;
+              responseHash = crypto.createHash('md5').update(responseInput).digest('hex');
+            }
+            
+            if (DEBUG) {
+              dbg(`[SNAPSHOT] HA1: ${ha1}, HA2: ${ha2}, Response: ${responseHash}`);
+            }
+            
+            // Monta o header Authorization
+            let authHeader = `Digest username="${username}", realm="${realm}", nonce="${nonce}", uri="${uri}", response="${responseHash}"`;
+            if (qop) {
+              authHeader += `, qop="${qop}", nc=${nc}, cnonce="${cnonce}"`;
+            }
+            if (opaque) {
+              authHeader += `, opaque="${opaque}"`;
+            }
+            
+            // Faz a requisição com o header Authorization
+            const response = await axios.get(downloadUrl, {
+              responseType: 'arraybuffer',
+              timeout: 20000,  // Aumentado para 20s (câmera pode ser lenta para gerar imagem)
+              headers: {
+                'User-Agent': 'WhatsApp-API/1.0',
+                'Accept': 'image/*,*/*',
+                'Authorization': authHeader,
+                'Connection': 'keep-alive'  // Reutiliza conexão
+              },
+              validateStatus: (status) => status === 200,
+              maxRedirects: 0
+            });
+            
+            if (!response.data || response.data.length === 0) {
+              throw new Error('Resposta vazia da câmera');
+            }
+            
+            let buffer = Buffer.from(response.data);
+            let mimeType = response.headers['content-type'] || 'image/jpeg';
+            
+            // Otimiza a imagem se necessário
+            const optimized = await optimizeImage(buffer, mimeType);
+            buffer = optimized.buffer;
+            mimeType = optimized.mimeType;
+            
+            const base64 = buffer.toString('base64');
+            log(`[SNAPSHOT] Snapshot baixado com sucesso (Digest): ${buffer.length} bytes, tipo: ${mimeType}${optimized.optimized ? ' [OTIMIZADO]' : ''}`);
+            return { base64, mimeType, buffer };
+          } catch (e2) {
           if (DEBUG) {
             dbg(`[SNAPSHOT] Erro na autenticação Digest:`, e2.message);
             dbg(`[SNAPSHOT] Status: ${e2.response?.status}, Headers:`, JSON.stringify(e2.response?.headers || {}));
@@ -507,28 +1049,29 @@ async function downloadSnapshot(url, username, password) {
           } else {
             err(`[SNAPSHOT] Erro HTTP ${status} ${statusText || ''}:`, e2.message);
           }
-          throw e2;
+              throw e2;
+          }
+        } else {
+          // Se não for Digest mas ainda deu 401, reporta erro
+          if (DEBUG) {
+            dbg(`[SNAPSHOT] Erro na autenticação Basic:`, e1.message);
+            dbg(`[SNAPSHOT] Status: ${e1.response?.status}, Headers:`, JSON.stringify(e1.response?.headers || {}));
+          }
+          err(`[SNAPSHOT] Erro 401 - Autenticação Basic falhou. Verifique CAMERA_USER e CAMERA_PASS.`);
+          err(`[SNAPSHOT] WWW-Authenticate: ${wwwAuth || '(não fornecido)'}`);
+          throw e1;
         }
       } else {
-        // Se não for Digest mas ainda deu 401, reporta erro
-        if (DEBUG) {
-          dbg(`[SNAPSHOT] Erro na autenticação Basic:`, e1.message);
-          dbg(`[SNAPSHOT] Status: ${e1.response?.status}, Headers:`, JSON.stringify(e1.response?.headers || {}));
+        // Outro tipo de erro (não foi 401)
+        const status = e1.response?.status;
+        const statusText = e1.response?.statusText;
+        if (status) {
+          err(`[SNAPSHOT] Erro HTTP ${status} ${statusText || ''}:`, e1.message);
+        } else {
+          err(`[SNAPSHOT] Erro ao baixar snapshot:`, e1.message);
         }
-        err(`[SNAPSHOT] Erro 401 - Autenticação Basic falhou. Verifique CAMERA_USER e CAMERA_PASS.`);
-        err(`[SNAPSHOT] WWW-Authenticate: ${wwwAuth || '(não fornecido)'}`);
         throw e1;
       }
-    } else {
-      // Outro tipo de erro
-      const status = e1.response?.status;
-      const statusText = e1.response?.statusText;
-      if (status) {
-        err(`[SNAPSHOT] Erro HTTP ${status} ${statusText || ''}:`, e1.message);
-      } else {
-        err(`[SNAPSHOT] Erro ao baixar snapshot:`, e1.message);
-      }
-      throw e1;
     }
   }
 }
@@ -549,6 +1092,284 @@ function readNumbersFromFile(filePath) {
     err(`[NUMBERS] Erro ao ler arquivo de números:`, e.message);
     return [];
   }
+}
+
+/**
+ * Verifica se um número está cadastrado no arquivo
+ * @param {string} phoneNumber - Número a verificar (pode estar em qualquer formato)
+ * @returns {boolean}
+ */
+function isNumberRegistered(phoneNumber) {
+  try {
+    const numbers = readNumbersFromFile(NUMBERS_FILE);
+    const normalized = normalizeBR(phoneNumber);
+    const normalizedNumbers = numbers.map(n => normalizeBR(n));
+    return normalizedNumbers.includes(normalized);
+  } catch (e) {
+    err(`[NUMBERS] Erro ao verificar número:`, e.message);
+    return false;
+  }
+}
+
+/**
+ * Constrói URL RTSP com credenciais se necessário
+ * @returns {string} URL RTSP completa
+ */
+function buildRTSPUrl() {
+  // Se CAMERA_RTSP_URL já tem credenciais, usa diretamente
+  if (CAMERA_RTSP_URL && CAMERA_RTSP_URL.includes('@')) {
+    return CAMERA_RTSP_URL;
+  }
+  
+  // Se não tem URL completa, constrói a partir das variáveis
+  if (!CAMERA_RTSP_URL && CAMERA_USER && CAMERA_PASS) {
+    // Tenta construir URL padrão baseada no snapshot URL
+    const snapshotUrl = CAMERA_SNAPSHOT_URL || '';
+    const match = snapshotUrl.match(/https?:\/\/([^\/]+)/);
+    if (match) {
+      const host = match[1].replace(/^[^@]+@/, ''); // Remove credenciais se existirem
+      return `rtsp://${CAMERA_USER}:${CAMERA_PASS}@${host}:554/cam/realmonitor?channel=1&subtype=0`;
+    }
+  }
+  
+  // Se tem URL mas não tem credenciais, adiciona
+  if (CAMERA_RTSP_URL && !CAMERA_RTSP_URL.includes('@') && CAMERA_USER && CAMERA_PASS) {
+    const url = CAMERA_RTSP_URL.replace(/^rtsp:\/\//, '');
+    return `rtsp://${CAMERA_USER}:${CAMERA_PASS}@${url}`;
+  }
+  
+  return CAMERA_RTSP_URL || '';
+}
+
+/**
+ * Remove arquivo de vídeo de forma segura
+ * @param {string} filePath - Caminho do arquivo a ser removido
+ * @param {string} context - Contexto para logs (ex: "após envio", "após erro")
+ */
+function cleanupVideoFile(filePath, context = '') {
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      log(`[CLEANUP] Arquivo removido ${context}: ${filePath}`);
+    }
+  } catch (e) {
+    warn(`[CLEANUP] Erro ao remover arquivo ${context}:`, e.message);
+  }
+}
+
+/**
+ * Comprime vídeo se necessário para WhatsApp (limite ~16MB, mas comprimimos se > MAX_VIDEO_SIZE_MB)
+ * @param {string} inputFile - Caminho do arquivo de vídeo original
+ * @param {object} message - Objeto de mensagem do WhatsApp para enviar feedback (opcional)
+ * @returns {Promise<string>} Caminho do arquivo comprimido (pode ser o mesmo se não precisar comprimir)
+ */
+async function compressVideoIfNeeded(inputFile, message = null) {
+  const stats = fs.statSync(inputFile);
+  const sizeMB = stats.size / 1024 / 1024;
+  
+  if (sizeMB <= MAX_VIDEO_SIZE_MB) {
+    log(`[COMPRESS] Vídeo não precisa comprimir: ${sizeMB.toFixed(2)} MB (limite: ${MAX_VIDEO_SIZE_MB} MB)`);
+    return inputFile;
+  }
+  
+  log(`[COMPRESS] Vídeo muito grande (${sizeMB.toFixed(2)} MB), comprimindo para ${MAX_VIDEO_SIZE_MB} MB...`);
+  if (message) {
+    const compressMsg = `📦 Comprimindo vídeo (${sizeMB.toFixed(1)} MB → ~${MAX_VIDEO_SIZE_MB} MB)...`;
+    log(`[COMPRESS] Enviando mensagem: "${compressMsg}"`);
+    message.reply(compressMsg)
+      .then(() => log(`[COMPRESS] Mensagem de compressão enviada`))
+      .catch((e) => err(`[COMPRESS] Erro ao enviar mensagem:`, e.message));
+  }
+  
+  const compressedFile = inputFile.replace('.mp4', '_compressed.mp4');
+  
+  return new Promise((resolve, reject) => {
+    ffmpeg(inputFile)
+      .outputOptions([
+        '-c:v', 'libx264',
+        '-preset', 'fast',
+        '-crf', String(VIDEO_CRF),  // CRF maior = menor qualidade, menor arquivo
+        '-maxrate', '1.5M',         // Bitrate máximo para compressão
+        '-bufsize', '3M',           // Buffer size
+        '-vf', 'scale=1280:720',   // Reduz resolução para 720p
+        '-c:a', 'aac',
+        '-b:a', '96k',              // Reduz bitrate de áudio
+        '-ar', '44100',             // Sample rate de áudio
+        '-movflags', '+faststart',  // Otimização (removido empty_moov)
+        '-pix_fmt', 'yuv420p',      // Formato de pixel compatível (necessário para WhatsApp)
+        '-profile:v', 'baseline',   // Perfil H.264 baseline (mais compatível)
+        '-level', '3.1',            // Nível H.264 3.1 (mais compatível)
+        '-g', '30',                 // GOP size
+        '-keyint_min', '30',        // Intervalo mínimo entre keyframes
+        '-sc_threshold', '0',       // Desabilita scene change detection
+        '-avoid_negative_ts', 'make_zero',  // Evita problemas de timestamp
+        '-fflags', '+genpts',       // Gera timestamps corretos
+        '-strict', '-2'             // Permite experimental codecs
+      ])
+      .output(compressedFile)
+      .on('start', (cmdline) => {
+        log(`[COMPRESS] Iniciando compressão...`);
+        if (DEBUG) {
+          dbg(`[COMPRESS] Comando: ${cmdline}`);
+        }
+      })
+      .on('end', () => {
+        const newStats = fs.statSync(compressedFile);
+        const newSizeMB = newStats.size / 1024 / 1024;
+        const reduction = ((sizeMB - newSizeMB) / sizeMB * 100).toFixed(1);
+        log(`[COMPRESS] Compressão concluída: ${sizeMB.toFixed(2)} MB → ${newSizeMB.toFixed(2)} MB (${reduction}% redução)`);
+        
+        // Remove arquivo original
+        try {
+          fs.unlinkSync(inputFile);
+          log(`[COMPRESS] Arquivo original removido`);
+        } catch (e) {
+          warn(`[COMPRESS] Erro ao remover arquivo original:`, e.message);
+        }
+        
+        resolve(compressedFile);
+      })
+      .on('error', (err) => {
+        err(`[COMPRESS] Erro na compressão:`, err.message);
+        // Se falhar, retorna o original
+        resolve(inputFile);
+      })
+      .run();
+  });
+}
+
+/**
+ * Grava vídeo RTSP por X segundos e envia feedback durante o processo
+ * @param {string} rtspUrl - URL RTSP da câmera
+ * @param {number} durationSeconds - Duração da gravação em segundos
+ * @param {object} message - Objeto de mensagem do WhatsApp para enviar feedback
+ * @returns {Promise<{success: boolean, filePath: string|null, error: string|null}>}
+ */
+async function recordRTSPVideo(rtspUrl, durationSeconds, message) {
+  if (!rtspUrl) {
+    throw new Error('CAMERA_RTSP_URL não configurada');
+  }
+  
+  // Verifica se ffmpeg está disponível
+  if (!ffmpegConfigured) {
+    const errorMsg = 'FFmpeg não está disponível. Instale ffmpeg no sistema ou verifique a instalação do ffmpeg-static.';
+    err(`[RECORD] ${errorMsg}`);
+    throw new Error(errorMsg);
+  }
+  
+  // Garante que o diretório de gravações existe
+  if (!fs.existsSync(RECORDINGS_DIR)) {
+    fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
+    log(`[RECORD] Diretório de gravações criado: ${RECORDINGS_DIR}`);
+  }
+  
+  const timestamp = Date.now();
+  const outputFile = path.join(RECORDINGS_DIR, `recording_${timestamp}.mp4`);
+  
+  return new Promise((resolve, reject) => {
+    let progressInterval = null;
+    let lastProgress = 0;
+    
+    // Envia feedback inicial
+    const initialMsg = `🎥 Iniciando gravação de ${durationSeconds} segundos...`;
+    log(`[RECORD] Enviando mensagem: "${initialMsg}"`);
+    message.reply(initialMsg)
+      .then(() => log(`[RECORD] Mensagem enviada com sucesso: "${initialMsg}"`))
+      .catch((e) => err(`[RECORD] Erro ao enviar mensagem inicial:`, e.message));
+    
+    // Constrói comando ffmpeg (corrigido: não duplica -i)
+    const command = ffmpeg()
+      .input(rtspUrl)
+      .inputOptions([
+        '-rtsp_transport', 'tcp',  // Usa TCP para maior confiabilidade
+        '-timeout', '5000000',     // Timeout de 5 segundos (em microsegundos)
+        '-rtsp_flags', 'prefer_tcp' // Prefere TCP para RTSP
+      ])
+      .outputOptions([
+        '-t', String(durationSeconds),  // Duração
+        '-c:v', 'libx264',              // Codec de vídeo
+        '-preset', 'ultrafast',         // Preset rápido
+        '-crf', '23',                   // Qualidade melhor (23 é padrão, mais compatível que 28)
+        '-maxrate', '2M',               // Bitrate máximo (limita tamanho)
+        '-bufsize', '4M',               // Buffer size
+        '-c:a', 'aac',                  // Codec de áudio
+        '-b:a', '128k',                 // Bitrate de áudio
+        '-ar', '44100',                 // Sample rate de áudio (padrão WhatsApp)
+        '-movflags', '+faststart',      // Otimização para streaming (removido empty_moov que pode causar problemas)
+        '-pix_fmt', 'yuv420p',         // Formato de pixel compatível (necessário para WhatsApp)
+        '-profile:v', 'baseline',       // Perfil H.264 baseline (mais compatível)
+        '-level', '3.1',                // Nível H.264 3.1 (mais compatível que 3.0)
+        '-g', '30',                     // GOP size (keyframe a cada 30 frames)
+        '-keyint_min', '30',            // Intervalo mínimo entre keyframes
+        '-sc_threshold', '0',           // Desabilita scene change detection
+        '-avoid_negative_ts', 'make_zero',  // Evita problemas de timestamp
+        '-fflags', '+genpts',          // Gera timestamps corretos
+        '-strict', '-2'                 // Permite experimental codecs se necessário
+      ])
+      .output(outputFile)
+      .on('start', (cmdline) => {
+        log(`[RECORD] Iniciando gravação: ${outputFile}`);
+        if (DEBUG) {
+          dbg(`[RECORD] Comando ffmpeg: ${cmdline}`);
+        }
+        
+        // Envia feedback a cada 25% do progresso
+        progressInterval = setInterval(() => {
+          const elapsed = Date.now() - timestamp;
+          const progress = Math.min(100, Math.floor((elapsed / (durationSeconds * 1000)) * 100));
+          
+          if (progress >= lastProgress + 25 && progress <= 100) {
+            lastProgress = progress;
+            const remaining = Math.max(0, durationSeconds - Math.floor(elapsed / 1000));
+            const progressMsg = `⏳ Gravando... ${progress}% (${remaining}s restantes)`;
+            log(`[RECORD] Enviando progresso: "${progressMsg}"`);
+            message.reply(progressMsg)
+              .then(() => log(`[RECORD] Progresso enviado: ${progress}%`))
+              .catch((e) => err(`[RECORD] Erro ao enviar progresso:`, e.message));
+          }
+        }, 1000); // Verifica a cada segundo
+      })
+      .on('progress', (progress) => {
+        if (DEBUG && progress.percent) {
+          dbg(`[RECORD] Progresso: ${progress.percent.toFixed(1)}%`);
+        }
+      })
+      .on('end', () => {
+        if (progressInterval) {
+          clearInterval(progressInterval);
+        }
+        log(`[RECORD] Gravação concluída: ${outputFile}`);
+        const completeMsg = `✅ Gravação concluída! Processando vídeo...`;
+        log(`[RECORD] Enviando mensagem: "${completeMsg}"`);
+        message.reply(completeMsg)
+          .then(() => log(`[RECORD] Mensagem de conclusão enviada`))
+          .catch((e) => err(`[RECORD] Erro ao enviar mensagem de conclusão:`, e.message));
+        resolve({ success: true, filePath: outputFile, error: null });
+      })
+      .on('error', (ffmpegError, stdout, stderr) => {
+        if (progressInterval) {
+          clearInterval(progressInterval);
+        }
+        err(`[RECORD] Erro na gravação:`, ffmpegError.message);
+        if (stderr) {
+          dbg(`[RECORD] stderr: ${stderr}`);
+        }
+        const errorMsg = `❌ Erro na gravação: ${ffmpegError.message}`;
+        log(`[RECORD] Enviando mensagem de erro: "${errorMsg}"`);
+        message.reply(errorMsg)
+          .then(() => log(`[RECORD] Mensagem de erro enviada`))
+          .catch((e) => err(`[RECORD] Erro ao enviar mensagem de erro:`, e.message));
+        
+        // Remove arquivo parcial se existir
+        if (fs.existsSync(outputFile)) {
+          fs.unlinkSync(outputFile);
+        }
+        
+        resolve({ success: false, filePath: null, error: ffmpegError.message });
+      });
+    
+    command.run();
+  });
 }
 
 /* ===== endpoints ===== */
@@ -673,31 +1494,69 @@ app.post('/trigger-snapshot', (req, res, next) => {
 
     // Cria o MessageMedia
     const media = new MessageMedia(mimeType, base64, `snapshot_${Date.now()}.jpg`);
-    
-    // Envia para cada número
-    const results = [];
     const message = req.body?.message || '📸 Snapshot da câmera';
     
-    for (const rawPhone of numbers) {
-      try {
-        const normalized = normalizeBR(rawPhone);
-        const { id: numberId, tried } = await resolveWhatsAppNumber(client, normalized);
-        
-        if (!numberId) {
-          warn(`[SNAPSHOT][${rid}] Número não está no WhatsApp: ${normalized} | tried=${tried.join(',')}`);
-          results.push({ phone: normalized, success: false, error: 'not_on_whatsapp', tried });
-          continue;
+    // OTIMIZAÇÃO: Resolve todos os números em paralelo ANTES de enviar
+    log(`[SNAPSHOT][${rid}] Resolvendo ${numbers.length} número(s) em paralelo...`);
+    const numberResolutions = await Promise.all(
+      numbers.map(async (rawPhone) => {
+        try {
+          const normalized = normalizeBR(rawPhone);
+          const { id: numberId, tried } = await resolveWhatsAppNumber(client, normalized);
+          return { rawPhone, normalized, numberId, tried, error: null };
+        } catch (e) {
+          return { rawPhone, normalized: rawPhone, numberId: null, tried: [], error: String(e) };
         }
-
+      })
+    );
+    
+    // Filtra números válidos
+    const validNumbers = numberResolutions.filter(n => n.numberId !== null);
+    const invalidNumbers = numberResolutions.filter(n => n.numberId === null);
+    
+    if (validNumbers.length === 0) {
+      warn(`[SNAPSHOT][${rid}] Nenhum número válido encontrado`);
+      return res.status(400).json({
+        ok: false,
+        error: 'no_valid_numbers',
+        requestId: rid,
+        results: invalidNumbers.map(n => ({
+          phone: n.normalized,
+          success: false,
+          error: n.error || 'not_on_whatsapp',
+          tried: n.tried
+        }))
+      });
+    }
+    
+    log(`[SNAPSHOT][${rid}] ${validNumbers.length} número(s) válido(s), ${invalidNumbers.length} inválido(s)`);
+    
+    // OTIMIZAÇÃO: Envia para todos os números em PARALELO
+    const sendPromises = validNumbers.map(async ({ normalized, numberId, rawPhone }) => {
+      try {
         const to = numberId._serialized;
         const r = await client.sendMessage(to, media, { caption: message });
         log(`[SNAPSHOT OK][${rid}] Enviado para ${to} | id=${r.id?._serialized || 'n/a'}`);
-        results.push({ phone: normalized, success: true, to, msgId: r.id?._serialized || null });
+        return { phone: normalized, success: true, to, msgId: r.id?._serialized || null };
       } catch (e) {
         err(`[SNAPSHOT][${rid}] Erro ao enviar para ${rawPhone}:`, e.message);
-        results.push({ phone: rawPhone, success: false, error: String(e) });
+        return { phone: normalized, success: false, error: String(e) };
       }
-    }
+    });
+    
+    // Aguarda todos os envios em paralelo
+    const sendResults = await Promise.all(sendPromises);
+    
+    // Combina resultados (válidos + inválidos)
+    const results = [
+      ...sendResults,
+      ...invalidNumbers.map(n => ({
+        phone: n.normalized,
+        success: false,
+        error: n.error || 'not_on_whatsapp',
+        tried: n.tried
+      }))
+    ];
 
     const successCount = results.filter(r => r.success).length;
     log(`[SNAPSHOT][${rid}] Processo concluído: ${successCount}/${results.length} enviados com sucesso`);
