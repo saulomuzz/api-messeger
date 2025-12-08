@@ -9,8 +9,8 @@ Este erro indica que a assinatura HMAC-SHA256 está incorreta. Aqui estão as ca
 Certifique-se de que as credenciais no arquivo `.env` estão corretas:
 
 ```bash
-TUYA_CLIENT_ID=smu5nmy5cuueqvag5xty
-TUYA_CLIENT_SECRET=8dc9e1576bb64b8c98bee0d4af2e8801
+TUYA_CLIENT_ID=seu_client_id_aqui
+TUYA_CLIENT_SECRET=seu_client_secret_aqui
 TUYA_REGION=us
 ```
 
@@ -110,9 +110,9 @@ Este script vai:
 ```bash
 # NÃO use o CLIENT_SECRET como sign!
 curl -X GET "https://openapi.tuyaus.com/v1.0/token?grant_type=1" \
-  -H "client_id: smu5nmy5cuueqvag5xty" \
-  -H "sign: 8dc9e1576bb64b8c98bee0d4af2e8801" \  # ❌ Isso é o SECRET, não a assinatura!
-  -H "t: 1765068057679" \  # ❌ Timestamp antigo (vai dar erro "request time is invalid")
+  -H "client_id: seu_client_id_aqui" \
+  -H "sign: seu_client_secret_aqui" \  # ❌ Isso é o SECRET, não a assinatura!
+  -H "t: timestamp_atual" \  # ❌ Timestamp antigo (vai dar erro "request time is invalid")
   -H "sign_method: HMAC-SHA256"
 ```
 
