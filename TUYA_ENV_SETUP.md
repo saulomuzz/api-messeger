@@ -12,10 +12,10 @@ Baseado na imagem da plataforma Tuya, aqui está o mapeamento:
 
 ### Da Seção "Authorization Key":
 
-| Campo na Plataforma | Variável no .env | Valor da Imagem |
-|---------------------|------------------|-----------------|
-| **Access ID/Client ID** | `TUYA_CLIENT_ID` | `smu5nmy5cuueqvag5xty` |
-| **Access Secret/Client Secret** | `TUYA_CLIENT_SECRET` | `8dc9e1576bb64b8c98bee0d4af2e8801` |
+| Campo na Plataforma | Variável no .env | Exemplo |
+|---------------------|------------------|---------|
+| **Access ID/Client ID** | `TUYA_CLIENT_ID` | `seu_client_id_aqui` |
+| **Access Secret/Client Secret** | `TUYA_CLIENT_SECRET` | `seu_client_secret_aqui` |
 
 ### Da Seção "Data Center":
 
@@ -37,8 +37,8 @@ Baseado na imagem da plataforma Tuya, aqui está o mapeamento:
 
 ```bash
 # Tuya API
-TUYA_CLIENT_ID=smu5nmy5cuueqvag5xty
-TUYA_CLIENT_SECRET=8dc9e1576bb64b8c98bee0d4af2e8801
+TUYA_CLIENT_ID=seu_client_id_aqui
+TUYA_CLIENT_SECRET=seu_client_secret_aqui
 TUYA_REGION=us
 TUYA_UID=seu_uid_aqui
 ```

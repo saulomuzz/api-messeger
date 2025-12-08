@@ -12,20 +12,92 @@
 require('dotenv').config();
 const crypto = require('crypto');
 
-// Configuração
-const CLIENT_ID = process.env.TUYA_CLIENT_ID || 'smu5nmy5cuueqvag5xty';
-const CLIENT_SECRET = process.env.TUYA_CLIENT_SECRET || '8dc9e1576bb64b8c98bee0d4af2e8801';
+// Configuração - Use variáveis de ambiente ou defina aqui para testes locais
+// ⚠️ NUNCA commite este arquivo com credenciais reais!
+const CLIENT_ID = process.env.TUYA_CLIENT_ID || '';
+const CLIENT_SECRET = process.env.TUYA_CLIENT_SECRET || '';
 const REGION = process.env.TUYA_REGION || 'us';
 
-function generateTuyaSign(clientId, secret, timestamp, method, path, body = '') {
+// Validação
+if (!CLIENT_ID || !CLIENT_SECRET) {
+  console.error('❌ ERRO: TUYA_CLIENT_ID e TUYA_CLIENT_SECRET devem estar configurados!');
+  console.error('   Configure no arquivo .env ou exporte como variáveis de ambiente.');
+  process.exit(1);
+}
+
+/**
+ * Gera um nonce (UUID) para requisições Tuya
+ */
+function generateNonce() {
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+    const r = Math.random() * 16 | 0;
+    const v = c === 'x' ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
+/**
+ * Gera assinatura Tuya conforme documentação oficial:
+ * https://developer.tuya.com/en/docs/iot/new-singnature?id=Kbw0q34cs2e5g
+ */
+function generateTuyaSign(clientId, secret, timestamp, method, path, body = '', accessToken = '', nonce = '', signatureHeaders = '') {
+  // Garante que não há espaços ou caracteres invisíveis
+  const cleanClientId = String(clientId).trim();
+  const cleanSecret = String(secret).trim();
+  const cleanTimestamp = String(timestamp).trim();
+  const cleanMethod = String(method).trim().toUpperCase();
+  const cleanPath = String(path).trim();
+  const cleanAccessToken = String(accessToken || '').trim();
+  const cleanNonce = String(nonce || '').trim();
+  const cleanSignatureHeaders = String(signatureHeaders || '').trim();
   const bodyStr = body || '';
+  
+  // Calcula SHA256 do body (string vazia = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855)
   const bodyHash = crypto.createHash('sha256').update(bodyStr, 'utf8').digest('hex').toLowerCase();
   
-  const stringToSign = method + '\n' + bodyHash + '\n\n' + path;
-  const signStr = clientId + secret + timestamp + stringToSign;
-  const sign = crypto.createHmac('sha256', secret).update(signStr, 'utf8').digest('hex').toUpperCase();
+  // Formato do stringToSign conforme documentação:
+  // HTTPMethod + "\n" + Content-SHA256 + "\n" + Optional_Signature_key + "\n" + URL
+  let stringToSign = cleanMethod + '\n' + bodyHash + '\n';
+  if (cleanSignatureHeaders) {
+    stringToSign += cleanSignatureHeaders + '\n';
+  } else {
+    stringToSign += '\n'; // Linha vazia se não houver headers customizados
+  }
+  stringToSign += cleanPath;
   
-  return { sign, stringToSign, signStr: signStr.replace(secret, '***SECRET***') };
+  // Determina se é Token Management API ou General Business API
+  const isTokenAPI = path.includes('/token');
+  
+  // String para assinar conforme documentação oficial
+  let signStr;
+  if (isTokenAPI) {
+    // Token Management API: client_id + t + nonce + stringToSign
+    signStr = cleanClientId + cleanTimestamp + cleanNonce + stringToSign;
+  } else {
+    // General Business API: client_id + access_token + t + nonce + stringToSign
+    signStr = cleanClientId + cleanAccessToken + cleanTimestamp + cleanNonce + stringToSign;
+  }
+  
+  // Gera HMAC-SHA256 usando o secret como chave
+  const sign = crypto.createHmac('sha256', cleanSecret).update(signStr, 'utf8').digest('hex').toUpperCase();
+  
+  return { 
+    sign, 
+    stringToSign, 
+    signStr: signStr.replace(cleanSecret, '***SECRET***'),
+    details: {
+      clientId: cleanClientId,
+      clientIdLength: cleanClientId.length,
+      secretLength: cleanSecret.length,
+      timestamp: cleanTimestamp,
+      method: cleanMethod,
+      path: cleanPath,
+      bodyHash: bodyHash,
+      nonce: cleanNonce,
+      accessToken: cleanAccessToken ? cleanAccessToken.substring(0, 10) + '...' : '(não usado)',
+      isTokenAPI: isTokenAPI
+    }
+  };
 }
 
 // Teste: Obter token
@@ -39,15 +111,28 @@ console.log(`CLIENT_ID: ${CLIENT_ID}`);
 console.log(`CLIENT_SECRET: ${CLIENT_SECRET.substring(0, 10)}...${CLIENT_SECRET.substring(CLIENT_SECRET.length - 4)}`);
 console.log(`REGION: ${REGION}`);
 console.log(`\nTimestamp (atual): ${timestamp}`);
+const nonce = generateNonce();
+console.log(`Nonce: ${nonce}`);
 console.log(`Método: ${method}`);
 console.log(`Path: ${path}`);
 
-const result = generateTuyaSign(CLIENT_ID, CLIENT_SECRET, timestamp, method, path);
+// Para Token Management API: client_id + t + nonce + stringToSign
+const result = generateTuyaSign(CLIENT_ID, CLIENT_SECRET, timestamp, method, path, '', '', nonce);
 
 console.log(`\n--- Cálculo da Assinatura ---`);
-console.log(`BodyHash (SHA256 de ""): e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`);
-console.log(`\nStringToSign:`);
+console.log(`BodyHash (SHA256 de ""): ${result.details.bodyHash}`);
+console.log(`\nDetalhes:`);
+console.log(`  Client ID: "${result.details.clientId}" (${result.details.clientIdLength} chars)`);
+console.log(`  Secret: ${result.details.secretLength} chars`);
+console.log(`  Timestamp: ${result.details.timestamp}`);
+console.log(`  Nonce: ${result.details.nonce}`);
+console.log(`  Method: ${result.details.method}`);
+console.log(`  Path: ${result.details.path}`);
+console.log(`  Tipo: ${result.details.isTokenAPI ? 'Token Management API' : 'General Business API'}`);
+console.log(`\nStringToSign (JSON):`);
 console.log(JSON.stringify(result.stringToSign));
+console.log(`\nStringToSign (raw, mostrando quebras de linha):`);
+console.log(result.stringToSign.split('\n').map((line, i) => `  [${i}]: "${line}"`).join('\n'));
 console.log(`\nSignStr (com secret oculto):`);
 console.log(result.signStr);
 console.log(`\n✅ Assinatura gerada (HMAC-SHA256):`);
@@ -59,6 +144,7 @@ console.log(`curl -X GET "${baseUrl}${path}" \\`);
 console.log(`  -H "client_id: ${CLIENT_ID}" \\`);
 console.log(`  -H "sign: ${result.sign}" \\`);
 console.log(`  -H "t: ${timestamp}" \\`);
+console.log(`  -H "nonce: ${nonce}" \\`);
 console.log(`  -H "sign_method: HMAC-SHA256"`);
 
 console.log(`\n⚠️  IMPORTANTE: Execute o comando curl IMEDIATAMENTE após gerar!`);
@@ -76,6 +162,7 @@ try {
       'client_id': CLIENT_ID,
       'sign': result.sign,
       't': timestamp,
+      'nonce': nonce,
       'sign_method': 'HMAC-SHA256'
     },
     timeout: 10000

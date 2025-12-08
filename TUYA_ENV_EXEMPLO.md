@@ -12,8 +12,8 @@ Segundo a [documentação oficial da Tuya](https://developer.tuya.com/en/docs/io
 
 ```bash
 # Tuya API - DADOS SENSÍVEIS - NUNCA COMMITAR
-TUYA_CLIENT_ID=smu5nmy5cuueqvag5xty
-TUYA_CLIENT_SECRET=8dc9e1576bb64b8c98bee0d4af2e8801
+TUYA_CLIENT_ID=seu_client_id_aqui
+TUYA_CLIENT_SECRET=seu_client_secret_aqui
 ```
 
 **Onde encontrar:**
@@ -46,7 +46,7 @@ TUYA_UID=obter_separadamente
 - ✅ **Onde encontrar:** Na página de gerenciamento de contas de aplicativo do projeto
 - ✅ **Como acessar:** Na plataforma Tuya Developer, vá para o projeto > seção de gerenciamento de contas de aplicativo
 - ✅ **O que procurar:** Na coluna "UID" da tabela de contas de aplicativo
-- 📋 **Exemplo do seu caso:** `az1655237368792Wwr37` (vinculado ao projeto "Api-Wpp" com 32 dispositivos)
+- 📋 **Exemplo:** `seu_uid_aqui` (vinculado ao seu projeto)
 
 **Nota importante:**
 - O "User ID: 32M19MVD" da página "Account Center" **NÃO é o TUYA_UID**
@@ -61,10 +61,10 @@ TUYA_UID=obter_separadamente
 # ⚠️ ESTES SÃO DADOS SENSÍVEIS - NUNCA COMMITAR
 # O arquivo .env já está no .gitignore
 
-TUYA_CLIENT_ID=smu5nmy5cuueqvag5xty
-TUYA_CLIENT_SECRET=8dc9e1576bb64b8c98bee0d4af2e8801
+TUYA_CLIENT_ID=seu_client_id_aqui
+TUYA_CLIENT_SECRET=seu_client_secret_aqui
 TUYA_REGION=us
-TUYA_UID=az1655237368792Wwr37
+TUYA_UID=seu_uid_aqui
 
 # ============================================
 # Outras configurações do projeto

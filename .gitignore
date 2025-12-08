@@ -1,5 +1,7 @@
 node_modules/
 .env
+.env.local
+.env.*.local
 npm-debug.log*
 yarn-error.log
 .pnpm-debug.log
@@ -8,3 +10,5 @@ yarn-error.log
 logs/
 numbers.txt
 recordings/
+*.log
+test-tuya-sign.js
