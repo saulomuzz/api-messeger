@@ -5,6 +5,8 @@
 
 const QRCode = require('qrcode');
 const { MessageMedia } = require('whatsapp-web.js');
+const fs = require('fs');
+const path = require('path');
 
 /**
  * Inicializa o módulo Routes
@@ -37,15 +39,116 @@ function initRoutesModule({
   numbersFile,
   cameraSnapshotUrl,
   authDataPath,
-  tuyaUid
+  tuyaUid,
+  recordingsDir,
+  strictRateLimit
 }) {
   const { log, dbg, warn, err, nowISO } = logger;
   const { requestId, normalizeBR, readNumbersFromFile, getClientIp } = utils;
   
+  // Sistema de gerenciamento de vídeos temporários (24 horas)
+  const TEMP_VIDEOS_DIR = path.join(recordingsDir || path.join(__dirname, '..', '..', 'recordings'), 'temp_videos');
+  const TEMP_VIDEOS_DB = path.join(TEMP_VIDEOS_DIR, 'videos_db.json');
+  const VIDEO_EXPIRY_HOURS = 24;
+  
+  // Garante que o diretório existe
+  if (!fs.existsSync(TEMP_VIDEOS_DIR)) {
+    fs.mkdirSync(TEMP_VIDEOS_DIR, { recursive: true });
+    log(`[TEMP-VIDEOS] Diretório criado: ${TEMP_VIDEOS_DIR}`);
+  }
+  
+  // Carrega banco de dados de vídeos temporários
+  function loadTempVideosDB() {
+    try {
+      if (fs.existsSync(TEMP_VIDEOS_DB)) {
+        const data = fs.readFileSync(TEMP_VIDEOS_DB, 'utf8');
+        return JSON.parse(data);
+      }
+    } catch (e) {
+      warn(`[TEMP-VIDEOS] Erro ao carregar DB:`, e.message);
+    }
+    return {};
+  }
+  
+  // Salva banco de dados de vídeos temporários
+  function saveTempVideosDB(db) {
+    try {
+      fs.writeFileSync(TEMP_VIDEOS_DB, JSON.stringify(db, null, 2), 'utf8');
+    } catch (e) {
+      err(`[TEMP-VIDEOS] Erro ao salvar DB:`, e.message);
+    }
+  }
+  
+  // Limpa vídeos expirados
+  function cleanupExpiredVideos() {
+    const db = loadTempVideosDB();
+    const now = Date.now();
+    const expired = [];
+    
+    for (const [videoId, videoData] of Object.entries(db)) {
+      if (now > videoData.expiresAt) {
+        expired.push(videoId);
+        // Remove arquivo
+        if (videoData.filePath && fs.existsSync(videoData.filePath)) {
+          try {
+            fs.unlinkSync(videoData.filePath);
+            log(`[TEMP-VIDEOS] Vídeo expirado removido: ${videoId}`);
+          } catch (e) {
+            warn(`[TEMP-VIDEOS] Erro ao remover vídeo expirado:`, e.message);
+          }
+        }
+      }
+    }
+    
+    if (expired.length > 0) {
+      expired.forEach(id => delete db[id]);
+      saveTempVideosDB(db);
+      log(`[TEMP-VIDEOS] ${expired.length} vídeo(s) expirado(s) removido(s)`);
+    }
+  }
+  
+  // Registra vídeo temporário
+  function registerTempVideo(filePath, phoneNumbers) {
+    const videoId = `video_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    const expiresAt = Date.now() + (VIDEO_EXPIRY_HOURS * 60 * 60 * 1000);
+    
+    const db = loadTempVideosDB();
+    db[videoId] = {
+      filePath,
+      phoneNumbers: phoneNumbers.map(n => normalizeBR(n)),
+      createdAt: Date.now(),
+      expiresAt,
+      expiresAtISO: new Date(expiresAt).toISOString()
+    };
+    saveTempVideosDB(db);
+    
+    log(`[TEMP-VIDEOS] Vídeo registrado: ${videoId} (expira em ${VIDEO_EXPIRY_HOURS}h)`);
+    return videoId;
+  }
+  
+  // Obtém vídeo temporário
+  function getTempVideo(videoId) {
+    cleanupExpiredVideos();
+    const db = loadTempVideosDB();
+    return db[videoId] || null;
+  }
+  
+  // Limpa vídeos expirados periodicamente (a cada hora)
+  setInterval(() => {
+    cleanupExpiredVideos();
+  }, 60 * 60 * 1000);
+  
+  // Limpa na inicialização
+  cleanupExpiredVideos();
+  
   // Compatibilidade: API oficial não tem client da mesma forma
   const client = whatsapp.client || null;
   const getLastQR = whatsapp.getLastQR || (() => null);
-  const getIsReady = whatsapp.isReady || (() => true);
+  // Garante que getIsReady sempre retorna boolean (compatível com ESP32)
+  const getIsReady = () => {
+    const ready = whatsapp.isReady ? whatsapp.isReady() : true;
+    return typeof ready === 'boolean' ? ready : true;
+  };
   const resolveWhatsAppNumber = whatsapp.resolveWhatsAppNumber || (async (e164) => {
     const normalized = normalizeBR(e164);
     return { id: { _serialized: normalized.replace(/^\+/, '') }, tried: [normalized] };
@@ -65,14 +168,21 @@ function initRoutesModule({
   
   const ip = getClientIp;
   
-  // Health check
+  // Health check - compatível com ESP32
   app.get('/health', (_req, res) => {
-    res.json({ 
+    const isReady = getIsReady();
+    const response = { 
       ok: true, 
-      service: 'whatsapp-web.js', 
-      ready: getIsReady(), 
+      service: 'whatsapp-api', 
+      ready: isReady, 
       ts: nowISO() 
-    });
+    };
+    // Garante que ready é boolean (não undefined)
+    if (typeof response.ready !== 'boolean') {
+      response.ready = true; // Default para true se não for boolean
+    }
+    log(`[HEALTH] Check solicitado | ready=${response.ready}`);
+    res.json(response);
   });
   
   // Status
@@ -154,22 +264,45 @@ function initRoutesModule({
   });
   
   // Send message
-  app.post('/send', auth, async (req, res) => {
+  app.post('/send', strictRateLimit || ((req, res, next) => next()), auth, async (req, res) => {
     const rid = requestId();
+    const clientIp = getClientIp(req);
+    
+    // Validação de entrada
+    if (!req.body) {
+      warn(`[SECURITY][${rid}] Requisição sem body de ${clientIp}`);
+      return res.status(400).json({ ok: false, error: 'invalid_request', message: 'Corpo da requisição inválido', requestId: rid });
+    }
+    
     // Verifica assinatura apenas se REQUIRE_SIGNED_REQUESTS=true
     // Se REQUIRE_SIGNED=false, a função verifySignedRequest retorna true automaticamente
     if (!verifySignedRequest(req, '/send')) {
-      warn(`[SEND][${rid}] 403 invalid signature /send`);
+      warn(`[SECURITY][${rid}] Assinatura inválida de ${clientIp}`);
       dbg(`[SEND][${rid}] Verificação de assinatura falhou. Configure REQUIRE_SIGNED_REQUESTS=false no .env para desabilitar`);
       return res.status(403).json({ ok: false, error: 'invalid signature', requestId: rid, hint: 'Set REQUIRE_SIGNED_REQUESTS=false to disable signature verification' });
     }
+    
     if (!getIsReady()) {
       return res.status(503).json({ ok: false, error: 'whatsapp not ready', requestId: rid });
     }
     
     const { phone, message, subject } = req.body || {};
     if (!phone || !message) {
+      warn(`[SECURITY][${rid}] Requisição com campos faltando de ${clientIp}`);
       return res.status(400).json({ ok: false, error: 'phone and message are required', requestId: rid });
+    }
+    
+    // Validação de tamanho
+    if (typeof message !== 'string' || message.length > 4096) {
+      warn(`[SECURITY][${rid}] Mensagem muito longa de ${clientIp} (${message.length} caracteres)`);
+      return res.status(400).json({ ok: false, error: 'invalid_request', message: 'Mensagem muito longa (máximo 4096 caracteres)', requestId: rid });
+    }
+    
+    // Validação de formato de telefone básico
+    const phoneStr = String(phone).replace(/\D/g, '');
+    if (phoneStr.length < 10 || phoneStr.length > 15) {
+      warn(`[SECURITY][${rid}] Formato de telefone inválido de ${clientIp}: ${phone}`);
+      return res.status(400).json({ ok: false, error: 'invalid_request', message: 'Formato de telefone inválido', requestId: rid });
     }
     
     const rawPhone = String(phone);
@@ -194,23 +327,30 @@ function initRoutesModule({
     }
   });
   
-  // ESP32 Validate
+  // ESP32 Validate - compatível com ESP32 (não requer mudanças no código do ESP)
   app.get('/esp32/validate', (req, res) => {
     const validation = validateESP32Authorization(req);
     
     if (validation.authorized) {
       log(`[ESP32-VALIDATE] Autorizado | ip=${validation.ip}`);
-      return res.json({
+      // Garante formato exato esperado pelo ESP32
+      const response = {
         ok: true,
         authorized: true,
         message: 'ESP32 autorizado',
         ip: validation.ip,
         checks: validation.checks,
         timestamp: nowISO()
-      });
+      };
+      // Garante que authorized é boolean
+      if (typeof response.authorized !== 'boolean') {
+        response.authorized = true;
+      }
+      return res.json(response);
     } else {
       warn(`[ESP32-VALIDATE] Não autorizado | ip=${validation.ip} | reason=${validation.reason}`);
-      return res.status(401).json({
+      // Garante formato exato esperado pelo ESP32
+      const response = {
         ok: false,
         authorized: false,
         error: validation.reason,
@@ -218,17 +358,29 @@ function initRoutesModule({
         ip: validation.ip,
         checks: validation.checks,
         timestamp: nowISO()
-      });
+      };
+      // Garante que authorized é boolean
+      if (typeof response.authorized !== 'boolean') {
+        response.authorized = false;
+      }
+      return res.status(401).json(response);
     }
   });
   
   // Trigger Snapshot
-  app.post('/trigger-snapshot', (req, res, next) => {
+  app.post('/trigger-snapshot', strictRateLimit || ((req, res, next) => next()), (req, res, next) => {
     const validation = validateESP32Authorization(req);
+    const rid = requestId();
+    const clientIp = validation.ip;
     
+    // Validação de tamanho do body
+    if (req.body && JSON.stringify(req.body).length > 1024) {
+      warn(`[SECURITY][${rid}] Body muito grande de ${clientIp}`);
+      return res.status(400).json({ ok: false, error: 'invalid_request', message: 'Corpo da requisição muito grande', requestId: rid });
+    }
+
     if (!validation.authorized) {
-      const rid = requestId();
-      warn(`[SNAPSHOT][${rid}] Requisição não autorizada | ip=${validation.ip} | reason=${validation.reason}`);
+      warn(`[SECURITY][${rid}] Requisição não autorizada | ip=${clientIp} | reason=${validation.reason}`);
       const statusCode = validation.reason === 'invalid_token' ? 401 : 403;
       return res.status(statusCode).json({
         ok: false,
@@ -298,12 +450,115 @@ function initRoutesModule({
       
       log(`[SNAPSHOT][${rid}] ${validNumbers.length} número(s) válido(s), ${invalidNumbers.length} inválido(s)`);
       
+      // Grava vídeo de 15 segundos em background (não bloqueia o envio da foto)
+      let videoIdPromise = Promise.resolve(null);
+      if (camera && camera.buildRTSPUrl && camera.recordRTSPVideo) {
+        const rtspUrl = camera.buildRTSPUrl();
+        if (rtspUrl) {
+          log(`[SNAPSHOT][${rid}] Iniciando gravação de vídeo de 15 segundos em background...`);
+          videoIdPromise = (async () => {
+            try {
+              const fakeMessage = {
+                from: 'system',
+                reply: async () => {} // Não precisa responder durante gravação
+              };
+              
+              const result = await camera.recordRTSPVideo(rtspUrl, 15, fakeMessage);
+              
+              if (result.success && result.filePath && fs.existsSync(result.filePath)) {
+                // Comprime vídeo apenas se necessário (função já verifica tamanho)
+                let finalVideoPath = result.filePath;
+                try {
+                  // compressVideoIfNeeded só comprime se o vídeo for maior que MAX_VIDEO_SIZE_MB
+                  // Se não precisar comprimir, retorna o arquivo original sem modificar
+                  finalVideoPath = await camera.compressVideoIfNeeded(result.filePath, fakeMessage);
+                  log(`[SNAPSHOT][${rid}] Vídeo processado: ${finalVideoPath === result.filePath ? 'sem compressão (tamanho OK)' : 'comprimido'}`);
+                } catch (compressError) {
+                  warn(`[SNAPSHOT][${rid}] Erro ao processar vídeo:`, compressError.message);
+                  // Continua com arquivo original se compressão falhar
+                }
+                
+                // Registra vídeo temporário
+                const phoneNumbers = validNumbers.map(n => n.normalized);
+                const videoId = registerTempVideo(finalVideoPath, phoneNumbers);
+                log(`[SNAPSHOT][${rid}] Vídeo gravado e registrado: ${videoId}`);
+                return videoId;
+              } else {
+                warn(`[SNAPSHOT][${rid}] Falha na gravação de vídeo: ${result.error || 'Erro desconhecido'}`);
+                return null;
+              }
+            } catch (videoError) {
+              err(`[SNAPSHOT][${rid}] Erro ao gravar vídeo:`, videoError.message);
+              return null;
+            }
+          })();
+        }
+      }
+      
       const sendPromises = validNumbers.map(async ({ normalized, numberId, rawPhone }) => {
         try {
           const to = numberId._serialized;
-          const r = await client.sendMessage(to, media, { caption: message });
-          log(`[SNAPSHOT OK][${rid}] Enviado para ${to} | id=${r.id?._serialized || 'n/a'}`);
-          return { phone: normalized, success: true, to, msgId: r.id?._serialized || null };
+          let r;
+          
+          // Verifica qual API está sendo usada
+          if (whatsapp.sendMediaFromBase64) {
+            // API Oficial do WhatsApp - usa base64 diretamente
+            r = await whatsapp.sendMediaFromBase64(to, base64, mimeType, message);
+          } else if (client && client.sendMessage) {
+            // whatsapp-web.js - usa MessageMedia
+            r = await client.sendMessage(to, media, { caption: message });
+          } else {
+            throw new Error('Nenhuma API WhatsApp configurada para envio de mídia');
+          }
+          
+          log(`[SNAPSHOT OK][${rid}] Enviado para ${to} | id=${r.id?._serialized || r.messages?.[0]?.id || 'n/a'}`);
+          
+          // Envia mensagem perguntando se quer ver o vídeo (aguarda gravação terminar)
+          videoIdPromise.then(async (videoId) => {
+            if (!videoId) return; // Se não gravou vídeo, não envia mensagem
+            
+            try {
+              // Aguarda um pouco para garantir que tudo está processado
+              await new Promise(resolve => setTimeout(resolve, 500));
+              
+              if (whatsapp.sendInteractiveButtons) {
+                // API Oficial - usa botões interativos
+                await whatsapp.sendInteractiveButtons(
+                  to,
+                  '🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de 15 segundos da campainha.\n\nDeseja visualizar o vídeo? (Válido por 24 horas)',
+                  [
+                    { id: `view_video_${videoId}`, title: '👁️ Ver Vídeo' },
+                    { id: 'skip_video', title: '⏭️ Pular' }
+                  ],
+                  'Campainha - Vídeo Temporário'
+                );
+              } else if (client && client.sendMessage) {
+                // whatsapp-web.js - usa botões
+                try {
+                  const buttonMessage = {
+                    text: '🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de 15 segundos da campainha.\n\nDeseja visualizar o vídeo? (Válido por 24 horas)',
+                    buttons: [
+                      { body: `👁️ Ver Vídeo (${videoId.substring(0, 8)}...)` },
+                      { body: '⏭️ Pular' }
+                    ],
+                    footer: 'Campainha - Vídeo Temporário'
+                  };
+                  await client.sendMessage(to, buttonMessage);
+                } catch (buttonError) {
+                  // Fallback para texto
+                  await client.sendMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de 15 segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
+                }
+              }
+              
+              log(`[SNAPSHOT][${rid}] Mensagem de vídeo enviada para ${to} (videoId: ${videoId})`);
+            } catch (videoMsgError) {
+              warn(`[SNAPSHOT][${rid}] Erro ao enviar mensagem de vídeo:`, videoMsgError.message);
+            }
+          }).catch((error) => {
+            warn(`[SNAPSHOT][${rid}] Erro ao processar vídeo:`, error.message);
+          });
+          
+          return { phone: normalized, success: true, to, msgId: r.id?._serialized || r.messages?.[0]?.id || null };
         } catch (e) {
           err(`[SNAPSHOT][${rid}] Erro ao enviar para ${rawPhone}:`, e.message);
           return { phone: normalized, success: false, error: String(e) };
@@ -325,14 +580,21 @@ function initRoutesModule({
       const successCount = results.filter(r => r.success).length;
       log(`[SNAPSHOT][${rid}] Processo concluído: ${successCount}/${results.length} enviados com sucesso`);
       
-      return res.json({
+      // Garante formato exato esperado pelo ESP32 - sempre retorna ok: true se a requisição foi processada
+      // (mesmo que alguns envios tenham falhado, a requisição em si foi bem-sucedida)
+      const response = {
         ok: true,
         requestId: rid,
         total: results.length,
         success: successCount,
         failed: results.length - successCount,
         results
-      });
+      };
+      // Garante que ok é boolean
+      if (typeof response.ok !== 'boolean') {
+        response.ok = true;
+      }
+      return res.json(response);
     } catch (e) {
       err(`[SNAPSHOT][${rid}] ERRO`, e);
       return res.status(500).json({ ok: false, error: String(e), requestId: rid });
@@ -565,7 +827,41 @@ function initRoutesModule({
     }
   });
   
-  return {};
+  // Função helper para processar vídeos temporários (exportada para uso externo)
+  function processTempVideo(videoId, phoneNumber) {
+    const videoData = getTempVideo(videoId);
+    
+    if (!videoData) {
+      return { success: false, error: 'Vídeo não encontrado ou expirado' };
+    }
+    
+    // Verifica se o número está autorizado para ver este vídeo
+    const normalizedPhone = normalizeBR(phoneNumber);
+    const isAuthorized = videoData.phoneNumbers.some(p => {
+      const normalized = normalizeBR(p);
+      return normalized === normalizedPhone || normalized.replace(/^\+/, '') === normalizedPhone.replace(/^\+/, '');
+    });
+    
+    if (!isAuthorized) {
+      return { success: false, error: 'Você não está autorizado a ver este vídeo' };
+    }
+    
+    // Verifica se o arquivo ainda existe
+    if (!fs.existsSync(videoData.filePath)) {
+      return { success: false, error: 'Arquivo de vídeo não encontrado' };
+    }
+    
+    return {
+      success: true,
+      filePath: videoData.filePath,
+      createdAt: videoData.createdAt,
+      expiresAt: videoData.expiresAt
+    };
+  }
+  
+  return {
+    processTempVideo
+  };
 }
 
 module.exports = { initRoutesModule };

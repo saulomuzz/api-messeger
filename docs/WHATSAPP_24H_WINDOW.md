@@ -31,7 +31,7 @@ Crie templates aprovados no Meta for Developers e use-os:
 // Exemplo de template (precisa ser aprovado no Meta)
 {
   "messaging_product": "whatsapp",
-  "to": "554299219594",
+  "to": "5511999999999",
   "type": "template",
   "template": {
     "name": "hello_world",
@@ -44,10 +44,10 @@ Crie templates aprovados no Meta for Developers e use-os:
 
 ### Opção 3: Verificar se o número está correto
 
-O número foi normalizado para `5542999219594` (com 9 adicionado). Verifique se o número real tem o 9:
+O número pode ser normalizado (com 9 adicionado). Verifique se o número real tem o 9:
 
-- Se o número real é: `554299219594` (sem 9) → pode estar errado
-- Se o número real é: `5542999219594` (com 9) → está correto
+- Se o número real é: `551199999999` (sem 9) → pode estar errado
+- Se o número real é: `5511999999999` (com 9) → está correto
 
 ## 🧪 Como Testar
 
@@ -62,7 +62,7 @@ O número foi normalizado para `5542999219594` (com 9 adicionado). Verifique se 
 Quando o usuário enviar mensagem, você verá nos logs:
 
 ```
-[WHATSAPP-API] Mensagem recebida de 554299219594: "mensagem do usuário"
+[WHATSAPP-API] Mensagem recebida de 5511999999999: "mensagem do usuário"
 ```
 
 ### 3. Teste o envio novamente
@@ -70,11 +70,11 @@ Quando o usuário enviar mensagem, você verá nos logs:
 Após o usuário iniciar a conversa, teste:
 
 ```bash
-curl -X POST http://10.10.0.3:4000/send \
+curl -X POST http://localhost:3000/send \
   -H "Content-Type: application/json" \
-  -H "X-API-Token: 9f35a6e95a5f4b7f8c0c7c5a83a61c43eaa8b1e0f4b845c99b403ae9a02fbb2e" \
+  -H "X-API-Token: seu_token_aqui" \
   -d '{
-    "phone": "554299219594",
+    "phone": "5511999999999",
     "message": "Teste após iniciar conversa",
     "subject": "Teste"
   }'

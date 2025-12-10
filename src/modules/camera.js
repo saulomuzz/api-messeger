@@ -24,8 +24,18 @@ const ffmpegPath = require('ffmpeg-static');
  * @param {number} config.maxImageWidth - Largura máxima de imagem
  * @param {number} config.maxImageHeight - Altura máxima de imagem
  * @param {number} config.jpegQuality - Qualidade JPEG
- * @param {number} config.maxVideoSizeMB - Tamanho máximo de vídeo em MB
+ * @param {number} config.maxVideoSizeMB - Tamanho máximo de vídeo em MB antes de comprimir
+ * @param {number} config.whatsappMaxVideoSizeMB - Tamanho máximo permitido pela API do WhatsApp
  * @param {number} config.videoCRF - CRF para compressão de vídeo
+ * @param {string} config.videoPreset - Preset FFmpeg (ultrafast, fast, medium, slow, etc)
+ * @param {string} config.videoProfile - Perfil H.264 (baseline, main, high)
+ * @param {string} config.videoLevel - Nível H.264 (3.0, 3.1, 4.0, etc)
+ * @param {string} config.videoMaxrate - Bitrate máximo (ex: '3M')
+ * @param {string} config.videoBufsize - Tamanho do buffer (ex: '6M')
+ * @param {number} config.videoGOP - GOP size
+ * @param {number} config.videoMaxWidth - Largura máxima do vídeo
+ * @param {number} config.videoMaxHeight - Altura máxima do vídeo
+ * @param {string} config.videoAudioBitrate - Bitrate de áudio (ex: '128k')
  * @param {Object} config.logger - Objeto com funções de log
  * @returns {Object} API do módulo de câmera
  */
@@ -41,11 +51,24 @@ function initCameraModule({
   maxImageHeight = 1080,
   jpegQuality = 85,
   maxVideoSizeMB = 8,
+  whatsappMaxVideoSizeMB = 16,
   videoCRF = 32,
+  videoPreset = 'medium',
+  videoProfile = 'high',
+  videoLevel = '4.0',
+  videoMaxrate = '3M',
+  videoBufsize = '6M',
+  videoGOP = 60,
+  videoMaxWidth = 1920,
+  videoMaxHeight = 1080,
+  videoAudioBitrate = '128k',
   logger
 }) {
   const { log, dbg, warn, err } = logger;
   const authTypeCache = new Map();
+  
+  // Armazena whatsappMaxVideoSizeMB no escopo do módulo
+  const whatsappMaxVideoSize = whatsappMaxVideoSizeMB;
   
   // Configura FFmpeg
   let ffmpegConfigured = false;
@@ -507,7 +530,7 @@ function initCameraModule({
   }
   
   /**
-   * Comprime vídeo se necessário
+   * Comprime vídeo se necessário (mantém qualidade melhor)
    */
   async function compressVideoIfNeeded(inputFile, message = null) {
     const stats = fs.statSync(inputFile);
@@ -529,61 +552,147 @@ function initCameraModule({
     
     const compressedFile = inputFile.replace('.mp4', '_compressed.mp4');
     
+    // Obtém informações do vídeo original para manter resolução se possível
     return new Promise((resolve, reject) => {
-      ffmpeg(inputFile)
-        .outputOptions([
+      // Primeiro obtém informações do vídeo
+      ffmpeg.ffprobe(inputFile, (err, metadata) => {
+        if (err) {
+          warn(`[COMPRESS] Erro ao obter metadados, usando configuração padrão:`, err.message);
+        }
+        
+        const width = metadata?.streams?.[0]?.width || videoMaxWidth;
+        const height = metadata?.streams?.[0]?.height || videoMaxHeight;
+        
+        // Calcula resolução mantendo aspect ratio, mas limitando se muito grande
+        let scaleFilter = '';
+        if (width > videoMaxWidth || height > videoMaxHeight) {
+          // Redimensiona apenas se for maior que o máximo configurado
+          scaleFilter = `scale='min(${videoMaxWidth},iw)':'min(${videoMaxHeight},ih)':force_original_aspect_ratio=decrease`;
+        }
+        // Se já está em resolução aceitável, não redimensiona
+        
+        // Calcula bitrate de compressão (um pouco menor que o de gravação)
+        const compressMaxrate = videoMaxrate.replace(/\d+/, (match) => {
+          const value = parseInt(match);
+          return Math.max(1, Math.floor(value * 0.83)).toString(); // ~83% do bitrate original
+        });
+        const compressBufsize = videoBufsize.replace(/\d+/, (match) => {
+          const value = parseInt(match);
+          return Math.max(1, Math.floor(value * 0.83)).toString(); // ~83% do buffer original
+        });
+        
+        const outputOptions = [
           '-c:v', 'libx264',
-          '-preset', 'fast',
-          '-crf', String(videoCRF),
-          '-maxrate', '1.5M',
-          '-bufsize', '3M',
-          '-vf', 'scale=1280:720',
+          '-preset', videoPreset,
+          '-crf', String(Math.max(18, Math.min(23, videoCRF))), // Garante CRF entre 18-23 (qualidade muito boa)
+          '-maxrate', compressMaxrate,
+          '-bufsize', compressBufsize,
           '-c:a', 'aac',
-          '-b:a', '96k',
+          '-b:a', videoAudioBitrate,
           '-ar', '44100',
           '-movflags', '+faststart',
           '-pix_fmt', 'yuv420p',
-          '-profile:v', 'baseline',
-          '-level', '3.1',
-          '-g', '30',
-          '-keyint_min', '30',
+          '-profile:v', videoProfile,
+          '-level', videoLevel,
+          '-g', String(videoGOP),
+          '-keyint_min', String(videoGOP),
           '-sc_threshold', '0',
           '-avoid_negative_ts', 'make_zero',
           '-fflags', '+genpts',
           '-strict', '-2'
-        ])
-        .output(compressedFile)
-        .on('start', (cmdline) => {
-          log(`[COMPRESS] Iniciando compressão...`);
-          if (logger.DEBUG) {
-            dbg(`[COMPRESS] Comando: ${cmdline}`);
-          }
-        })
-        .on('end', () => {
-          const newStats = fs.statSync(compressedFile);
-          const newSizeMB = newStats.size / 1024 / 1024;
-          const reduction = ((sizeMB - newSizeMB) / sizeMB * 100).toFixed(1);
-          log(`[COMPRESS] Compressão concluída: ${sizeMB.toFixed(2)} MB → ${newSizeMB.toFixed(2)} MB (${reduction}% redução)`);
-          
-          try {
-            fs.unlinkSync(inputFile);
-            log(`[COMPRESS] Arquivo original removido`);
-          } catch (e) {
-            warn(`[COMPRESS] Erro ao remover arquivo original:`, e.message);
-          }
-          
-          resolve(compressedFile);
-        })
-        .on('error', (ffmpegError) => {
-          err(`[COMPRESS] Erro na compressão:`, ffmpegError.message);
-          resolve(inputFile);
-        })
-        .run();
+        ];
+        
+        // Adiciona scale apenas se necessário
+        if (scaleFilter) {
+          outputOptions.push('-vf', scaleFilter);
+        }
+        
+        ffmpeg(inputFile)
+          .outputOptions(outputOptions)
+          .output(compressedFile)
+          .on('start', (cmdline) => {
+            log(`[COMPRESS] Iniciando compressão com qualidade melhorada (CRF: ${Math.max(18, Math.min(23, videoCRF))})...`);
+            if (logger.DEBUG) {
+              dbg(`[COMPRESS] Comando: ${cmdline}`);
+            }
+          })
+          .on('end', () => {
+            const newStats = fs.statSync(compressedFile);
+            const newSizeMB = newStats.size / 1024 / 1024;
+            const reduction = ((sizeMB - newSizeMB) / sizeMB * 100).toFixed(1);
+            log(`[COMPRESS] Compressão concluída: ${sizeMB.toFixed(2)} MB → ${newSizeMB.toFixed(2)} MB (${reduction}% redução)`);
+            
+            // Se ainda estiver muito grande, tenta compressão mais agressiva
+            if (newSizeMB > maxVideoSizeMB * 1.2) {
+              warn(`[COMPRESS] Vídeo ainda grande após compressão (${newSizeMB.toFixed(2)} MB), aplicando compressão adicional...`);
+              const moreCompressedFile = compressedFile.replace('.mp4', '_more_compressed.mp4');
+              
+              // Segunda compressão mais agressiva
+              const secondPassMaxrate = compressMaxrate.replace(/\d+/, (match) => {
+                const value = parseInt(match);
+                return Math.max(1, Math.floor(value * 0.8)).toString(); // 80% do bitrate da primeira passagem
+              });
+              const secondPassBufsize = compressBufsize.replace(/\d+/, (match) => {
+                const value = parseInt(match);
+                return Math.max(1, Math.floor(value * 0.8)).toString(); // 80% do buffer da primeira passagem
+              });
+              
+              ffmpeg(compressedFile)
+                .outputOptions([
+                  '-c:v', 'libx264',
+                  '-preset', videoPreset,
+                  '-crf', String(Math.min(28, videoCRF + 2)), // CRF um pouco maior para segunda passagem
+                  '-maxrate', secondPassMaxrate,
+                  '-bufsize', secondPassBufsize,
+                  '-vf', scaleFilter || `scale=${Math.floor(videoMaxWidth * 0.67)}:${Math.floor(videoMaxHeight * 0.67)}`, // Redimensiona na segunda passagem se necessário
+                  '-c:a', 'aac',
+                  '-b:a', videoAudioBitrate.replace(/\d+/, (match) => Math.max(64, Math.floor(parseInt(match) * 0.75)) + 'k'),
+                  '-movflags', '+faststart',
+                  '-pix_fmt', 'yuv420p'
+                ])
+                .output(moreCompressedFile)
+                .on('end', () => {
+                  const finalStats = fs.statSync(moreCompressedFile);
+                  const finalSizeMB = finalStats.size / 1024 / 1024;
+                  log(`[COMPRESS] Segunda compressão concluída: ${newSizeMB.toFixed(2)} MB → ${finalSizeMB.toFixed(2)} MB`);
+                  
+                  try {
+                    fs.unlinkSync(compressedFile);
+                    fs.unlinkSync(inputFile);
+                  } catch (e) {
+                    warn(`[COMPRESS] Erro ao remover arquivos temporários:`, e.message);
+                  }
+                  
+                  resolve(moreCompressedFile);
+                })
+                .on('error', (e) => {
+                  warn(`[COMPRESS] Erro na segunda compressão, usando primeira:`, e.message);
+                  resolve(compressedFile);
+                })
+                .run();
+            } else {
+              try {
+                fs.unlinkSync(inputFile);
+                log(`[COMPRESS] Arquivo original removido`);
+              } catch (e) {
+                warn(`[COMPRESS] Erro ao remover arquivo original:`, e.message);
+              }
+              
+              resolve(compressedFile);
+            }
+          })
+          .on('error', (ffmpegError) => {
+            err(`[COMPRESS] Erro na compressão:`, ffmpegError.message);
+            resolve(inputFile); // Retorna original se falhar
+          })
+          .run();
+      });
     });
   }
   
   /**
    * Grava vídeo RTSP por X segundos
+   * Suporta múltiplas gravações simultâneas (cada uma cria seu próprio arquivo e processo FFmpeg)
    */
   async function recordRTSPVideo(rtspUrl, durationSeconds, message) {
     if (!rtspUrl) {
@@ -602,11 +711,42 @@ function initCameraModule({
     }
     
     const timestamp = Date.now();
-    const outputFile = path.join(recordingsDir, `recording_${timestamp}.mp4`);
+    const randomSuffix = Math.random().toString(36).substring(2, 8); // Adiciona sufixo aleatório para evitar colisões
+    const outputFile = path.join(recordingsDir, `recording_${timestamp}_${randomSuffix}.mp4`);
+    
+    // Log de início com identificador único
+    const recordId = `REC-${timestamp}-${randomSuffix}`;
+    log(`[RECORD][${recordId}] Iniciando gravação de ${durationSeconds}s → ${path.basename(outputFile)}`);
     
     return new Promise((resolve, reject) => {
       let progressInterval = null;
       let lastProgress = 0;
+      let hasEnded = false;
+      
+      // Timeout de segurança (durações + 30 segundos de margem)
+      const timeout = setTimeout(() => {
+        if (!hasEnded) {
+          hasEnded = true;
+          if (progressInterval) {
+            clearInterval(progressInterval);
+          }
+          err(`[RECORD][${recordId}] ⏱️ Timeout na gravação após ${durationSeconds + 30} segundos`);
+          if (fs.existsSync(outputFile)) {
+            const stats = fs.statSync(outputFile);
+            if (stats.size > 0) {
+              log(`[RECORD] Arquivo parcial encontrado (${(stats.size / 1024 / 1024).toFixed(2)} MB), usando mesmo assim`);
+              resolve({ success: true, filePath: outputFile, error: null });
+            } else {
+              try {
+                fs.unlinkSync(outputFile);
+              } catch (e) {}
+              resolve({ success: false, filePath: null, error: 'Timeout na gravação' });
+            }
+          } else {
+            resolve({ success: false, filePath: null, error: 'Timeout na gravação - arquivo não criado' });
+          }
+        }
+      }, (durationSeconds + 30) * 1000);
       
       const initialMsg = `🎥 Iniciando gravação de ${durationSeconds} segundos...`;
       log(`[RECORD] Enviando mensagem: "${initialMsg}"`);
@@ -624,19 +764,19 @@ function initCameraModule({
         .outputOptions([
           '-t', String(durationSeconds),
           '-c:v', 'libx264',
-          '-preset', 'ultrafast',
-          '-crf', '23',
-          '-maxrate', '2M',
-          '-bufsize', '4M',
+          '-preset', videoPreset,
+          '-crf', String(videoCRF),
+          '-maxrate', videoMaxrate,
+          '-bufsize', videoBufsize,
           '-c:a', 'aac',
-          '-b:a', '128k',
+          '-b:a', videoAudioBitrate,
           '-ar', '44100',
           '-movflags', '+faststart',
           '-pix_fmt', 'yuv420p',
-          '-profile:v', 'baseline',
-          '-level', '3.1',
-          '-g', '30',
-          '-keyint_min', '30',
+          '-profile:v', videoProfile,
+          '-level', videoLevel,
+          '-g', String(videoGOP),
+          '-keyint_min', String(videoGOP),
           '-sc_threshold', '0',
           '-avoid_negative_ts', 'make_zero',
           '-fflags', '+genpts',
@@ -644,9 +784,9 @@ function initCameraModule({
         ])
         .output(outputFile)
         .on('start', (cmdline) => {
-          log(`[RECORD] Iniciando gravação: ${outputFile}`);
+          log(`[RECORD][${recordId}] FFmpeg iniciado: ${path.basename(outputFile)}`);
           if (logger.DEBUG) {
-            dbg(`[RECORD] Comando ffmpeg: ${cmdline}`);
+            dbg(`[RECORD][${recordId}] Comando ffmpeg: ${cmdline}`);
           }
           
           progressInterval = setInterval(() => {
@@ -670,24 +810,66 @@ function initCameraModule({
           }
         })
         .on('end', () => {
+          if (hasEnded) {
+            warn(`[RECORD] Evento 'end' recebido após timeout, ignorando`);
+            return;
+          }
+          hasEnded = true;
+          clearTimeout(timeout);
+          
           if (progressInterval) {
             clearInterval(progressInterval);
           }
-          log(`[RECORD] Gravação concluída: ${outputFile}`);
-          const completeMsg = `✅ Gravação concluída! Processando vídeo...`;
-          log(`[RECORD] Enviando mensagem: "${completeMsg}"`);
-          message.reply(completeMsg)
-            .then(() => log(`[RECORD] Mensagem de conclusão enviada`))
-            .catch((e) => err(`[RECORD] Erro ao enviar mensagem de conclusão:`, e.message));
-          resolve({ success: true, filePath: outputFile, error: null });
+          
+          // Aguarda um pouco para garantir que o arquivo foi escrito completamente
+          setTimeout(() => {
+            // Verifica se o arquivo foi criado
+            if (!fs.existsSync(outputFile)) {
+              err(`[RECORD] Arquivo de saída não encontrado após gravação: ${outputFile}`);
+              resolve({ success: false, filePath: null, error: 'Arquivo de saída não foi criado' });
+              return;
+            }
+            
+            const stats = fs.statSync(outputFile);
+            const sizeMB = stats.size / 1024 / 1024;
+            log(`[RECORD][${recordId}] ✅ Gravação concluída: ${path.basename(outputFile)} (${sizeMB.toFixed(2)} MB)`);
+            
+            if (stats.size === 0) {
+              err(`[RECORD] Arquivo de vídeo está vazio (0 bytes)`);
+              try {
+                fs.unlinkSync(outputFile);
+              } catch (e) {
+                warn(`[RECORD] Erro ao remover arquivo vazio:`, e.message);
+              }
+              resolve({ success: false, filePath: null, error: 'Arquivo de vídeo está vazio' });
+              return;
+            }
+            
+            const completeMsg = `✅ Gravação concluída! Processando vídeo...`;
+            log(`[RECORD] Enviando mensagem: "${completeMsg}"`);
+            message.reply(completeMsg)
+              .then(() => log(`[RECORD] Mensagem de conclusão enviada`))
+              .catch((e) => err(`[RECORD] Erro ao enviar mensagem de conclusão:`, e.message));
+            resolve({ success: true, filePath: outputFile, error: null });
+          }, 1000); // Aguarda 1 segundo para garantir escrita completa
         })
         .on('error', (ffmpegError, stdout, stderr) => {
+          if (hasEnded) {
+            warn(`[RECORD] Evento 'error' recebido após timeout/conclusão, ignorando`);
+            return;
+          }
+          hasEnded = true;
+          clearTimeout(timeout);
+          
           if (progressInterval) {
             clearInterval(progressInterval);
           }
-          err(`[RECORD] Erro na gravação:`, ffmpegError.message);
+          err(`[RECORD][${recordId}] ❌ Erro na gravação:`, ffmpegError.message);
           if (stderr) {
             dbg(`[RECORD] stderr: ${stderr}`);
+          }
+          if (stdout) {
+            dbg(`[RECORD] stdout: ${stdout}`);
           }
           const errorMsg = `❌ Erro na gravação: ${ffmpegError.message}`;
           log(`[RECORD] Enviando mensagem de erro: "${errorMsg}"`);
@@ -696,7 +878,11 @@ function initCameraModule({
             .catch((e) => err(`[RECORD] Erro ao enviar mensagem de erro:`, e.message));
           
           if (fs.existsSync(outputFile)) {
-            fs.unlinkSync(outputFile);
+            try {
+              fs.unlinkSync(outputFile);
+            } catch (e) {
+              warn(`[RECORD] Erro ao remover arquivo com erro:`, e.message);
+            }
           }
           
           resolve({ success: false, filePath: null, error: ffmpegError.message });
@@ -706,12 +892,121 @@ function initCameraModule({
     });
   }
   
+  /**
+   * Divide vídeo em partes se exceder o tamanho máximo do WhatsApp
+   * @param {string} inputFile - Caminho do arquivo de vídeo
+   * @returns {Promise<Array<string>>} Array com caminhos dos arquivos (pode ser 1 ou mais)
+   */
+  async function splitVideoIfNeeded(inputFile) {
+    if (!fs.existsSync(inputFile)) {
+      throw new Error(`Arquivo não encontrado: ${inputFile}`);
+    }
+    
+    const stats = fs.statSync(inputFile);
+    const sizeMB = stats.size / 1024 / 1024;
+    
+    // Se o vídeo já está dentro do limite, retorna o arquivo original
+    if (sizeMB <= whatsappMaxVideoSize) {
+      log(`[SPLIT] Vídeo não precisa dividir: ${sizeMB.toFixed(2)} MB (limite: ${whatsappMaxVideoSize} MB)`);
+      return [inputFile];
+    }
+    
+    // Obtém duração do vídeo
+    return new Promise((resolve, reject) => {
+      ffmpeg.ffprobe(inputFile, (err, metadata) => {
+        if (err) {
+          err(`[SPLIT] Erro ao obter metadados do vídeo:`, err.message);
+          reject(err);
+          return;
+        }
+        
+        const duration = metadata.format.duration; // em segundos
+        if (!duration || duration <= 0) {
+          err(`[SPLIT] Duração inválida do vídeo: ${duration}`);
+          reject(new Error('Duração inválida do vídeo'));
+          return;
+        }
+        
+        // Calcula quantas partes são necessárias
+        const partsNeeded = Math.ceil(sizeMB / whatsappMaxVideoSize);
+        const durationPerPart = duration / partsNeeded;
+        
+        log(`[SPLIT] Vídeo muito grande (${sizeMB.toFixed(2)} MB), dividindo em ${partsNeeded} parte(s) de ~${durationPerPart.toFixed(1)}s cada`);
+        
+        const outputFiles = [];
+        let partsCompleted = 0;
+        let hasError = false;
+        
+        // Cria cada parte do vídeo
+        for (let i = 0; i < partsNeeded; i++) {
+          const startTime = i * durationPerPart;
+          const partFile = inputFile.replace('.mp4', `_part${i + 1}_of_${partsNeeded}.mp4`);
+          outputFiles.push(partFile);
+          
+          ffmpeg(inputFile)
+            .outputOptions([
+              '-ss', String(startTime),
+              '-t', String(durationPerPart),
+              '-c', 'copy', // Copia sem re-encoding para manter qualidade
+              '-avoid_negative_ts', 'make_zero'
+            ])
+            .output(partFile)
+            .on('start', (cmdline) => {
+              log(`[SPLIT] Criando parte ${i + 1}/${partsNeeded}...`);
+              if (logger.DEBUG) {
+                dbg(`[SPLIT] Comando: ${cmdline}`);
+              }
+            })
+            .on('end', () => {
+              partsCompleted++;
+              const partStats = fs.statSync(partFile);
+              const partSizeMB = partStats.size / 1024 / 1024;
+              log(`[SPLIT] Parte ${i + 1}/${partsNeeded} criada: ${partFile} (${partSizeMB.toFixed(2)} MB)`);
+              
+              if (partsCompleted === partsNeeded) {
+                // Todas as partes foram criadas
+                log(`[SPLIT] Todas as ${partsNeeded} parte(s) foram criadas com sucesso`);
+                
+                // Remove arquivo original se todas as partes foram criadas
+                try {
+                  fs.unlinkSync(inputFile);
+                  log(`[SPLIT] Arquivo original removido`);
+                } catch (e) {
+                  warn(`[SPLIT] Erro ao remover arquivo original:`, e.message);
+                }
+                
+                resolve(outputFiles);
+              }
+            })
+            .on('error', (ffmpegError) => {
+              if (hasError) return;
+              hasError = true;
+              err(`[SPLIT] Erro ao criar parte ${i + 1}/${partsNeeded}:`, ffmpegError.message);
+              
+              // Limpa partes já criadas
+              outputFiles.forEach(file => {
+                if (fs.existsSync(file)) {
+                  try {
+                    fs.unlinkSync(file);
+                  } catch (e) {}
+                }
+              });
+              
+              reject(ffmpegError);
+            })
+            .run();
+        }
+      });
+    });
+  }
+  
   // Retorna API pública do módulo
   return {
     downloadSnapshot: (url) => downloadSnapshot(url || snapshotUrl, username, password),
     buildRTSPUrl,
     recordRTSPVideo,
     compressVideoIfNeeded,
+    splitVideoIfNeeded,
     cleanupVideoFile,
     optimizeImage,
     get ffmpegConfigured() { return ffmpegConfigured; }

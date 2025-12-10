@@ -1,38 +1,24 @@
-# Dependências
 node_modules/
-
-# Arquivos de ambiente (contêm dados sensíveis)
 .env
 .env.local
 .env.*.local
-env-otimizado.txt
-*.env.example
-
-# Logs
-*.log
 npm-debug.log*
 yarn-error.log
 .pnpm-debug.log
-logs/
-
-# Arquivos de autenticação
+.DS_Store
 .wwebjs_auth/
-*.pem
-*.key
-
-# Arquivos sensíveis
+logs/
 numbers.txt
 recordings/
-
-# Arquivos do sistema
-.DS_Store
-Thumbs.db
-
-# Arquivos de teste temporários
+*.log
 test-tuya-sign.js
-*.tmp
-*.temp
 
-# Arquivos de build
-dist/
-build/
+# Banco de dados de IPs bloqueados
+blocked_ips.db
+blocked_ips.json
+
+# Estado de dispositivos Tuya
+tuya_devices_state.json
+
+# Vídeos temporários
+recordings/temp_videos/

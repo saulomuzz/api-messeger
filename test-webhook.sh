@@ -1,9 +1,8 @@
 #!/bin/bash
 # Script para testar o webhook
-# Configure as variáveis abaixo com seus valores
 
-TOKEN="${WHATSAPP_WEBHOOK_VERIFY_TOKEN:-seu_token_secreto}"
-DOMAIN="${WHATSAPP_WEBHOOK_DOMAIN:-https://seu-dominio.com.br}"
+TOKEN="seu_token_secreto"  # Substitua pelo token do seu .env
+DOMAIN="https://api.biancavolken.com.br"
 
 echo "Testando webhook via HTTPS..."
 echo ""
