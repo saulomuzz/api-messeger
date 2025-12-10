@@ -18,6 +18,7 @@ const { initWhatsAppModule } = require('./modules/whatsapp');
 const { initRoutesModule } = require('./modules/routes');
 const { initTuyaMonitorModule } = require('./modules/tuya-monitor');
 const { initIPBlockerModule } = require('./modules/ip-blocker');
+const { initWebSocketESP32Module } = require('./modules/websocket-esp32');
 
 /* ===== env ===== */
 // Detecta APP_ROOT automaticamente baseado no diretório do script
@@ -652,7 +653,7 @@ function validateESP32Authorization(req) {
   // Verifica whitelist de IPs (se configurada)
   if (ESP32_ALLOWED_IPS.length > 0) {
     const isAllowed = ESP32_ALLOWED_IPS.some(allowedIp => {
-      // Suporta CIDR básico (ex: 10.10.0.0/23) ou IP exato
+      // Suporta CIDR básico (ex: 192.168.1.0/24) ou IP exato
       if (allowedIp.includes('/')) {
         return ipInCidr(clientIp, allowedIp);
       } else {
@@ -872,7 +873,7 @@ try {
     whatsapp,
     camera,
     tuya: (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) ? tuya : null,
-    utils: { requestId, normalizeBR, readNumbersFromFile, getClientIp },
+    utils: { requestId, normalizeBR, readNumbersFromFile, getClientIp, isNumberAuthorized },
     logger,
     auth,
     verifySignedRequest,
@@ -894,14 +895,30 @@ try {
 // Passa função de processamento de vídeos temporários para o módulo WhatsApp
 try {
   if (whatsapp && routesModule) {
+    dbg(`[INIT] Verificando funções do routesModule...`);
+    dbg(`[INIT] routesModule.processTempVideo:`, typeof routesModule.processTempVideo);
+    dbg(`[INIT] routesModule.listVideos:`, typeof routesModule.listVideos);
+    
     if (routesModule.processTempVideo && whatsapp.setTempVideoProcessor) {
       whatsapp.setTempVideoProcessor(routesModule.processTempVideo);
       log(`[INIT] Processador de vídeos temporários configurado`);
+    } else {
+      warn(`[INIT] processTempVideo não disponível ou setTempVideoProcessor não existe`);
     }
+    
     if (routesModule.listVideos && whatsapp.setListVideosFunction) {
       whatsapp.setListVideosFunction(routesModule.listVideos);
       log(`[INIT] Função de listagem de vídeos configurada`);
+    } else {
+      warn(`[INIT] listVideos não disponível (tipo: ${typeof routesModule.listVideos}) ou setListVideosFunction não existe`);
+      if (whatsapp.setListVideosFunction) {
+        dbg(`[INIT] setListVideosFunction existe`);
+      } else {
+        warn(`[INIT] setListVideosFunction não existe no módulo WhatsApp`);
+      }
     }
+  } else {
+    warn(`[INIT] whatsapp ou routesModule não disponível`);
   }
 } catch (tempVideoError) {
   err(`[FATAL] Erro ao configurar processador de vídeos temporários:`, tempVideoError.message);
@@ -1044,6 +1061,22 @@ process.on('uncaughtException', (error) => {
 });
 
 process.on('unhandledRejection', (reason, promise) => {
+  const errorMsg = reason?.message || String(reason) || 'Erro desconhecido';
+  const errorStack = reason?.stack || 'N/A';
+  
+  // Ignora erros conhecidos do WhatsApp Web.js que não são críticos
+  if (errorMsg.includes('Minified invariant') || 
+      errorMsg.includes('Evaluation failed') ||
+      errorMsg.includes('Invalid value') ||
+      errorMsg.includes('getStorage') ||
+      errorMsg.includes('getMetaTable')) {
+    warn(`[WHATSAPP] Erro não crítico do WhatsApp Web.js ignorado: ${errorMsg}`);
+    if (DEBUG) {
+      warn(`[WHATSAPP] Stack: ${errorStack}`);
+    }
+    return; // Não encerra o processo
+  }
+  
   err(`[FATAL] Promise rejeitada não tratada:`, reason);
   if (reason && reason.stack) {
     err(`[FATAL] Stack:`, reason.stack);
@@ -1097,6 +1130,17 @@ async function gracefulShutdown(signal) {
     }
   }
   
+  // Fecha WebSocket ESP32
+  if (wsESP32 && wsESP32.close) {
+    try {
+      log(`[SHUTDOWN] Fechando WebSocket ESP32...`);
+      wsESP32.close();
+      log(`[SHUTDOWN] WebSocket ESP32 fechado`);
+    } catch (e) {
+      warn(`[SHUTDOWN] Erro ao fechar WebSocket ESP32:`, e.message);
+    }
+  }
+  
   // Fecha o servidor HTTP
   if (server) {
     server.close(() => {
@@ -1128,6 +1172,146 @@ async function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
+// Funções auxiliares para WebSocket ESP32
+async function checkApiStatusForWS() {
+  try {
+    if (!whatsapp || !whatsapp.isReady) {
+      return false;
+    }
+    const isReady = whatsapp.isReady();
+    return isReady === true;
+  } catch (e) {
+    warn(`[WS-ESP32] Erro ao verificar status da API:`, e.message);
+    return false;
+  }
+}
+
+async function triggerSnapshotForWS(message, clientIp) {
+  const rid = requestId();
+  try {
+    if (!whatsapp || !whatsapp.isReady || !whatsapp.isReady()) {
+      return { ok: false, error: 'whatsapp not ready' };
+    }
+    
+    if (!camera || !cameraSnapshotUrl) {
+      return { ok: false, error: 'camera not configured' };
+    }
+    
+    const { base64, mimeType } = await camera.downloadSnapshot(cameraSnapshotUrl);
+    const numbers = readNumbersFromFile(NUMBERS_FILE);
+    
+    if (numbers.length === 0) {
+      return { ok: false, error: 'no numbers found' };
+    }
+    
+    // Resolve números do WhatsApp
+    const numberResolutions = await Promise.all(
+      numbers.map(async (rawPhone) => {
+        try {
+          const normalized = normalizeBR(rawPhone);
+          if (whatsapp.resolveWhatsAppNumber) {
+            const { id: numberId } = await whatsapp.resolveWhatsAppNumber(normalized);
+            return { normalized, numberId, success: numberId !== null };
+          }
+          return { normalized, numberId: null, success: false };
+        } catch (e) {
+          return { normalized: rawPhone, numberId: null, success: false };
+        }
+      })
+    );
+    
+    const validNumbers = numberResolutions.filter(n => n.success && n.numberId);
+    
+    if (validNumbers.length === 0) {
+      return { ok: false, error: 'no valid numbers' };
+    }
+    
+    // Envia snapshot para todos os números válidos
+    const sendPromises = validNumbers.map(async ({ normalized, numberId }) => {
+      try {
+        // Para API oficial, usa o número normalizado diretamente
+        const to = numberId?._serialized || normalized.replace(/^\+/, '') || normalized;
+        if (whatsapp.sendMediaFromBase64) {
+          await whatsapp.sendMediaFromBase64(to, base64, mimeType, message || '📸 Snapshot da câmera');
+        } else {
+          return { success: false, error: 'send method not available' };
+        }
+        return { success: true, phone: normalized };
+      } catch (e) {
+        return { success: false, phone: normalized, error: e.message };
+      }
+    });
+    
+    const results = await Promise.all(sendPromises);
+    const successCount = results.filter(r => r.success).length;
+    
+    // Inicia gravação de vídeo em background (não bloqueia)
+    if (camera && camera.buildRTSPUrl && camera.recordRTSPVideo) {
+      const rtspUrl = camera.buildRTSPUrl();
+      if (rtspUrl) {
+        (async () => {
+          try {
+            const fakeMessage = { from: 'system', reply: async () => {} };
+            const result = await camera.recordRTSPVideo(rtspUrl, 15, fakeMessage);
+            if (result.success && result.filePath) {
+              const finalVideoPath = await camera.compressVideoIfNeeded(result.filePath, fakeMessage);
+              // Registra vídeo temporário usando a mesma lógica do routes
+              // (registerTempVideo não é exportado, então fazemos manualmente)
+              try {
+                const tempVideosDBPath = path.join(RECORDINGS_DIR, 'temp_videos', 'videos.json');
+                const VIDEO_EXPIRY_HOURS = 24;
+                
+                let db = {};
+                if (fs.existsSync(tempVideosDBPath)) {
+                  db = JSON.parse(fs.readFileSync(tempVideosDBPath, 'utf8'));
+                }
+                
+                const videoId = `video_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+                const expiresAt = Date.now() + (VIDEO_EXPIRY_HOURS * 60 * 60 * 1000);
+                const phoneNumbers = validNumbers.map(n => normalizeBR(n.normalized));
+                
+                db[videoId] = {
+                  filePath: finalVideoPath,
+                  phoneNumbers,
+                  createdAt: Date.now(),
+                  expiresAt,
+                  expiresAtISO: new Date(expiresAt).toISOString()
+                };
+                
+                // Cria diretório se não existir
+                const dbDir = path.dirname(tempVideosDBPath);
+                if (!fs.existsSync(dbDir)) {
+                  fs.mkdirSync(dbDir, { recursive: true });
+                }
+                
+                fs.writeFileSync(tempVideosDBPath, JSON.stringify(db, null, 2));
+                log(`[WS-ESP32] Vídeo registrado: ${videoId}`);
+              } catch (e) {
+                warn(`[WS-ESP32] Erro ao registrar vídeo:`, e.message);
+              }
+            }
+          } catch (e) {
+            warn(`[WS-ESP32] Erro ao gravar vídeo:`, e.message);
+          }
+        })();
+      }
+    }
+    
+    return { 
+      ok: true, 
+      successCount, 
+      totalCount: results.length,
+      requestId: rid
+    };
+  } catch (e) {
+    err(`[WS-ESP32] Erro ao processar snapshot:`, e.message);
+    return { ok: false, error: e.message, requestId: rid };
+  }
+}
+
+// Inicializa WebSocket ESP32 (após servidor estar pronto)
+let wsESP32 = null;
+
 // Inicia o servidor
 server = app.listen(PORT, () => { 
   log(`═══════════════════════════════════════════════════════════`);
@@ -1145,5 +1329,22 @@ server = app.listen(PORT, () => {
     log(`[SERVER] Token de verificação: ${WHATSAPP_WEBHOOK_VERIFY_TOKEN}`);
     log(`[SERVER] Phone Number ID: ${WHATSAPP_PHONE_NUMBER_ID}`);
   }
+  
+  // Inicializa WebSocket ESP32 após servidor estar pronto
+  try {
+    wsESP32 = initWebSocketESP32Module({
+      server,
+      logger,
+      validateESP32Authorization,
+      triggerSnapshot: triggerSnapshotForWS,
+      checkApiStatus: checkApiStatusForWS,
+      ESP32_TOKEN,
+      ESP32_ALLOWED_IPS
+    });
+    log(`[SERVER] WebSocket ESP32 inicializado em /ws/esp32`);
+  } catch (wsError) {
+    warn(`[SERVER] Erro ao inicializar WebSocket ESP32:`, wsError.message);
+  }
+  
   log(`═══════════════════════════════════════════════════════════`);
 });

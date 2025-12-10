@@ -47,7 +47,7 @@ cp .env.example .env
 - `AUTH_DATA_PATH`: Caminho para dados de autenticação do WhatsApp (padrão: `{APP_ROOT}/.wwebjs_auth`)
 
 **Câmera IP (para snapshots):**
-- `CAMERA_SNAPSHOT_URL`: URL completa do snapshot da câmera (ex: `http://10.10.0.240/cgi-bin/snapshot.cgi?channel=1`)
+- `CAMERA_SNAPSHOT_URL`: URL completa do snapshot da câmera (ex: `http://192.168.1.100/cgi-bin/snapshot.cgi?channel=1`)
 - `CAMERA_USER`: Usuário para autenticação na câmera
 - `CAMERA_PASS`: Senha para autenticação na câmera
 
@@ -74,8 +74,8 @@ cp .env.example .env
 Crie o arquivo `numbers.txt` (ou configure `NUMBERS_FILE`) com um número por linha:
 
 ```
-+5542999999999
-+5542888888888
++5511999999999
++5511888888888
 # Linhas começando com # são ignoradas
 ```
 
@@ -181,10 +181,10 @@ Envia mensagens de texto para um número brasileiro.
   "failed": 0,
   "results": [
     {
-      "phone": "+5542999999999",
+      "phone": "+5511999999999",
       "success": true,
-      "to": "5542999999999@c.us",
-      "msgId": "true_5542999999999@c.us_ABC123"
+      "to": "5511999999999@c.us",
+      "msgId": "true_5511999999999@c.us_ABC123"
     }
   ]
 }
@@ -270,11 +270,11 @@ Consulta o status de múltiplos dispositivos Tuya de uma vez.
   "ok": true,
   "authorized": true,
   "message": "ESP32 autorizado",
-  "ip": "10.10.0.4",
+  "ip": "192.168.1.100",
   "checks": {
     "ip": {
       "passed": true,
-      "message": "IP 10.10.0.4 autorizado"
+      "message": "IP 192.168.1.100 autorizado"
     },
     "token": {
       "passed": true,
@@ -309,11 +309,11 @@ ESP32_TOKEN=seu_token_super_secreto_aqui
 Para restringir acesso apenas a IPs específicos:
 
 ```bash
-ESP32_ALLOWED_IPS=10.10.0.4,10.10.0.0/24,192.168.1.100
+ESP32_ALLOWED_IPS=192.168.1.100,192.168.1.0/24,10.0.0.10
 ```
 
-- Suporta IPs individuais: `10.10.0.4`
-- Suporta CIDR: `10.10.0.0/24`
+- Suporta IPs individuais: `192.168.1.100`
+- Suporta CIDR: `192.168.1.0/24`
 - Múltiplos IPs separados por vírgula
 
 ### Como Funciona
@@ -335,7 +335,7 @@ A API suporta dois métodos de autenticação:
 ### Variáveis Necessárias
 
 ```bash
-CAMERA_SNAPSHOT_URL=http://10.10.0.240/cgi-bin/snapshot.cgi?channel=1
+CAMERA_SNAPSHOT_URL=http://192.168.1.100/cgi-bin/snapshot.cgi?channel=1
 CAMERA_USER=admin
 CAMERA_PASS=sua_senha
 ```
@@ -344,10 +344,10 @@ CAMERA_PASS=sua_senha
 
 ```bash
 # Teste Basic
-curl -u admin:senha http://10.10.0.240/cgi-bin/snapshot.cgi?channel=1 -o test.jpg
+curl -u admin:senha http://192.168.1.100/cgi-bin/snapshot.cgi?channel=1 -o test.jpg
 
 # Teste Digest (se Basic falhar)
-curl --digest -u admin:senha http://10.10.0.240/cgi-bin/snapshot.cgi?channel=1 -o test.jpg
+curl --digest -u admin:senha http://192.168.1.100/cgi-bin/snapshot.cgi?channel=1 -o test.jpg
 ```
 
 ## Estrutura do Projeto

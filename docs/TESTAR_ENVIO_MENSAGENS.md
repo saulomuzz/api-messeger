@@ -10,7 +10,7 @@ USE_WHATSAPP_OFFICIAL_API=true
 WHATSAPP_ACCESS_TOKEN=seu_access_token_aqui
 WHATSAPP_PHONE_NUMBER_ID=seu_phone_number_id_aqui
 WHATSAPP_WEBHOOK_VERIFY_TOKEN=seu_token_secreto
-WHATSAPP_WEBHOOK_DOMAIN=api.biancavolken.com.br
+WHATSAPP_WEBHOOK_DOMAIN=seu-dominio.com.br
 ```
 
 ## 2. Testar Envio de Mensagem via API REST
@@ -18,11 +18,11 @@ WHATSAPP_WEBHOOK_DOMAIN=api.biancavolken.com.br
 ### Método 1: Usando curl
 
 ```bash
-curl -X POST https://api.biancavolken.com.br/send \
+curl -X POST https://seu-dominio.com.br/send \
   -H "Content-Type: application/json" \
   -H "X-API-Token: seu_api_token" \
   -d '{
-    "phone": "554299219594",
+    "phone": "+5511999999999",
     "message": "Teste de mensagem via API Oficial!",
     "subject": "Teste"
   }'
@@ -30,7 +30,7 @@ curl -X POST https://api.biancavolken.com.br/send \
 
 ### Método 2: Usando Postman ou Insomnia
 
-**URL:** `POST https://api.biancavolken.com.br/send`
+**URL:** `POST https://seu-dominio.com.br/send`
 
 **Headers:**
 ```
@@ -41,7 +41,7 @@ X-API-Token: seu_api_token (se configurado)
 **Body (JSON):**
 ```json
 {
-  "phone": "554299219594",
+  "phone": "+5511999999999",
   "message": "Olá! Esta é uma mensagem de teste via API Oficial do WhatsApp Business.",
   "subject": "Teste"
 }
@@ -57,7 +57,7 @@ const axios = require('axios');
 async function testSend() {
   try {
     const response = await axios.post('http://localhost:4000/send', {
-      phone: '554299219594',
+      phone: '+5511999999999',
       message: 'Teste de mensagem via API Oficial!',
       subject: 'Teste'
     }, {
@@ -89,7 +89,7 @@ node test-send.js
 curl -X POST http://localhost:4000/send \
   -H "Content-Type: application/json" \
   -d '{
-    "phone": "554299219594",
+    "phone": "+5511999999999",
     "message": "🏠 *Menu Principal*\n\nSelecione uma opção:",
     "buttons": [
       {"title": "📋 Dispositivos", "id": "btn_devices"},
@@ -105,7 +105,7 @@ curl -X POST http://localhost:4000/send \
 ## 4. Verificar Status da API
 
 ```bash
-curl https://api.biancavolken.com.br/status
+curl https://seu-dominio.com.br/status
 ```
 
 Deve retornar:
@@ -128,7 +128,7 @@ Deve retornar:
    ```
 3. Você deve ver logs como:
    ```
-   [WHATSAPP-API] Mensagem recebida de 554299219594: "sua mensagem"
+   [WHATSAPP-API] Mensagem recebida de +5511999999999: "sua mensagem"
    ```
 
 ## 6. Troubleshooting
@@ -139,7 +139,7 @@ Deve retornar:
 
 ### Erro: "not_on_whatsapp"
 - O número precisa estar no WhatsApp
-- Verifique o formato: deve ser E.164 (ex: 554299219594)
+- Verifique o formato: deve ser E.164 (ex: +5511999999999)
 
 ### Erro: "invalid token"
 - Verifique se o `X-API-Token` está correto (se configurado)
@@ -156,8 +156,8 @@ Deve retornar:
 #!/bin/bash
 
 # Configurações
-API_URL="https://api.biancavolken.com.br"
-PHONE="554299219594"
+API_URL="https://seu-dominio.com.br"
+PHONE="+5511999999999"
 API_TOKEN="seu_token" # Opcional
 
 echo "1. Verificando status..."

@@ -13,7 +13,7 @@ cp .env .env.backup
 O arquivo `env-otimizado.txt` contém a versão otimizada com todas as correções:
 
 - ✅ `REQUIRE_SIGNED_REQUESTS=false` (sem duplicatas)
-- ✅ `ESP32_ALLOWED_IPS=10.10.0.4,10.10.0.0/23` (sem duplicatas)
+- ✅ `ESP32_ALLOWED_IPS=192.168.1.100,192.168.1.0/24` (sem duplicatas)
 - ✅ `WHATSAPP_WEBHOOK_DOMAIN` configurado
 - ✅ `WHATSAPP_API_VERSION` adicionado
 - ✅ Organizado por seções

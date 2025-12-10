@@ -29,6 +29,7 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
   let lastQR = null;
   let isReady = false;
   let tempVideoProcessor = null; // Função para processar vídeos temporários
+  let listVideosFunction = null; // Função para listar histórico de vídeos
   
   // Cria cliente WhatsApp
   const client = new Client({
@@ -86,9 +87,9 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
     qrcodeTerminal.generate(qr, { small: true });
     console.log('\n═══════════════════════════════════════════════════════');
     console.log('💡 Escaneie o QR Code acima com seu WhatsApp');
-    console.log(`🌐 Ou acesse: http://10.10.0.3:${port}/qr.png`);
+    console.log(`🌐 Ou acesse: http://localhost:${port}/qr.png`);
     console.log('═══════════════════════════════════════════════════════\n');
-    log(`[STATUS] QR Code gerado. Escaneie com seu celular para autenticar. URL: http://10.10.0.3:${port}/qr.png`);
+    log(`[STATUS] QR Code gerado. Escaneie com seu celular para autenticar. URL: http://localhost:${port}/qr.png`);
   });
   
   client.on('authenticated', () => {
@@ -1329,15 +1330,43 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
     const tried = [];
     const toDigits = s => String(s || '').replace(/\D/g, '');
     tried.push(e164);
-    let id = await client.getNumberId(toDigits(e164)).catch(() => null);
-    if (id) return { id, tried };
-    const alt = toggleNineBR(e164);
-    if (alt && !tried.includes(alt)) {
-      tried.push(alt);
-      id = await client.getNumberId(toDigits(alt)).catch(() => null);
-      if (id) return { id, tried };
+    
+    // Se cliente não está pronto, usa número diretamente como fallback
+    if (!isReady || !client) {
+      const normalized = normalizeBR(e164);
+      const digits = toDigits(normalized);
+      // Cria um objeto Contact simulado para compatibilidade
+      return { 
+        id: { _serialized: `${digits}@c.us` }, 
+        tried: [normalized] 
+      };
     }
-    return { id: null, tried };
+    
+    try {
+      let id = await client.getNumberId(toDigits(e164)).catch(() => null);
+      if (id) return { id, tried };
+      const alt = toggleNineBR(e164);
+      if (alt && !tried.includes(alt)) {
+        tried.push(alt);
+        id = await client.getNumberId(toDigits(alt)).catch(() => null);
+        if (id) return { id, tried };
+      }
+      // Fallback: usa número diretamente mesmo se não encontrado
+      const normalized = normalizeBR(e164);
+      const digits = toDigits(normalized);
+      return { 
+        id: { _serialized: `${digits}@c.us` }, 
+        tried 
+      };
+    } catch (e) {
+      // Em caso de erro, usa número diretamente
+      const normalized = normalizeBR(e164);
+      const digits = toDigits(normalized);
+      return { 
+        id: { _serialized: `${digits}@c.us` }, 
+        tried: [normalized] 
+      };
+    }
   }
   
   /**
@@ -1364,6 +1393,10 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
     setTempVideoProcessor: (processor) => {
       tempVideoProcessor = processor;
       log(`[WHATSAPP] Processador de vídeos temporários configurado`);
+    },
+    setListVideosFunction: (listFunction) => {
+      listVideosFunction = listFunction;
+      log(`[WHATSAPP] Função de listagem de vídeos configurada`);
     }
   };
 }

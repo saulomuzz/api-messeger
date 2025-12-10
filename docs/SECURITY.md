@@ -96,7 +96,7 @@ RATE_LIMIT_STRICT_MAX=10            # Máximo para endpoints críticos (padrão:
 
 # Whitelist Global de IPs
 ENABLE_IP_WHITELIST=false           # Habilitar whitelist global (padrão: false)
-IP_WHITELIST=10.10.0.0/23,192.168.1.1  # IPs permitidos (separados por vírgula, suporta CIDR)
+IP_WHITELIST=192.168.1.0/24,10.0.0.0/8  # IPs permitidos (separados por vírgula, suporta CIDR)
 
 # Timeout
 ENABLE_REQUEST_TIMEOUT=true         # Habilitar timeout (padrão: true)
@@ -111,7 +111,7 @@ LOG_TIMEZONE_LOCAL=true             # Usar horário local nos logs (padrão: tru
 # Autenticação
 API_TOKEN=seu_token_aqui            # Token para autenticação geral
 ESP32_TOKEN=seu_token_esp32         # Token para ESP32
-ESP32_ALLOWED_IPS=10.10.0.0/23      # IPs permitidos para ESP32 (separados por vírgula)
+ESP32_ALLOWED_IPS=192.168.1.0/24      # IPs permitidos para ESP32 (separados por vírgula)
 ```
 
 ## Recomendações de Segurança
@@ -128,7 +128,7 @@ ESP32_ALLOWED_IPS=10.10.0.0/23      # IPs permitidos para ESP32 (separados por v
 3. **Habilite Whitelist de IPs**: Se possível, restrinja acesso por IP
    ```env
    ENABLE_IP_WHITELIST=true
-   IP_WHITELIST=10.10.0.0/23,192.168.1.100
+   IP_WHITELIST=192.168.1.0/24,10.0.0.10
    ```
 
 4. **Tokens Fortes**: Use tokens longos e aleatórios

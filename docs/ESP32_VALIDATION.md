@@ -101,11 +101,11 @@ void loop() {
   "ok": true,
   "authorized": true,
   "message": "ESP32 autorizado",
-  "ip": "10.10.0.4",
+  "ip": "192.168.1.100",
   "checks": {
     "ip": {
       "passed": true,
-      "message": "IP 10.10.0.4 autorizado"
+      "message": "IP 192.168.1.100 autorizado"
     },
     "token": {
       "passed": true,
@@ -123,11 +123,11 @@ void loop() {
   "authorized": false,
   "error": "invalid_token",
   "message": "Token inválido ou não fornecido",
-  "ip": "10.10.0.4",
+  "ip": "192.168.1.100",
   "checks": {
     "ip": {
       "passed": true,
-      "message": "IP 10.10.0.4 autorizado"
+      "message": "IP 192.168.1.100 autorizado"
     },
     "token": {
       "passed": false,
@@ -144,12 +144,12 @@ void loop() {
   "ok": false,
   "authorized": false,
   "error": "ip_not_allowed",
-  "message": "IP 192.168.1.100 não está na whitelist. Permitidos: 10.10.0.4",
-  "ip": "192.168.1.100",
+  "message": "IP 192.168.1.200 não está na whitelist. Permitidos: 192.168.1.100",
+  "ip": "192.168.1.200",
   "checks": {
     "ip": {
       "passed": false,
-      "message": "IP 192.168.1.100 não está na whitelist. Permitidos: 10.10.0.4"
+      "message": "IP 192.168.1.200 não está na whitelist. Permitidos: 192.168.1.100"
     },
     "token": {
       "passed": true,
@@ -187,6 +187,6 @@ No arquivo `.env`:
 ESP32_TOKEN=seu_token_secreto_aqui
 
 # Whitelist de IPs (opcional)
-ESP32_ALLOWED_IPS=10.10.0.4,10.10.0.0/24
+ESP32_ALLOWED_IPS=192.168.1.100,192.168.1.0/24
 ```
 

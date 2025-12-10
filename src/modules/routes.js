@@ -7,6 +7,7 @@ const QRCode = require('qrcode');
 const { MessageMedia } = require('whatsapp-web.js');
 const fs = require('fs');
 const path = require('path');
+const multer = require('multer');
 
 /**
  * Inicializa o módulo Routes
@@ -139,9 +140,19 @@ function initRoutesModule({
     const db = loadTempVideosDB();
     const videos = [];
     
+    // Se phoneNumber fornecido, verifica se está autorizado no sistema
+    let isSystemAuthorized = true;
+    if (phoneNumber) {
+      const authorizedNumbers = readNumbersFromFile(numbersFile || '');
+      if (authorizedNumbers.length > 0) {
+        isSystemAuthorized = isNumberAuthorized(phoneNumber, numbersFile || '', dbg);
+      }
+    }
+    
     for (const [videoId, videoData] of Object.entries(db)) {
-      // Se phoneNumber fornecido, verifica se está autorizado
-      if (phoneNumber) {
+      // Se o número está autorizado no sistema, mostra todos os vídeos
+      // Caso contrário, mostra apenas os vídeos enviados para ele
+      if (phoneNumber && !isSystemAuthorized) {
         const normalizedPhone = normalizeBR(phoneNumber);
         const isAuthorized = videoData.phoneNumbers.some(p => {
           const normalized = normalizeBR(p);
@@ -405,6 +416,116 @@ function initRoutesModule({
     }
   });
   
+  // OTA (Over-The-Air) - Upload de firmware
+  const otaStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+      const otaDir = path.join(recordingsDir || path.join(__dirname, '..', '..', 'recordings'), 'ota');
+      if (!fs.existsSync(otaDir)) {
+        fs.mkdirSync(otaDir, { recursive: true });
+      }
+      cb(null, otaDir);
+    },
+    filename: (req, file, cb) => {
+      // Nome do arquivo: firmware_YYYYMMDD_HHMMSS.bin
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').substring(0, 19);
+      cb(null, `firmware_${timestamp}.bin`);
+    }
+  });
+  
+  const otaUpload = multer({
+    storage: otaStorage,
+    limits: {
+      fileSize: 2 * 1024 * 1024 // 2MB máximo
+    },
+    fileFilter: (req, file, cb) => {
+      // Aceita apenas arquivos .bin
+      if (file.mimetype === 'application/octet-stream' || file.originalname.endsWith('.bin')) {
+        cb(null, true);
+      } else {
+        cb(new Error('Apenas arquivos .bin são permitidos'), false);
+      }
+    }
+  });
+  
+  app.post('/esp32/ota', auth, otaUpload.single('firmware'), (req, res) => {
+    const rid = requestId();
+    const clientIp = ip(req);
+    
+    if (!req.file) {
+      warn(`[OTA][${rid}] Upload sem arquivo | ip=${clientIp}`);
+      return res.status(400).json({
+        ok: false,
+        error: 'no_file',
+        message: 'Nenhum arquivo enviado',
+        requestId: rid
+      });
+    }
+    
+    log(`[OTA][${rid}] Firmware recebido | ip=${clientIp} | tamanho=${req.file.size} bytes | arquivo=${req.file.filename}`);
+    
+    // Retorna informações do firmware para o ESP32 baixar
+    const firmwareUrl = `${req.protocol}://${req.get('host')}/esp32/ota/download/${path.basename(req.file.filename)}`;
+    
+    res.json({
+      ok: true,
+      message: 'Firmware recebido com sucesso',
+      firmware: {
+        filename: req.file.filename,
+        size: req.file.size,
+        url: firmwareUrl,
+        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() // 24 horas
+      },
+      requestId: rid
+    });
+  });
+  
+  // Download de firmware OTA
+  app.get('/esp32/ota/download/:filename', (req, res) => {
+    const { filename } = req.params;
+    const rid = requestId();
+    const clientIp = ip(req);
+    
+    // Validação básica de segurança (apenas .bin)
+    if (!filename.endsWith('.bin') || filename.includes('..') || filename.includes('/')) {
+      warn(`[OTA][${rid}] Tentativa de download inválido | ip=${clientIp} | filename=${filename}`);
+      return res.status(400).json({
+        ok: false,
+        error: 'invalid_filename',
+        message: 'Nome de arquivo inválido',
+        requestId: rid
+      });
+    }
+    
+    const otaDir = path.join(recordingsDir || path.join(__dirname, '..', '..', 'recordings'), 'ota');
+    const filePath = path.join(otaDir, filename);
+    
+    if (!fs.existsSync(filePath)) {
+      warn(`[OTA][${rid}] Arquivo não encontrado | ip=${clientIp} | filename=${filename}`);
+      return res.status(404).json({
+        ok: false,
+        error: 'file_not_found',
+        message: 'Arquivo não encontrado',
+        requestId: rid
+      });
+    }
+    
+    log(`[OTA][${rid}] Download de firmware | ip=${clientIp} | filename=${filename}`);
+    
+    res.download(filePath, filename, (err) => {
+      if (err) {
+        err(`[OTA][${rid}] Erro ao enviar arquivo:`, err.message);
+        if (!res.headersSent) {
+          res.status(500).json({
+            ok: false,
+            error: 'download_failed',
+            message: 'Erro ao baixar arquivo',
+            requestId: rid
+          });
+        }
+      }
+    });
+  });
+  
   // Trigger Snapshot
   app.post('/trigger-snapshot', strictRateLimit || ((req, res, next) => next()), (req, res, next) => {
     const validation = validateESP32Authorization(req);
@@ -460,9 +581,12 @@ function initRoutesModule({
         numbers.map(async (rawPhone) => {
           try {
             const normalized = normalizeBR(rawPhone);
+            dbg(`[SNAPSHOT][${rid}] Resolvendo número: ${rawPhone} -> ${normalized}`);
             const { id: numberId, tried } = await resolveWhatsAppNumber(normalized);
+            dbg(`[SNAPSHOT][${rid}] Resultado para ${normalized}: numberId=${numberId ? 'encontrado' : 'null'}, tried=${tried?.length || 0}`);
             return { rawPhone, normalized, numberId, tried, error: null };
           } catch (e) {
+            warn(`[SNAPSHOT][${rid}] Erro ao resolver ${rawPhone}: ${e.message}`);
             return { rawPhone, normalized: rawPhone, numberId: null, tried: [], error: String(e) };
           }
         })
@@ -470,6 +594,11 @@ function initRoutesModule({
       
       const validNumbers = numberResolutions.filter(n => n.numberId !== null);
       const invalidNumbers = numberResolutions.filter(n => n.numberId === null);
+      
+      dbg(`[SNAPSHOT][${rid}] Resolução completa: ${validNumbers.length} válidos, ${invalidNumbers.length} inválidos`);
+      invalidNumbers.forEach(n => {
+        warn(`[SNAPSHOT][${rid}] Número inválido: ${n.normalized} - erro: ${n.error || 'not_on_whatsapp'}`);
+      });
       
       if (validNumbers.length === 0) {
         warn(`[SNAPSHOT][${rid}] Nenhum número válido encontrado`);

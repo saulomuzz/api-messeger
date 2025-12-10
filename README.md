@@ -84,7 +84,7 @@ API_TOKEN=seu_token_opcional
 DEBUG=false
 
 # Câmera IP
-CAMERA_SNAPSHOT_URL=http://10.10.0.240/cgi-bin/snapshot.cgi?channel=1
+CAMERA_SNAPSHOT_URL=http://192.168.1.100/cgi-bin/snapshot.cgi?channel=1
 CAMERA_USER=admin
 CAMERA_PASS=senha
 
@@ -96,7 +96,7 @@ JPEG_QUALITY=85              # Qualidade JPEG 1-100 (padrão: 85)
 
 # Segurança ESP32
 ESP32_TOKEN=token_secreto_esp32
-ESP32_ALLOWED_IPS=10.10.0.4,10.10.0.0/24
+ESP32_ALLOWED_IPS=192.168.1.100,192.168.1.0/24
 
 # Tuya API (opcional)
 TUYA_CLIENT_ID=seu_client_id
