@@ -51,6 +51,7 @@ function initWhatsAppOfficialModule({
   
   let isReady = true; // API oficial sempre está "pronta" (não precisa de QR)
   let tempVideoProcessor = null; // Função para processar vídeos temporários
+  let listVideosFunction = null; // Função para listar histórico de vídeos
   
   /**
    * Envia mensagem de texto
@@ -505,9 +506,9 @@ function initWhatsAppOfficialModule({
               }
               
               // Mensagem de texto normal
-              await handleTextMessage(from, text, messageId);
+                await handleTextMessage(from, text, messageId);
               continue;
-            }
+              }
             
             dbg(`[WHATSAPP-API] Tipo de mensagem não processado: ${messageType}`);
           }
@@ -886,19 +887,21 @@ function initWhatsAppOfficialModule({
                 await new Promise(resolve => setTimeout(resolve, 2000));
               }
               
-              camera.cleanupVideoFile(partFile, `após envio da parte ${i + 1}`);
+              // Não deleta imediatamente - deixa o sistema de expiração cuidar
+              // camera.cleanupVideoFile(partFile, `após envio da parte ${i + 1}`);
             } catch (sendError) {
               err(`[CMD] Erro ao enviar parte ${i + 1}/${videoParts.length}:`, sendError.message);
               await sendTextMessage(to, `❌ Erro ao enviar parte ${i + 1}/${videoParts.length}: ${sendError.message}`);
-              camera.cleanupVideoFile(partFile, 'após erro no envio');
+              // Não deleta em caso de erro também - pode ser útil para debug
+            // camera.cleanupVideoFile(partFile, 'após erro no envio');
               // Continua tentando enviar as outras partes
             }
           }
           
-          // Limpa arquivo original se ainda existir
-          if (originalFilePath !== finalVideoPath && fs.existsSync(originalFilePath)) {
-            camera.cleanupVideoFile(originalFilePath, 'após envio (arquivo original)');
-          }
+          // Não deleta imediatamente - deixa o sistema de expiração cuidar
+          // if (originalFilePath !== finalVideoPath && fs.existsSync(originalFilePath)) {
+          //   camera.cleanupVideoFile(originalFilePath, 'após envio (arquivo original)');
+          // }
         } catch (sendError) {
           err(`[CMD] Erro ao processar/enviar vídeo:`, sendError.message);
           err(`[CMD] Stack trace:`, sendError.stack);
@@ -1041,16 +1044,68 @@ function initWhatsAppOfficialModule({
               await new Promise(resolve => setTimeout(resolve, 2000));
             }
             
-            camera.cleanupVideoFile(partFile, `após envio da parte ${i + 1}`);
+            // Não deleta imediatamente - deixa o sistema de expiração cuidar
+            // camera.cleanupVideoFile(partFile, `após envio da parte ${i + 1}`);
           } catch (sendError) {
             err(`[WHATSAPP-API] Erro ao enviar parte ${i + 1}/${videoParts.length}:`, sendError.message);
             await sendTextMessage(from, `❌ Erro ao enviar parte ${i + 1}/${videoParts.length}: ${sendError.message}`);
-            camera.cleanupVideoFile(partFile, 'após erro no envio');
+            // Não deleta em caso de erro também - pode ser útil para debug
+            // camera.cleanupVideoFile(partFile, 'após erro no envio');
           }
         }
       } catch (e) {
         err(`[WHATSAPP-API] Erro ao enviar vídeo via comando:`, e.message);
         await sendTextMessage(from, `❌ Erro ao enviar vídeo: ${e.message}`);
+      }
+      return;
+    }
+    
+    // Comandos de histórico de vídeos
+    if (msgLower === '!historico' || msgLower === '!histórico' || msgLower === '!videos' || msgLower === '!hist') {
+      log(`[CMD] Comando de histórico recebido de ${from}`);
+      
+      if (!listVideosFunction) {
+        await sendTextMessage(from, '❌ Sistema de histórico não disponível.');
+        return;
+      }
+      
+      try {
+        const videos = listVideosFunction(from);
+        
+        if (videos.length === 0) {
+          await sendTextMessage(from, '📹 *Histórico de Vídeos*\n\nNenhum vídeo disponível no momento.');
+          return;
+        }
+        
+        // Formata lista de vídeos
+        let message = `📹 *Histórico de Vídeos*\n\n`;
+        message += `Total: ${videos.length} vídeo(s) disponível(is)\n\n`;
+        
+        videos.slice(0, 10).forEach((video, index) => {
+          const date = new Date(video.createdAt);
+          const dateStr = date.toLocaleString('pt-BR', { 
+            day: '2-digit', 
+            month: '2-digit', 
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+          });
+          const status = video.fileExists ? '✅' : '❌';
+          message += `${index + 1}. ${status} ${dateStr}\n`;
+          message += `   ID: \`${video.videoId}\`\n`;
+          message += `   Use: \`!video ${video.videoId}\`\n\n`;
+        });
+        
+        if (videos.length > 10) {
+          message += `\n... e mais ${videos.length - 10} vídeo(s). Use \`!video <ID>\` para ver.`;
+        }
+        
+        message += `\n💡 *Dica:* Use \`!video <ID>\` para ver um vídeo específico.`;
+        
+        await sendTextMessage(from, message);
+      } catch (e) {
+        err(`[CMD] Erro ao listar histórico:`, e.message);
+        await sendTextMessage(from, `❌ Erro ao listar histórico: ${e.message}`);
       }
       return;
     }
@@ -1518,11 +1573,13 @@ function initWhatsAppOfficialModule({
               await new Promise(resolve => setTimeout(resolve, 2000));
             }
             
-            camera.cleanupVideoFile(partFile, `após envio da parte ${i + 1}`);
+            // Não deleta imediatamente - deixa o sistema de expiração cuidar
+            // camera.cleanupVideoFile(partFile, `após envio da parte ${i + 1}`);
           } catch (sendError) {
             err(`[WHATSAPP-API] Erro ao enviar parte ${i + 1}/${videoParts.length}:`, sendError.message);
             await sendTextMessage(from, `❌ Erro ao enviar parte ${i + 1}/${videoParts.length}: ${sendError.message}`);
-            camera.cleanupVideoFile(partFile, 'após erro no envio');
+            // Não deleta em caso de erro também - pode ser útil para debug
+            // camera.cleanupVideoFile(partFile, 'após erro no envio');
           }
         }
       } catch (e) {

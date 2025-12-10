@@ -893,10 +893,14 @@ try {
 
 // Passa função de processamento de vídeos temporários para o módulo WhatsApp
 try {
-  if (whatsapp && routesModule && routesModule.processTempVideo) {
-    if (whatsapp.setTempVideoProcessor) {
+  if (whatsapp && routesModule) {
+    if (routesModule.processTempVideo && whatsapp.setTempVideoProcessor) {
       whatsapp.setTempVideoProcessor(routesModule.processTempVideo);
       log(`[INIT] Processador de vídeos temporários configurado`);
+    }
+    if (routesModule.listVideos && whatsapp.setListVideosFunction) {
+      whatsapp.setListVideosFunction(routesModule.listVideos);
+      log(`[INIT] Função de listagem de vídeos configurada`);
     }
   }
 } catch (tempVideoError) {
