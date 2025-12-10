@@ -12,16 +12,44 @@ const crypto = require('crypto');
  * @param {Object} config - Configuração
  * @param {string} config.logPath - Caminho do arquivo de log
  * @param {boolean} config.debug - Modo debug
+ * @param {boolean} config.useLocalTimezone - Usar horário local ao invés de UTC (padrão: false)
  * @returns {Object} Funções de logging
  */
-function initLogger({ logPath, debug = false }) {
+function initLogger({ logPath, debug = false, useLocalTimezone = false }) {
   try {
     fs.mkdirSync(path.dirname(logPath), { recursive: true });
     if (!fs.existsSync(logPath)) fs.writeFileSync(logPath, '');
   } catch {}
   
   const append = (l) => { try { fs.appendFileSync(logPath, l); } catch {} };
-  const nowISO = () => new Date().toISOString();
+  
+  // Função para formatar data/hora no timezone local
+  const formatLocalDateTime = () => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    const seconds = String(now.getSeconds()).padStart(2, '0');
+    const ms = String(now.getMilliseconds()).padStart(3, '0');
+    
+    // Obtém o offset do timezone em minutos e converte para formato +/-HH:MM
+    const offset = -now.getTimezoneOffset(); // Inverte porque getTimezoneOffset retorna o oposto
+    const offsetHours = String(Math.floor(Math.abs(offset) / 60)).padStart(2, '0');
+    const offsetMinutes = String(Math.abs(offset) % 60).padStart(2, '0');
+    const offsetSign = offset >= 0 ? '+' : '-';
+    const timezone = `${offsetSign}${offsetHours}:${offsetMinutes}`;
+    
+    return `${year}-${month}-${day}T${hours}:${minutes}:${seconds}.${ms}${timezone}`;
+  };
+  
+  const nowISO = () => {
+    // Se useLocalTimezone estiver habilitado, usa horário local
+    // Caso contrário, mantém UTC (compatibilidade)
+    return useLocalTimezone ? formatLocalDateTime() : new Date().toISOString();
+  };
+  
   const out = (lvl, ...a) => {
     const line = `[${lvl}] ${nowISO()} ${a.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')}\n`;
     append(line);

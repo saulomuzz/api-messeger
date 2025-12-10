@@ -105,6 +105,9 @@ REQUEST_TIMEOUT_MS=30000            # Timeout em ms (padrão: 30000 = 30s)
 # CORS
 CORS_ORIGIN=*                       # Origem permitida (use * para todas, ou URL específica)
 
+# Logs
+LOG_TIMEZONE_LOCAL=true             # Usar horário local nos logs (padrão: true, use false para UTC)
+
 # Autenticação
 API_TOKEN=seu_token_aqui            # Token para autenticação geral
 ESP32_TOKEN=seu_token_esp32         # Token para ESP32
