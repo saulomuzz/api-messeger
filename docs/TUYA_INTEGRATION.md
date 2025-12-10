@@ -75,12 +75,12 @@ O **TUYA_UID** é o UID da conta de aplicativo vinculada ao seu projeto. Para en
 2. Vá para seu projeto (ex: "Api-Wpp")
 3. Navegue até a seção de **"Gerenciamento de Contas de App"** ou similar
 4. Na tabela de contas vinculadas, procure a coluna **"UID"**
-5. Copie o valor do UID (formato exemplo: `az1655237368792Wwr37`)
+5. Copie o valor do UID (formato exemplo: `az1234567890abcdef`)
 
-**Na imagem que você mostrou:**
-- **UID:** `az1655237368792Wwr37`
+**Exemplo:**
+- **UID:** `az1234567890abcdef`
 - **App Name:** SmartLife
-- **Projeto Vinculado:** Api-Wpp
+- **Projeto Vinculado:** Seu-Projeto
 - **Dispositivos:** 32/32
 
 Este é o UID que você deve usar no `TUYA_UID` do arquivo `.env`.

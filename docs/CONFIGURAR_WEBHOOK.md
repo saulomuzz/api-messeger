@@ -13,7 +13,7 @@ Adicione esta configuração ao seu nginx (geralmente em `/etc/nginx/sites-avail
 ```nginx
 server {
     listen 80;
-    server_name api.biancavolken.com.br;
+    server_name seu-dominio.com.br;
 
     location /webhook/whatsapp {
         proxy_pass http://localhost:4000;
@@ -36,7 +36,7 @@ server {
 ```nginx
 server {
     listen 443 ssl http2;
-    server_name api.biancavolken.com.br;
+    server_name seu-dominio.com.br;
 
     # Seus certificados SSL aqui
     # ssl_certificate /caminho/para/certificado.pem;

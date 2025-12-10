@@ -7,8 +7,8 @@
    - Linha 15: `REQUIRE_SIGNED_REQUESTS=true` ⚠️ **CONFLITO!**
 
 2. **`ESP32_ALLOWED_IPS` duplicado:**
-   - Linha 25: `ESP32_ALLOWED_IPS=10.10.1.42`
-   - Linha 30: `ESP32_ALLOWED_IPS=10.10.0.4,10.10.0.0/23` ⚠️ **CONFLITO!**
+   - Linha 25: `ESP32_ALLOWED_IPS=192.168.1.42`
+   - Linha 30: `ESP32_ALLOWED_IPS=192.168.1.100,192.168.1.0/24` ⚠️ **CONFLITO!**
 
 3. **Espaço antes de `REQUIRE_SIGNED_REQUESTS`:**
    - Linha 9 tem um espaço: ` REQUIRE_SIGNED_REQUESTS=false` ⚠️ **ERRO!**
@@ -34,11 +34,11 @@ REQUIRE_SIGNED_REQUESTS=false
 
 **Mantenha apenas:**
 ```env
-ESP32_ALLOWED_IPS=10.10.0.4,10.10.0.0/23
+ESP32_ALLOWED_IPS=192.168.1.100,192.168.1.0/24
 ```
 
 **Remova:**
-- A linha 25: `ESP32_ALLOWED_IPS=10.10.1.42`
+- A linha 25: `ESP32_ALLOWED_IPS=192.168.1.42`
 
 ### 3. Adicione `WHATSAPP_API_VERSION` (opcional)
 
@@ -51,8 +51,8 @@ WHATSAPP_API_VERSION=v21.0
 - [ ] Remover espaço antes de `REQUIRE_SIGNED_REQUESTS` na linha 9
 - [ ] Remover linha duplicada `REQUIRE_SIGNED_REQUESTS=true` (linha 15)
 - [ ] Manter apenas `REQUIRE_SIGNED_REQUESTS=false`
-- [ ] Remover `ESP32_ALLOWED_IPS=10.10.1.42` (linha 25)
-- [ ] Manter apenas `ESP32_ALLOWED_IPS=10.10.0.4,10.10.0.0/23`
+- [ ] Remover `ESP32_ALLOWED_IPS=192.168.1.42` (linha 25)
+- [ ] Manter apenas `ESP32_ALLOWED_IPS=192.168.1.100,192.168.1.0/24`
 - [ ] Adicionar `WHATSAPP_API_VERSION=v21.0` (opcional)
 
 ## 🚀 Após Correções

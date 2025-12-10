@@ -1,7 +1,7 @@
 #!/bin/bash
 # Script para testar chamadas do ESP32
 
-API_URL="http://10.10.0.3:4000"
+API_URL="http://localhost:3000"
 ESP32_TOKEN="seu_token_esp32_aqui"  # Substitua pelo token configurado no .env
 
 echo "=========================================="

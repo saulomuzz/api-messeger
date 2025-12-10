@@ -677,7 +677,24 @@ function initWhatsAppOfficialModule({
         log(`[MENU] Menu de opções enviado como List Message para ${to}`);
         return;
       } catch (listError) {
-        dbg(`[MENU] List Message não suportado, usando botões: ${listError.message}`);
+        const listErrorMsg = listError.message || String(listError) || 'Erro desconhecido';
+        dbg(`[MENU] List Message não suportado, usando botões: ${listErrorMsg}`);
+        // Verifica se é erro de lista de transmissão (não suporta mensagens interativas)
+        if (listErrorMsg.includes('Invalid value') || listErrorMsg.includes('invalid') || listErrorMsg.includes('Evaluation failed')) {
+          warn(`[MENU] Lista de transmissão não suporta mensagens interativas, usando texto simples`);
+          // Pula botões e vai direto para texto
+          const textMenu = '🏠 *Menu Principal*\n\n' +
+            '📋 *1. Dispositivos Tuya*\n   Digite: `!tuya list`\n\n' +
+            '⚡ *2. Status do Dispositivo*\n   Digite: `!tuya status <nome>`\n\n' +
+            '💡 *3. Luzes Ligadas*\n   Digite: `!tuya count`\n\n' +
+            '🛡️ *4. IPs Bloqueados*\n   Digite: `!blocked` ou `!ips`\n\n' +
+            '🎥 *5. Gravar Vídeo*\n   Digite: `!record` ou `!record 30`\n\n' +
+            '❓ *6. Ajuda*\n   Digite: `!tuya help`\n\n' +
+            '💡 *Dica:* Use os comandos acima para interagir.';
+          await sendTextMessage(to, textMenu);
+          log(`[MENU] Menu de opções enviado como texto para ${to}`);
+          return;
+        }
         // Fallback: botões interativos
         try {
           await sendInteractiveButtons(
@@ -702,7 +719,12 @@ function initWhatsAppOfficialModule({
           log(`[MENU] Menu de opções enviado como botões para ${to}`);
           return;
         } catch (buttonError) {
-          dbg(`[MENU] Botões não suportados, usando texto: ${buttonError.message}`);
+          const errorMsg = buttonError.message || String(buttonError) || 'Erro desconhecido';
+          dbg(`[MENU] Botões não suportados, usando texto: ${errorMsg}`);
+          // Verifica se é erro de lista de transmissão
+          if (errorMsg.includes('Invalid value') || errorMsg.includes('invalid') || errorMsg.includes('Evaluation failed')) {
+            warn(`[MENU] Lista de transmissão não suporta mensagens interativas`);
+          }
           // Fallback final: texto
           const textMenu = '🏠 *Menu Principal*\n\n' +
             '📋 *1. Dispositivos Tuya*\n   Digite: `!tuya list`\n\n' +
@@ -1672,6 +1694,10 @@ function initWhatsAppOfficialModule({
     setTempVideoProcessor: (processor) => {
       tempVideoProcessor = processor;
       log(`[WHATSAPP-API] Processador de vídeos temporários configurado`);
+    },
+    setListVideosFunction: (listFunction) => {
+      listVideosFunction = listFunction;
+      log(`[WHATSAPP-API] Função de listagem de vídeos configurada`);
     },
     
     // Resolver número (para compatibilidade)
