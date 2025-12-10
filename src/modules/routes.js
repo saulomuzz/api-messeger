@@ -44,7 +44,7 @@ function initRoutesModule({
   strictRateLimit
 }) {
   const { log, dbg, warn, err, nowISO } = logger;
-  const { requestId, normalizeBR, readNumbersFromFile, getClientIp } = utils;
+  const { requestId, normalizeBR, readNumbersFromFile, getClientIp, isNumberAuthorized } = utils;
   
   // Sistema de gerenciamento de vídeos temporários (24 horas)
   const TEMP_VIDEOS_DIR = path.join(recordingsDir || path.join(__dirname, '..', '..', 'recordings'), 'temp_videos');
@@ -131,6 +131,44 @@ function initRoutesModule({
     cleanupExpiredVideos();
     const db = loadTempVideosDB();
     return db[videoId] || null;
+  }
+  
+  // Lista todos os vídeos disponíveis (histórico)
+  function listVideos(phoneNumber = null) {
+    cleanupExpiredVideos();
+    const db = loadTempVideosDB();
+    const videos = [];
+    
+    for (const [videoId, videoData] of Object.entries(db)) {
+      // Se phoneNumber fornecido, verifica se está autorizado
+      if (phoneNumber) {
+        const normalizedPhone = normalizeBR(phoneNumber);
+        const isAuthorized = videoData.phoneNumbers.some(p => {
+          const normalized = normalizeBR(p);
+          return normalized === normalizedPhone || normalized.replace(/^\+/, '') === normalizedPhone.replace(/^\+/, '');
+        });
+        if (!isAuthorized) continue;
+      }
+      
+      // Verifica se arquivo ainda existe
+      const fileExists = videoData.filePath && fs.existsSync(videoData.filePath);
+      
+      videos.push({
+        videoId,
+        createdAt: videoData.createdAt,
+        createdAtISO: new Date(videoData.createdAt).toISOString(),
+        expiresAt: videoData.expiresAt,
+        expiresAtISO: videoData.expiresAtISO,
+        filePath: videoData.filePath,
+        fileExists,
+        phoneNumbers: videoData.phoneNumbers
+      });
+    }
+    
+    // Ordena por data de criação (mais recente primeiro)
+    videos.sort((a, b) => b.createdAt - a.createdAt);
+    
+    return videos;
   }
   
   // Limpa vídeos expirados periodicamente (a cada hora)
@@ -836,14 +874,26 @@ function initRoutesModule({
     }
     
     // Verifica se o número está autorizado para ver este vídeo
+    // Agora permite que qualquer número autorizado veja qualquer vídeo
     const normalizedPhone = normalizeBR(phoneNumber);
     const isAuthorized = videoData.phoneNumbers.some(p => {
       const normalized = normalizeBR(p);
       return normalized === normalizedPhone || normalized.replace(/^\+/, '') === normalizedPhone.replace(/^\+/, '');
     });
     
+    // Se não está na lista original, verifica se o número está autorizado no sistema
     if (!isAuthorized) {
-      return { success: false, error: 'Você não está autorizado a ver este vídeo' };
+      const authorizedNumbers = readNumbersFromFile(numbersFile || '');
+      if (authorizedNumbers.length > 0) {
+        // Se há números autorizados no sistema, verifica se o número atual está autorizado
+        const isSystemAuthorized = isNumberAuthorized(phoneNumber, numbersFile || '', dbg);
+        if (!isSystemAuthorized) {
+          return { success: false, error: 'Você não está autorizado a ver este vídeo' };
+        }
+      } else {
+        // Se não há lista de autorizados, permite acesso
+        log(`[TEMP-VIDEOS] Número ${phoneNumber} autorizado (sem lista de restrição)`);
+      }
     }
     
     // Verifica se o arquivo ainda existe
@@ -860,7 +910,8 @@ function initRoutesModule({
   }
   
   return {
-    processTempVideo
+    processTempVideo,
+    listVideos
   };
 }
 
