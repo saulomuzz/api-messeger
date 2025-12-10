@@ -47,6 +47,7 @@ const BLOCKED_IPS_FILE = process.env.BLOCKED_IPS_FILE || path.join(APP_ROOT, 'bl
 const ENABLE_REQUEST_TIMEOUT = /^true$/i.test(process.env.ENABLE_REQUEST_TIMEOUT || 'true');
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '30000', 10); // Timeout de 30 segundos
 const LOG_PATH = process.env.LOG_PATH || '/var/log/whatsapp-api.log';
+const LOG_TIMEZONE_LOCAL = /^true$/i.test(process.env.LOG_TIMEZONE_LOCAL || 'true'); // Usar horário local nos logs (padrão: true)
 const SIG_MAX_SKEW = parseInt(process.env.SIG_MAX_SKEW_SECONDS || '300', 10);
 const REQUIRE_SIGNED = /^true$/i.test(process.env.REQUIRE_SIGNED_REQUESTS || 'false'); // <-- MUDANÇA: Padrão para 'false' para facilitar testes
 const PUBLIC_KEY_PATH_RAW = process.env.PUBLIC_KEY_PATH || '';
@@ -82,7 +83,8 @@ const VIDEO_AUDIO_BITRATE = process.env.VIDEO_AUDIO_BITRATE || '128k'; // Bitrat
 /* ===== logging ===== */
 const logger = initLogger({
   logPath: LOG_PATH,
-  debug: DEBUG
+  debug: DEBUG,
+  useLocalTimezone: LOG_TIMEZONE_LOCAL
 });
 const { log, dbg, warn, err, nowISO } = logger;
 
