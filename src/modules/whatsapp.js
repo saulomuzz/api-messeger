@@ -28,6 +28,7 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
   // Estado interno
   let lastQR = null;
   let isReady = false;
+  let tempVideoProcessor = null; // Função para processar vídeos temporários
   
   // Cria cliente WhatsApp
   const client = new Client({
@@ -697,6 +698,62 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
         }
         return;
       }
+      
+      // Processa botão "Ver Vídeo" (view_video_*)
+      if (msgBody.startsWith('view_video_')) {
+        const videoId = msgBody.replace('view_video_', '');
+        log(`[MENU] Solicitação de vídeo: ${videoId} por ${message.from}`);
+        
+        if (!tempVideoProcessor) {
+          await message.reply('❌ Sistema de vídeos temporários não disponível.');
+          return;
+        }
+        
+        try {
+          const senderNumber = getSenderNumber(message);
+          if (!senderNumber) return;
+          
+          const result = tempVideoProcessor(videoId, senderNumber);
+          
+          if (!result.success) {
+            await message.reply(`❌ ${result.error || 'Erro ao processar vídeo'}`);
+            return;
+          }
+          
+          const fs = require('fs');
+          if (!fs.existsSync(result.filePath)) {
+            await message.reply('❌ Arquivo de vídeo não encontrado.');
+            return;
+          }
+          
+          const videoBuffer = fs.readFileSync(result.filePath);
+          const videoBase64 = videoBuffer.toString('base64');
+          const sizeMB = videoBuffer.length / 1024 / 1024;
+          
+          if (sizeMB > 16) {
+            await message.reply(`❌ Vídeo muito grande (${sizeMB.toFixed(2)} MB). Limite do WhatsApp: 16 MB.`);
+            return;
+          }
+          
+          const { MessageMedia } = require('whatsapp-web.js');
+          const videoMedia = new MessageMedia('video/mp4', videoBase64, `video_${videoId}.mp4`);
+          
+          await message.reply('⏳ Enviando vídeo...');
+          await client.sendMessage(message.from, videoMedia, { caption: '🎥 Vídeo da campainha (15 segundos)' });
+          log(`[MENU] Vídeo ${videoId} enviado com sucesso para ${message.from}`);
+        } catch (e) {
+          err(`[MENU] Erro ao enviar vídeo:`, e.message);
+          await message.reply(`❌ Erro ao enviar vídeo: ${e.message}`);
+        }
+        return;
+      }
+      
+      // Processa botão "Pular" (skip_video)
+      if (msgBody === 'skip_video') {
+        log(`[MENU] Usuário optou por pular o vídeo: ${message.from}`);
+        // Não precisa fazer nada, apenas logar
+        return;
+      }
     }
     
     log(`[MSG] Mensagem recebida de ${message.from}: "${message.body}"`);
@@ -739,6 +796,55 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
         log(`[CMD] Resposta 'pong' enviada para ${message.from}.`);
       } catch (e) {
         err(`[CMD] Falha ao responder 'pong' para ${message.from}:`, e.message);
+      }
+      return;
+    }
+    
+    // Comando !video <videoId> - Solicita vídeo temporário
+    const videoMatch = message.body.match(/^!video\s+(.+)$/i);
+    if (videoMatch) {
+      const videoId = videoMatch[1].trim();
+      const fromNumber = getSenderNumber(message);
+      if (!fromNumber) return;
+      log(`[CMD] Comando !video recebido de ${message.from} para videoId: ${videoId}`);
+      
+      if (!tempVideoProcessor) {
+        await message.reply('❌ Sistema de vídeos temporários não disponível.');
+        return;
+      }
+      
+      try {
+        const result = tempVideoProcessor(videoId, fromNumber);
+        
+        if (!result.success) {
+          await message.reply(`❌ ${result.error || 'Erro ao processar vídeo'}`);
+          return;
+        }
+        
+        const fs = require('fs');
+        if (!fs.existsSync(result.filePath)) {
+          await message.reply('❌ Arquivo de vídeo não encontrado.');
+          return;
+        }
+        
+        const videoBuffer = fs.readFileSync(result.filePath);
+        const videoBase64 = videoBuffer.toString('base64');
+        const sizeMB = videoBuffer.length / 1024 / 1024;
+        
+        if (sizeMB > 16) {
+          await message.reply(`❌ Vídeo muito grande (${sizeMB.toFixed(2)} MB). Limite do WhatsApp: 16 MB.`);
+          return;
+        }
+        
+        const { MessageMedia } = require('whatsapp-web.js');
+        const videoMedia = new MessageMedia('video/mp4', videoBase64, `video_${videoId}.mp4`);
+        
+        await message.reply('⏳ Enviando vídeo...');
+        await client.sendMessage(message.from, videoMedia, { caption: '🎥 Vídeo da campainha (15 segundos)' });
+        log(`[CMD] Vídeo ${videoId} enviado via comando !video para ${message.from}`);
+      } catch (e) {
+        err(`[CMD] Erro ao enviar vídeo via comando:`, e.message);
+        await message.reply(`❌ Erro ao enviar vídeo: ${e.message}`);
       }
       return;
     }
@@ -1254,7 +1360,11 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
     getLastQR: () => lastQR,
     getIsReady: () => isReady,
     resolveWhatsAppNumber,
-    initialize
+    initialize,
+    setTempVideoProcessor: (processor) => {
+      tempVideoProcessor = processor;
+      log(`[WHATSAPP] Processador de vídeos temporários configurado`);
+    }
   };
 }
 

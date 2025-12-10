@@ -884,6 +884,9 @@ function initTuyaModule({ clientId, clientSecret, region, uid, logger }) {
     message += `*!tuya list*\n`;
     message += `Lista todos os seus dispositivos\n`;
     message += `Exemplo: !tuya list\n\n`;
+    message += `*!tuya count*\n`;
+    message += `Conta quantas lâmpadas/dispositivos estão ligados\n`;
+    message += `Exemplo: !tuya count\n\n`;
     message += `*!tuya status <número ou nome>*\n`;
     message += `Consulta o status de um dispositivo\n`;
     message += `Você pode usar:\n`;
@@ -906,6 +909,98 @@ function initTuyaModule({ clientId, clientSecret, region, uid, logger }) {
     return message;
   }
   
+  /**
+   * Identifica dispositivos que controlam luzes (lâmpadas e interruptores)
+   * Inclui lâmpadas e interruptores que controlam luzes (ex: interruptor da escada)
+   */
+  /**
+   * Identifica dispositivos que controlam luzes (lâmpadas e interruptores)
+   */
+  function isLightControlDevice(device) {
+    const category = (device.category || '').toLowerCase();
+    const name = (device.name || '').toLowerCase();
+    
+    // Lâmpadas
+    if (category.includes('light') || category.includes('lamp') || 
+        category.includes('lampada') || category.includes('lâmpada')) {
+      return true;
+    }
+    
+    // Interruptores que controlam luzes
+    if (category.includes('switch') || category.includes('interruptor')) {
+      // Verifica se o nome sugere controle de luz
+      if (name.includes('luz') || name.includes('light') || name.includes('lamp') ||
+          name.includes('lampada') || name.includes('lâmpada') || name.includes('escada') ||
+          name.includes('sala') || name.includes('quarto') || name.includes('cozinha') ||
+          name.includes('banheiro') || name.includes('corredor') || name.includes('garagem') ||
+          name.includes('varanda') || name.includes('jardim') || name.includes('externa')) {
+        return true;
+      }
+    }
+    
+    // Verifica pelo nome (caso a categoria não seja específica)
+    if (name.includes('luz') || name.includes('light') || name.includes('lamp') ||
+        name.includes('lampada') || name.includes('lâmpada') || name.includes('interruptor') ||
+        name.includes('switch') || name.includes('escada')) {
+      return true;
+    }
+    
+    return false;
+  }
+  
+  async function countPoweredOnDevices(uid, filterLightsOnly = true) {
+    try {
+      const devices = await getCachedDevices(uid);
+      
+      if (filterLightsOnly) {
+        // Filtra dispositivos que controlam luzes (lâmpadas e interruptores)
+        const lightDevices = devices.filter(d => isLightControlDevice(d));
+        
+        const poweredOnLights = lightDevices.filter(d => d.poweredOn);
+        return {
+          total: lightDevices.length,
+          poweredOn: poweredOnLights.length,
+          devices: poweredOnLights.map(d => ({ id: d.id, name: d.name, poweredOn: d.poweredOn }))
+        };
+      } else {
+        // Conta todos os dispositivos
+        const poweredOn = devices.filter(d => d.poweredOn);
+        return {
+          total: devices.length,
+          poweredOn: poweredOn.length,
+          devices: poweredOn.map(d => ({ id: d.id, name: d.name, poweredOn: d.poweredOn }))
+        };
+      }
+    } catch (e) {
+      err(`[TUYA] Erro ao contar dispositivos ligados:`, e.message);
+      throw e;
+    }
+  }
+  
+  /**
+   * Formata mensagem de contagem de dispositivos ligados
+   */
+  function formatCountMessage(countData, filterLightsOnly = true) {
+    const { total, poweredOn, devices } = countData;
+    const deviceType = filterLightsOnly ? 'luzes' : 'dispositivos';
+    
+    let message = `*💡 Contagem de ${deviceType.charAt(0).toUpperCase() + deviceType.slice(1)}*\n\n`;
+    message += `*Total:* ${total}\n`;
+    message += `*Ligadas:* ${poweredOn}\n`;
+    message += `*Desligadas:* ${total - poweredOn}\n\n`;
+    
+    if (poweredOn > 0) {
+      message += `*${deviceType.charAt(0).toUpperCase() + deviceType.slice(1)} ligadas:*\n`;
+      devices.forEach((d, index) => {
+        message += `${index + 1}. 🟢 ${d.name || d.id}\n`;
+      });
+    } else {
+      message += `✅ Nenhuma ${deviceType.slice(0, -1)} ligada no momento.`;
+    }
+    
+    return message;
+  }
+  
   // Retorna API pública do módulo
   return {
     getAccessToken,
@@ -918,6 +1013,9 @@ function initTuyaModule({ clientId, clientSecret, region, uid, logger }) {
     formatDeviceStatusMessage,
     formatDevicesListMessage,
     formatHelpMessage,
+    countPoweredOnDevices,
+    formatCountMessage,
+    isLightControlDevice,
     // Configuração (read-only)
     get config() {
       return {

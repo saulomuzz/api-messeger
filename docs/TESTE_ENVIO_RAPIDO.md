@@ -9,11 +9,11 @@ O endpoint `/send` está exigindo o header `X-API-Token` porque você tem `API_T
 ### Opção 1: Usando curl com token
 
 ```bash
-curl -X POST http://10.10.0.3:4000/send \
+curl -X POST http://localhost:3000/send \
   -H "Content-Type: application/json" \
-  -H "X-API-Token: 9f35a6e95a5f4b7f8c0c7c5a83a61c43eaa8b1e0f4b845c99b403ae9a02fbb2e" \
+  -H "X-API-Token: seu_token_aqui" \
   -d '{
-    "phone": "554299219594",
+    "phone": "5511999999999",
     "message": "Teste de mensagem via API Oficial!",
     "subject": "Teste"
   }'
@@ -31,25 +31,25 @@ chmod +x test-send.sh
 Se quiser testar sem token, remova ou comente a linha `API_TOKEN` no `.env`:
 
 ```env
-# API_TOKEN=9f35a6e95a5f4b7f8c0c7c5a83a61c43eaa8b1e0f4b845c99b403ae9a02fbb2e
+# API_TOKEN=seu_token_aqui
 ```
 
 **⚠️ ATENÇÃO:** Isso desabilita a autenticação para TODOS os endpoints que usam `auth`. Use apenas em desenvolvimento!
 
 ## 📋 Formato da Requisição
 
-**URL:** `POST http://10.10.0.3:4000/send`
+**URL:** `POST http://localhost:3000/send`
 
 **Headers:**
 ```
 Content-Type: application/json
-X-API-Token: 9f35a6e95a5f4b7f8c0c7c5a83a61c43eaa8b1e0f4b845c99b403ae9a02fbb2e
+X-API-Token: seu_token_aqui
 ```
 
 **Body (JSON):**
 ```json
 {
-  "phone": "554299219594",
+  "phone": "5511999999999",
   "message": "Sua mensagem aqui",
   "subject": "Assunto (opcional)"
 }
@@ -61,10 +61,10 @@ X-API-Token: 9f35a6e95a5f4b7f8c0c7c5a83a61c43eaa8b1e0f4b845c99b403ae9a02fbb2e
 {
   "ok": true,
   "requestId": "...",
-  "to": "554299219594",
+  "to": "5511999999999",
   "msgId": "wamid.xxx...",
-  "normalized": "+554299219594",
-  "tried": ["+554299219594"]
+  "normalized": "+5511999999999",
+  "tried": ["+5511999999999"]
 }
 ```
 
@@ -72,12 +72,12 @@ X-API-Token: 9f35a6e95a5f4b7f8c0c7c5a83a61c43eaa8b1e0f4b845c99b403ae9a02fbb2e
 
 ```bash
 # 1. Verificar status
-curl http://10.10.0.3:4000/status
+curl http://localhost:3000/status
 
 # 2. Enviar mensagem
-curl -X POST http://10.10.0.3:4000/send \
+curl -X POST http://localhost:3000/send \
   -H "Content-Type: application/json" \
-  -H "X-API-Token: 9f35a6e95a5f4b7f8c0c7c5a83a61c43eaa8b1e0f4b845c99b403ae9a02fbb2e" \
-  -d '{"phone":"554299219594","message":"Teste","subject":"Teste"}'
+  -H "X-API-Token: seu_token_aqui" \
+  -d '{"phone":"5511999999999","message":"Teste","subject":"Teste"}'
 ```
 

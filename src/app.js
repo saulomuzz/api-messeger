@@ -16,12 +16,36 @@ const { initTuyaModule } = require('./modules/tuya');
 const { initCameraModule } = require('./modules/camera');
 const { initWhatsAppModule } = require('./modules/whatsapp');
 const { initRoutesModule } = require('./modules/routes');
+const { initTuyaMonitorModule } = require('./modules/tuya-monitor');
+const { initIPBlockerModule } = require('./modules/ip-blocker');
 
 /* ===== env ===== */
+// Detecta APP_ROOT automaticamente baseado no diretório do script
+// Se não estiver definido no .env, usa o diretório pai do arquivo atual (src/app.js -> raiz do projeto)
+// IMPORTANTE: APP_ROOT deve ser definido ANTES de qualquer uso
+const APP_ROOT = process.env.APP_ROOT || (() => {
+  // Usa __dirname se disponível (CommonJS), senão usa require.main.filename
+  const scriptDir = typeof __dirname !== 'undefined' 
+    ? __dirname 
+    : path.dirname(require.main?.filename || process.cwd());
+  const projectRoot = path.resolve(scriptDir, '..'); // Sobe um nível de src/ para raiz
+  return projectRoot;
+})();
+
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || '';
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const DEBUG = /^true$/i.test(process.env.DEBUG || 'false');
+// Configurações de segurança
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10); // Janela de tempo em ms (padrão: 1 minuto)
+const RATE_LIMIT_MAX_REQUESTS = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100', 10); // Máximo de requisições por janela (padrão: 100)
+const RATE_LIMIT_STRICT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_STRICT_WINDOW_MS || '60000', 10); // Janela para endpoints críticos
+const RATE_LIMIT_STRICT_MAX = parseInt(process.env.RATE_LIMIT_STRICT_MAX || '10', 10); // Máximo para endpoints críticos (ex: /send, /trigger-snapshot)
+const ENABLE_IP_WHITELIST = /^true$/i.test(process.env.ENABLE_IP_WHITELIST || 'false'); // Whitelist global de IPs
+const IP_WHITELIST = process.env.IP_WHITELIST ? process.env.IP_WHITELIST.split(',').map(ip => ip.trim()) : [];
+const BLOCKED_IPS_FILE = process.env.BLOCKED_IPS_FILE || path.join(APP_ROOT, 'blocked_ips.json');
+const ENABLE_REQUEST_TIMEOUT = /^true$/i.test(process.env.ENABLE_REQUEST_TIMEOUT || 'true');
+const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '30000', 10); // Timeout de 30 segundos
 const LOG_PATH = process.env.LOG_PATH || '/var/log/whatsapp-api.log';
 const SIG_MAX_SKEW = parseInt(process.env.SIG_MAX_SKEW_SECONDS || '300', 10);
 const REQUIRE_SIGNED = /^true$/i.test(process.env.REQUIRE_SIGNED_REQUESTS || 'false'); // <-- MUDANÇA: Padrão para 'false' para facilitar testes
@@ -31,16 +55,6 @@ const CAMERA_USER = process.env.CAMERA_USER || '';
 const CAMERA_PASS = process.env.CAMERA_PASS || '';
 const CAMERA_RTSP_URL = process.env.CAMERA_RTSP_URL || '';
 const RECORD_DURATION_SEC = parseInt(process.env.RECORD_DURATION_SEC || '30', 10); // Duração padrão: 30 segundos
-// Detecta APP_ROOT automaticamente baseado no diretório do script
-// Se não estiver definido no .env, usa o diretório pai do arquivo atual (src/app.js -> raiz do projeto)
-const APP_ROOT = process.env.APP_ROOT || (() => {
-  // Usa __dirname se disponível (CommonJS), senão usa require.main.filename
-  const scriptDir = typeof __dirname !== 'undefined' 
-    ? __dirname 
-    : path.dirname(require.main?.filename || process.cwd());
-  const projectRoot = path.resolve(scriptDir, '..'); // Sobe um nível de src/ para raiz
-  return projectRoot;
-})();
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(APP_ROOT, 'recordings');
 const NUMBERS_FILE = process.env.NUMBERS_FILE || path.join(APP_ROOT, 'numbers.txt');
 const AUTH_DATA_PATH = process.env.AUTH_DATA_PATH || path.join(APP_ROOT, '.wwebjs_auth');
@@ -53,7 +67,17 @@ const MAX_IMAGE_HEIGHT = parseInt(process.env.MAX_IMAGE_HEIGHT || '1080', 10); /
 const JPEG_QUALITY = parseInt(process.env.JPEG_QUALITY || '85', 10); // Qualidade JPEG (1-100)
 // Configurações de otimização de vídeo
 const MAX_VIDEO_SIZE_MB = parseFloat(process.env.MAX_VIDEO_SIZE_MB || '8', 10); // Tamanho máximo em MB antes de comprimir (WhatsApp aceita até ~16MB)
-const VIDEO_CRF = parseInt(process.env.VIDEO_CRF || '32', 10); // CRF para compressão (maior = menor qualidade, menor arquivo, padrão: 32)
+const WHATSAPP_MAX_VIDEO_SIZE_MB = parseFloat(process.env.WHATSAPP_MAX_VIDEO_SIZE_MB || '16', 10); // Tamanho máximo permitido pela API do WhatsApp (padrão: 16MB)
+const VIDEO_CRF = parseInt(process.env.VIDEO_CRF || '23', 10); // CRF para compressão (0-51: menor = melhor qualidade, padrão: 23 para qualidade muito boa)
+const VIDEO_PRESET = process.env.VIDEO_PRESET || 'medium'; // Preset FFmpeg: ultrafast, fast, medium, slow, slower (padrão: medium)
+const VIDEO_PROFILE = process.env.VIDEO_PROFILE || 'high'; // Perfil H.264: baseline, main, high (padrão: high)
+const VIDEO_LEVEL = process.env.VIDEO_LEVEL || '4.0'; // Nível H.264: 3.0, 3.1, 4.0, 4.1, etc (padrão: 4.0)
+const VIDEO_MAXRATE = process.env.VIDEO_MAXRATE || '3M'; // Bitrate máximo (padrão: 3M)
+const VIDEO_BUFSIZE = process.env.VIDEO_BUFSIZE || '6M'; // Tamanho do buffer (padrão: 6M)
+const VIDEO_GOP = parseInt(process.env.VIDEO_GOP || '60', 10); // GOP size (padrão: 60)
+const VIDEO_MAX_WIDTH = parseInt(process.env.VIDEO_MAX_WIDTH || '1920', 10); // Largura máxima (padrão: 1920)
+const VIDEO_MAX_HEIGHT = parseInt(process.env.VIDEO_MAX_HEIGHT || '1080', 10); // Altura máxima (padrão: 1080)
+const VIDEO_AUDIO_BITRATE = process.env.VIDEO_AUDIO_BITRATE || '128k'; // Bitrate de áudio (padrão: 128k)
 
 /* ===== logging ===== */
 const logger = initLogger({
@@ -62,11 +86,29 @@ const logger = initLogger({
 });
 const { log, dbg, warn, err, nowISO } = logger;
 
+// Log de inicialização do processo
+log(`═══════════════════════════════════════════════════════════`);
+log(`🚀 [INIT] Iniciando aplicação WhatsApp API`);
+log(`📅 [INIT] Data/Hora: ${nowISO()}`);
+log(`🆔 [INIT] PID: ${process.pid}`);
+log(`📁 [INIT] Diretório: ${process.cwd()}`);
+log(`🔧 [INIT] Node.js: ${process.version}`);
+log(`💻 [INIT] Plataforma: ${os.platform()} ${os.arch()}`);
+log(`═══════════════════════════════════════════════════════════`);
+
 /* ===== Tuya API ===== */
 const TUYA_CLIENT_ID = (process.env.TUYA_CLIENT_ID || '').trim();
 const TUYA_CLIENT_SECRET = (process.env.TUYA_CLIENT_SECRET || '').trim();
 const TUYA_REGION = (process.env.TUYA_REGION || 'us').trim().toLowerCase(); // us, eu, cn, in
 const TUYA_UID = (process.env.TUYA_UID || '').trim(); // UID padrão do usuário
+
+// Tuya Monitor
+const TUYA_MONITOR_ENABLED = /^true$/i.test(process.env.TUYA_MONITOR_ENABLED || 'true');
+const TUYA_MONITOR_ALERT_HOURS = parseFloat(process.env.TUYA_MONITOR_ALERT_HOURS || '1', 10);
+const TUYA_MONITOR_CHECK_INTERVAL_MINUTES = parseInt(process.env.TUYA_MONITOR_CHECK_INTERVAL_MINUTES || '5', 10);
+const TUYA_MONITOR_NOTIFICATION_NUMBERS = process.env.TUYA_MONITOR_NOTIFICATION_NUMBERS
+  ? process.env.TUYA_MONITOR_NOTIFICATION_NUMBERS.split(',').map(n => n.trim())
+  : [];
 
 // Inicializa módulo Tuya
 const tuya = initTuyaModule({
@@ -79,21 +121,40 @@ const tuya = initTuyaModule({
 
 /* ===== Camera Module ===== */
 // Inicializa módulo Camera
-const camera = initCameraModule({
-  snapshotUrl: CAMERA_SNAPSHOT_URL,
-  username: CAMERA_USER,
-  password: CAMERA_PASS,
-  rtspUrl: CAMERA_RTSP_URL,
-  recordingsDir: RECORDINGS_DIR,
-  recordDurationSec: RECORD_DURATION_SEC,
-  maxImageSizeKB: MAX_IMAGE_SIZE_KB,
-  maxImageWidth: MAX_IMAGE_WIDTH,
-  maxImageHeight: MAX_IMAGE_HEIGHT,
-  jpegQuality: JPEG_QUALITY,
-  maxVideoSizeMB: MAX_VIDEO_SIZE_MB,
-  videoCRF: VIDEO_CRF,
-  logger
-});
+let camera;
+try {
+  log(`[INIT] Inicializando módulo Camera...`);
+  camera = initCameraModule({
+    snapshotUrl: CAMERA_SNAPSHOT_URL,
+    username: CAMERA_USER,
+    password: CAMERA_PASS,
+    rtspUrl: CAMERA_RTSP_URL,
+    recordingsDir: RECORDINGS_DIR,
+    recordDurationSec: RECORD_DURATION_SEC,
+    maxImageSizeKB: MAX_IMAGE_SIZE_KB,
+    maxImageWidth: MAX_IMAGE_WIDTH,
+    maxImageHeight: MAX_IMAGE_HEIGHT,
+    jpegQuality: JPEG_QUALITY,
+    maxVideoSizeMB: MAX_VIDEO_SIZE_MB,
+    whatsappMaxVideoSizeMB: WHATSAPP_MAX_VIDEO_SIZE_MB,
+    videoCRF: VIDEO_CRF,
+    videoPreset: VIDEO_PRESET,
+    videoProfile: VIDEO_PROFILE,
+    videoLevel: VIDEO_LEVEL,
+    videoMaxrate: VIDEO_MAXRATE,
+    videoBufsize: VIDEO_BUFSIZE,
+    videoGOP: VIDEO_GOP,
+    videoMaxWidth: VIDEO_MAX_WIDTH,
+    videoMaxHeight: VIDEO_MAX_HEIGHT,
+    videoAudioBitrate: VIDEO_AUDIO_BITRATE,
+    logger
+  });
+  log(`[INIT] Módulo Camera inicializado com sucesso`);
+} catch (cameraError) {
+  err(`[FATAL] Erro ao inicializar módulo Camera:`, cameraError.message);
+  err(`[FATAL] Stack:`, cameraError.stack);
+  process.exit(1);
+}
 
 /* ===== load public key ===== */
 const expandHome = p => (p && p.startsWith('~/')) ? path.join(os.homedir(), p.slice(2)) : p;
@@ -110,20 +171,197 @@ try {
 /* ===== express ===== */
 const app = express();
 app.set('trust proxy', 1);
+// Validação de tamanho de payload
 app.use(express.json({
-  limit: '256kb',
-  verify: (req, _res, buf) => { req.rawBody = buf.toString('utf8'); }
+  limit: '256kb',
+  verify: (req, _res, buf) => { 
+    req.rawBody = buf.toString('utf8');
+    // Validação adicional de tamanho
+    if (buf.length > 256 * 1024) {
+      throw new Error('Payload muito grande');
+    }
+  }
 }));
+
+// Configuração do Helmet com opções de segurança
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+    },
+  },
+  crossOriginEmbedderPolicy: false, // Permite CORS para APIs
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true
+  }
+}));
+
+// Middleware de timeout de requisições
+if (ENABLE_REQUEST_TIMEOUT) {
+  app.use((req, res, next) => {
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => {
+      const clientIp = getClientIp(req);
+      warn(`[SECURITY] Timeout de requisição para IP ${clientIp} em ${req.path}`);
+      if (!res.headersSent) {
+        res.status(408).json({ error: 'request_timeout', message: 'Requisição excedeu o tempo limite' });
+      }
+    });
+    next();
+  });
+}
+
+// Middleware de validação de IP (whitelist global)
+if (ENABLE_IP_WHITELIST && IP_WHITELIST.length > 0) {
+  app.use((req, res, next) => {
+    const clientIp = getClientIp(req);
+    const isAllowed = IP_WHITELIST.some(allowedIp => {
+      if (allowedIp.includes('/')) {
+        return ipInCidr(clientIp, allowedIp);
+      }
+      return normalizeIp(clientIp) === normalizeIp(allowedIp);
+    });
+    
+    if (!isAllowed) {
+      warn(`[SECURITY] IP bloqueado pela whitelist: ${clientIp} em ${req.path}`);
+      return res.status(403).json({ 
+        error: 'ip_not_allowed',
+        message: 'IP não autorizado'
+      });
+    }
+    next();
+  });
+}
 app.use(helmet());
 app.use(cors({
-  origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN,
-  methods: ['GET','POST'],
-  allowedHeaders: [
-    'Content-Type','X-API-Token','X-Date','X-Content-SHA256','X-Signature','X-Sign-Alg','X-Forwarded-For'
-  ],
+  origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN,
+  methods: ['GET','POST'],
+  allowedHeaders: [
+    'Content-Type','X-API-Token','X-Date','X-Content-SHA256','X-Signature','X-Sign-Alg','X-Forwarded-For','X-ESP32-Token'
+  ],
 }));
-app.use(rateLimit({ windowMs: 60_000, max: 120 }));
 
+/* ===== IP Blocker Module ===== */
+let ipBlocker = null;
+try {
+  log(`[INIT] Inicializando módulo IP Blocker...`);
+  ipBlocker = initIPBlockerModule({
+    appRoot: APP_ROOT,
+    logger
+  });
+  log(`[INIT] Módulo IP Blocker inicializado com sucesso`);
+} catch (ipBlockerError) {
+  err(`[FATAL] Erro ao inicializar módulo IP Blocker:`, ipBlockerError.message);
+  err(`[FATAL] Stack:`, ipBlockerError.stack);
+  // Não encerra a aplicação, mas loga o erro
+}
+
+// Middleware de verificação de IP bloqueado (executado no início de cada requisição)
+app.use(async (req, res, next) => {
+  const clientIp = getClientIp(req);
+  
+  // Ignora IPs na whitelist
+  if (ENABLE_IP_WHITELIST && IP_WHITELIST.length > 0) {
+    const isAllowed = IP_WHITELIST.some(allowedIp => {
+      if (allowedIp.includes('/')) {
+        return ipInCidr(clientIp, allowedIp);
+      }
+      return normalizeIp(clientIp) === normalizeIp(allowedIp);
+    });
+    if (isAllowed) {
+      return next();
+    }
+  }
+  
+  // Verifica se IP está bloqueado no banco
+  if (ipBlocker && ipBlocker.isBlocked) {
+    try {
+      const isBlocked = await ipBlocker.isBlocked(clientIp);
+      if (isBlocked) {
+        // Registra tentativa de acesso bloqueado
+        await ipBlocker.recordBlockedAttempt(clientIp);
+        warn(`[SECURITY] Tentativa de acesso de IP bloqueado: ${clientIp} em ${req.path}`);
+        return res.status(403).json({ 
+          error: 'ip_blocked',
+          message: 'IP bloqueado'
+        });
+      }
+    } catch (e) {
+      // Em caso de erro, permite acesso mas loga
+      dbg(`[SECURITY] Erro ao verificar IP bloqueado:`, e.message);
+    }
+  }
+  
+  next();
+});
+
+// Rate limiting global (mais permissivo)
+const globalRateLimit = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMIT_MAX_REQUESTS,
+  message: { error: 'Muitas requisições. Tente novamente mais tarde.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => {
+    // Pula rate limit para IPs na whitelist (se habilitado)
+    if (ENABLE_IP_WHITELIST && IP_WHITELIST.length > 0) {
+      const clientIp = getClientIp(req);
+      return IP_WHITELIST.some(allowedIp => {
+        if (allowedIp.includes('/')) {
+          return ipInCidr(clientIp, allowedIp);
+        }
+        return normalizeIp(clientIp) === normalizeIp(allowedIp);
+      });
+    }
+    return false;
+  },
+  handler: (req, res) => {
+    const clientIp = getClientIp(req);
+    warn(`[SECURITY] Rate limit excedido para IP ${clientIp} em ${req.path}`);
+    res.status(429).json({ 
+      error: 'rate_limit_exceeded',
+      message: 'Muitas requisições. Tente novamente mais tarde.',
+      retryAfter: Math.ceil(RATE_LIMIT_WINDOW_MS / 1000)
+    });
+  }
+});
+
+// Rate limiting estrito para endpoints críticos
+const strictRateLimit = rateLimit({
+  windowMs: RATE_LIMIT_STRICT_WINDOW_MS,
+  max: RATE_LIMIT_STRICT_MAX,
+  message: { error: 'Limite de requisições excedido para este endpoint.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skip: (req) => {
+    if (ENABLE_IP_WHITELIST && IP_WHITELIST.length > 0) {
+      const clientIp = getClientIp(req);
+      return IP_WHITELIST.some(allowedIp => {
+        if (allowedIp.includes('/')) {
+          return ipInCidr(clientIp, allowedIp);
+        }
+        return normalizeIp(clientIp) === normalizeIp(allowedIp);
+      });
+    }
+    return false;
+  },
+  handler: (req, res) => {
+    const clientIp = getClientIp(req);
+    warn(`[SECURITY] Rate limit estrito excedido para IP ${clientIp} em ${req.path}`);
+    res.status(429).json({ 
+      error: 'rate_limit_exceeded',
+      message: 'Limite de requisições excedido para este endpoint. Tente novamente mais tarde.',
+      retryAfter: Math.ceil(RATE_LIMIT_STRICT_WINDOW_MS / 1000)
+    });
+  }
+});
+
+// Nota: detectScanner será aplicado após sua definição (linha ~468)
+// mas a ordem de registro em Express importa - será executado na ordem registrada
 const ip = getClientIp;
 
 if (DEBUG) {
@@ -134,20 +372,269 @@ if (DEBUG) {
   });
 }
 
+// Sistema de bloqueio de IPs
+let blockedIPs = new Set();
+let failedAttempts = new Map(); // IP -> { count, firstAttempt, lastAttempt }
+let scannerDetection = new Map(); // IP -> { suspiciousPaths: Set, firstSeen, lastSeen, count }
+
+// Endpoints suspeitos que indicam varredura/reconhecimento
+const SUSPICIOUS_PATHS = [
+  '/robots.txt',
+  '/sitemap.xml',
+  '/.well-known/security.txt',
+  '/favicon.ico',
+  '/.env',
+  '/.git',
+  '/wp-admin',
+  '/wp-login.php',
+  '/phpmyadmin',
+  '/admin',
+  '/administrator',
+  '/.well-known',
+  '/.git/config',
+  '/config.php',
+  '/backup',
+  '/test',
+  '/api',
+  '/swagger',
+  '/docs'
+];
+
+// Carrega IPs bloqueados do arquivo
+function loadBlockedIPs() {
+  try {
+    if (fs.existsSync(BLOCKED_IPS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(BLOCKED_IPS_FILE, 'utf8'));
+      blockedIPs = new Set(data.blockedIPs || []);
+      log(`[SECURITY] ${blockedIPs.size} IP(s) bloqueado(s) carregado(s)`);
+    }
+  } catch (e) {
+    warn(`[SECURITY] Erro ao carregar IPs bloqueados:`, e.message);
+  }
+}
+
+// Salva IPs bloqueados
+function saveBlockedIPs() {
+  try {
+    fs.writeFileSync(BLOCKED_IPS_FILE, JSON.stringify({ 
+      blockedIPs: Array.from(blockedIPs),
+      updatedAt: new Date().toISOString()
+    }, null, 2), 'utf8');
+  } catch (e) {
+    warn(`[SECURITY] Erro ao salvar IPs bloqueados:`, e.message);
+  }
+}
+
+// Limpa tentativas antigas (mais de 1 hora)
+setInterval(() => {
+  const oneHourAgo = Date.now() - (60 * 60 * 1000);
+  for (const [ip, data] of failedAttempts.entries()) {
+    if (data.lastAttempt < oneHourAgo) {
+      failedAttempts.delete(ip);
+    }
+  }
+}, 60 * 60 * 1000); // A cada hora
+
+// Carrega IPs bloqueados na inicialização
+loadBlockedIPs();
+
+// Middleware de detecção de scanners/bots
+async function detectScanner(req, res, next) {
+  const clientIp = getClientIp(req);
+  const path = req.path.toLowerCase();
+  
+  // Ignora IPs na whitelist
+  if (ENABLE_IP_WHITELIST && IP_WHITELIST.length > 0) {
+    const isAllowed = IP_WHITELIST.some(allowedIp => {
+      if (allowedIp.includes('/')) {
+        return ipInCidr(clientIp, allowedIp);
+      }
+      return normalizeIp(clientIp) === normalizeIp(allowedIp);
+    });
+    if (isAllowed) {
+      return next();
+    }
+  }
+  
+  // Verificação de IP bloqueado já é feita no middleware global acima
+  // Esta verificação local é mantida apenas para compatibilidade
+  
+  // Verifica se o path é suspeito
+  const isSuspicious = SUSPICIOUS_PATHS.some(suspiciousPath => 
+    path === suspiciousPath || path.startsWith(suspiciousPath + '/')
+  );
+  
+  if (isSuspicious) {
+    const now = Date.now();
+    let scannerData = scannerDetection.get(clientIp);
+    
+    if (!scannerData) {
+      scannerData = {
+        suspiciousPaths: new Set(),
+        firstSeen: now,
+        lastSeen: now,
+        count: 0
+      };
+      scannerDetection.set(clientIp, scannerData);
+    }
+    
+    scannerData.suspiciousPaths.add(path);
+    scannerData.lastSeen = now;
+    scannerData.count++;
+    
+    // Bloqueia se detectou 3+ endpoints suspeitos em 5 minutos
+    const timeWindow = now - scannerData.firstSeen;
+    const BLOCK_THRESHOLD = 3; // Número de endpoints suspeitos
+    const TIME_WINDOW_MS = 5 * 60 * 1000; // 5 minutos
+    
+    if (scannerData.suspiciousPaths.size >= BLOCK_THRESHOLD && timeWindow <= TIME_WINDOW_MS) {
+      // Bloqueia no banco de dados
+      const reason = `Varredura/reconhecimento (${scannerData.suspiciousPaths.size} endpoints suspeitos: ${Array.from(scannerData.suspiciousPaths).join(', ')})`;
+      if (ipBlocker && ipBlocker.blockIP) {
+        try {
+          await ipBlocker.blockIP(clientIp, reason);
+        } catch (e) {
+          err(`[SECURITY] Erro ao bloquear IP no banco:`, e.message);
+        }
+      }
+      
+      // Mantém compatibilidade com sistema antigo (opcional)
+      blockedIPs.add(clientIp);
+      saveBlockedIPs();
+      
+      err(`[SECURITY] IP ${clientIp} bloqueado automaticamente por varredura/reconhecimento (${scannerData.suspiciousPaths.size} endpoints suspeitos: ${Array.from(scannerData.suspiciousPaths).join(', ')})`);
+      
+      // Remove da detecção
+      scannerDetection.delete(clientIp);
+      
+      return res.status(403).json({ 
+        error: 'ip_blocked',
+        message: 'IP bloqueado por atividade suspeita'
+      });
+    } else {
+      warn(`[SECURITY] Atividade suspeita detectada de ${clientIp}: ${path} (${scannerData.suspiciousPaths.size}/${BLOCK_THRESHOLD} endpoints suspeitos)`);
+    }
+  }
+  
+  // Limpa detecções antigas (mais de 10 minutos)
+  const tenMinutesAgo = Date.now() - (10 * 60 * 1000);
+  for (const [ip, data] of scannerDetection.entries()) {
+    if (data.lastSeen < tenMinutesAgo) {
+      scannerDetection.delete(ip);
+    }
+  }
+  
+  next();
+}
+
+// Aplica detecção de scanner ANTES do rate limiting (mas após sua definição)
+// Isso garante que scanners sejam bloqueados antes de consumir recursos de rate limiting
+app.use(detectScanner);
+
 /* ===== auth token (opcional) ===== */
-function auth(req, res, next) {
+async function auth(req, res, next) {
+  const clientIp = getClientIp(req);
+  
+  // Verificação de IP bloqueado já é feita no middleware global
+  // Esta verificação local é mantida apenas para compatibilidade
+  
   if (!API_TOKEN) return next();
+  
   const t = req.header('X-API-Token') || '';
   if (t !== API_TOKEN) {
-    warn(`401 invalid token | uri=${req.originalUrl} ip=${ip(req)}`);
-    return res.status(401).json({ error: 'invalid token' });
+    // Registra tentativa falhada
+    const now = Date.now();
+    const attempts = failedAttempts.get(clientIp) || { count: 0, firstAttempt: now, lastAttempt: now };
+    attempts.count++;
+    attempts.lastAttempt = now;
+    failedAttempts.set(clientIp, attempts);
+    
+    // Bloqueia IP após 5 tentativas falhadas em 15 minutos
+    if (attempts.count >= 5) {
+      const timeSinceFirst = now - attempts.firstAttempt;
+      if (timeSinceFirst < 15 * 60 * 1000) { // 15 minutos
+        // Bloqueia no banco de dados
+        const reason = `Múltiplas tentativas falhadas de autenticação (${attempts.count} tentativas)`;
+        if (ipBlocker && ipBlocker.blockIP) {
+          try {
+            await ipBlocker.blockIP(clientIp, reason);
+          } catch (e) {
+            err(`[SECURITY] Erro ao bloquear IP no banco:`, e.message);
+          }
+        }
+        
+        // Mantém compatibilidade com sistema antigo (opcional)
+        blockedIPs.add(clientIp);
+        saveBlockedIPs();
+        
+        err(`[SECURITY] IP ${clientIp} bloqueado após ${attempts.count} tentativas falhadas`);
+        return res.status(403).json({ 
+          error: 'ip_blocked',
+          message: 'IP bloqueado por múltiplas tentativas falhadas'
+        });
+      } else {
+        // Reset contador se passou muito tempo
+        attempts.count = 1;
+        attempts.firstAttempt = now;
+        failedAttempts.set(clientIp, attempts);
+      }
+    }
+    
+    warn(`[SECURITY] Tentativa de acesso com token inválido de ${clientIp} (tentativa ${attempts.count}/5)`);
+    return res.status(401).json({ 
+      error: 'invalid_token', 
+      message: 'Token inválido ou não fornecido' 
+    });
   }
+  
+  // Limpa tentativas falhadas em caso de sucesso
+  if (failedAttempts.has(clientIp)) {
+    failedAttempts.delete(clientIp);
+  }
+  
   next();
 }
 
 /* ===== validação de autorização ESP32 ===== */
+function normalizeIp(ipAddress) {
+  // Remove prefixo IPv6 mapeado para IPv4 (::ffff:)
+  if (ipAddress && ipAddress.startsWith('::ffff:')) {
+    return ipAddress.substring(7);
+  }
+  return ipAddress;
+}
+
+function ipInCidr(ipAddress, cidr) {
+  const [network, prefixStr] = cidr.split('/');
+  const prefixLength = parseInt(prefixStr, 10);
+  
+  if (isNaN(prefixLength) || prefixLength < 0 || prefixLength > 32) {
+    return false;
+  }
+  
+  const networkParts = network.split('.').map(Number);
+  const ipParts = ipAddress.split('.').map(Number);
+  
+  if (networkParts.length !== 4 || ipParts.length !== 4) {
+    return false;
+  }
+  
+  // Verifica se todos os valores são válidos
+  if (networkParts.some(p => isNaN(p) || p < 0 || p > 255) ||
+      ipParts.some(p => isNaN(p) || p < 0 || p > 255)) {
+    return false;
+  }
+  
+  const mask = (0xFFFFFFFF << (32 - prefixLength)) >>> 0;
+  const networkNum = (networkParts[0] << 24) + (networkParts[1] << 16) + (networkParts[2] << 8) + networkParts[3];
+  const ipNum = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
+  
+  return (networkNum & mask) === (ipNum & mask);
+}
+
 function validateESP32Authorization(req) {
-  const clientIp = ip(req);
+  const rawClientIp = ip(req);
+  const clientIp = normalizeIp(rawClientIp);
   const token = req.header('X-ESP32-Token') || req.query?.token || req.body?.token || '';
   
   const result = {
@@ -163,21 +650,13 @@ function validateESP32Authorization(req) {
   // Verifica whitelist de IPs (se configurada)
   if (ESP32_ALLOWED_IPS.length > 0) {
     const isAllowed = ESP32_ALLOWED_IPS.some(allowedIp => {
-      // Suporta CIDR básico (ex: 10.10.0.0/24) ou IP exato
+      // Suporta CIDR básico (ex: 10.10.0.0/23) ou IP exato
       if (allowedIp.includes('/')) {
-        const [network, prefix] = allowedIp.split('/');
-        const prefixLength = parseInt(prefix, 10);
-        const networkParts = network.split('.').map(Number);
-        const ipParts = clientIp.split('.').map(Number);
-        if (networkParts.length !== 4 || ipParts.length !== 4) return false;
-        
-        const mask = (0xFFFFFFFF << (32 - prefixLength)) >>> 0;
-        const networkNum = (networkParts[0] << 24) + (networkParts[1] << 16) + (networkParts[2] << 8) + networkParts[3];
-        const ipNum = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
-        
-        return (networkNum & mask) === (ipNum & mask);
+        return ipInCidr(clientIp, allowedIp);
       } else {
-        return clientIp === allowedIp;
+        // Normaliza o IP permitido também para comparação
+        const normalizedAllowedIp = normalizeIp(allowedIp);
+        return clientIp === normalizedAllowedIp;
       }
     });
     
@@ -186,13 +665,13 @@ function validateESP32Authorization(req) {
       result.reason = 'ip_not_allowed';
       result.checks.ip = {
         passed: false,
-        message: `IP ${clientIp} não está na whitelist. Permitidos: ${ESP32_ALLOWED_IPS.join(', ')}`
+        message: `IP não autorizado`
       };
       return result;
     } else {
       result.checks.ip = {
         passed: true,
-        message: `IP ${clientIp} autorizado`
+        message: `IP autorizado`
       };
     }
   } else {
@@ -291,21 +770,34 @@ let client = null;
 // Escolhe qual API usar
 if (USE_OFFICIAL_API && WHATSAPP_ACCESS_TOKEN && WHATSAPP_PHONE_NUMBER_ID) {
   log(`[INIT] Usando API Oficial do WhatsApp Business`);
-  const { initWhatsAppOfficialModule } = require('./modules/whatsapp-official');
-  
-  whatsapp = initWhatsAppOfficialModule({
-    accessToken: WHATSAPP_ACCESS_TOKEN,
-    phoneNumberId: WHATSAPP_PHONE_NUMBER_ID,
-    businessAccountId: WHATSAPP_BUSINESS_ACCOUNT_ID,
-    webhookVerifyToken: WHATSAPP_WEBHOOK_VERIFY_TOKEN,
-    apiVersion: WHATSAPP_API_VERSION,
-    logger,
-    camera,
-    tuya: (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) ? tuya : null,
-    utils: { normalizeBR, toggleNineBR, isNumberAuthorized },
-    numbersFile: NUMBERS_FILE,
-    recordDurationSec: RECORD_DURATION_SEC
-  });
+  try {
+    log(`[INIT] Carregando módulo whatsapp-official...`);
+    const { initWhatsAppOfficialModule } = require('./modules/whatsapp-official');
+    log(`[INIT] Módulo whatsapp-official carregado com sucesso`);
+    
+    log(`[INIT] Inicializando módulo WhatsApp Official...`);
+    log(`[INIT] Parâmetros: camera=${!!camera}, tuya=${!!tuya}, whatsappMaxVideoSizeMB=${WHATSAPP_MAX_VIDEO_SIZE_MB}`);
+    whatsapp = initWhatsAppOfficialModule({
+      accessToken: WHATSAPP_ACCESS_TOKEN,
+      phoneNumberId: WHATSAPP_PHONE_NUMBER_ID,
+      businessAccountId: WHATSAPP_BUSINESS_ACCOUNT_ID,
+      webhookVerifyToken: WHATSAPP_WEBHOOK_VERIFY_TOKEN,
+      apiVersion: WHATSAPP_API_VERSION,
+      logger,
+      camera,
+      tuya: (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) ? tuya : null,
+      utils: { normalizeBR, toggleNineBR, isNumberAuthorized },
+      ipBlocker,
+      numbersFile: NUMBERS_FILE,
+      recordDurationSec: RECORD_DURATION_SEC,
+      whatsappMaxVideoSizeMB: WHATSAPP_MAX_VIDEO_SIZE_MB
+    });
+    log(`[INIT] Módulo WhatsApp Official inicializado com sucesso`);
+  } catch (whatsappError) {
+    err(`[FATAL] Erro ao inicializar módulo WhatsApp Official:`, whatsappError.message);
+    err(`[FATAL] Stack:`, whatsappError.stack);
+    process.exit(1);
+  }
   
   // API oficial não tem cliente (usa HTTP direto)
   // Cria um objeto mock para compatibilidade
@@ -370,21 +862,100 @@ if (!fs.existsSync(RECORDINGS_DIR)) {
 
 /* ===== Routes Module ===== */
 // Inicializa módulo Routes (todos os endpoints HTTP)
-initRoutesModule({
-  app,
-  whatsapp,
-  camera,
-  tuya: (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) ? tuya : null,
-  utils: { requestId, normalizeBR, readNumbersFromFile, getClientIp },
-  logger,
-  auth,
-  verifySignedRequest,
-  validateESP32Authorization,
-  numbersFile: NUMBERS_FILE,
-  cameraSnapshotUrl: CAMERA_SNAPSHOT_URL,
-  authDataPath: AUTH_DATA_PATH,
-  tuyaUid: TUYA_UID
-});
+let routesModule;
+try {
+  log(`[INIT] Inicializando módulo Routes...`);
+  routesModule = initRoutesModule({
+    app,
+    whatsapp,
+    camera,
+    tuya: (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) ? tuya : null,
+    utils: { requestId, normalizeBR, readNumbersFromFile, getClientIp },
+    logger,
+    auth,
+    verifySignedRequest,
+    validateESP32Authorization,
+    numbersFile: NUMBERS_FILE,
+    cameraSnapshotUrl: CAMERA_SNAPSHOT_URL,
+    authDataPath: AUTH_DATA_PATH,
+    tuyaUid: TUYA_UID,
+    recordingsDir: RECORDINGS_DIR,
+    strictRateLimit // Passa rate limit estrito para endpoints críticos
+  });
+  log(`[INIT] Módulo Routes inicializado com sucesso`);
+} catch (routesError) {
+  err(`[FATAL] Erro ao inicializar módulo Routes:`, routesError.message);
+  err(`[FATAL] Stack:`, routesError.stack);
+  process.exit(1);
+}
+
+// Passa função de processamento de vídeos temporários para o módulo WhatsApp
+try {
+  if (whatsapp && routesModule && routesModule.processTempVideo) {
+    if (whatsapp.setTempVideoProcessor) {
+      whatsapp.setTempVideoProcessor(routesModule.processTempVideo);
+      log(`[INIT] Processador de vídeos temporários configurado`);
+    }
+  }
+} catch (tempVideoError) {
+  err(`[FATAL] Erro ao configurar processador de vídeos temporários:`, tempVideoError.message);
+  err(`[FATAL] Stack:`, tempVideoError.stack);
+  process.exit(1);
+}
+
+/* ===== Tuya Monitor Module ===== */
+let tuyaMonitor = null;
+if (TUYA_MONITOR_ENABLED && TUYA_CLIENT_ID && TUYA_CLIENT_SECRET && whatsapp) {
+  try {
+    log(`[INIT] Inicializando módulo Tuya Monitor...`);
+    
+    // Obtém números para notificação
+    let notificationNumbers = TUYA_MONITOR_NOTIFICATION_NUMBERS;
+    if (notificationNumbers.length === 0) {
+      // Se não especificado, usa números autorizados do WhatsApp
+      try {
+        notificationNumbers = readNumbersFromFile(NUMBERS_FILE);
+        log(`[TUYA-MONITOR] Usando ${notificationNumbers.length} número(s) autorizado(s) para notificações`);
+      } catch (e) {
+        warn(`[TUYA-MONITOR] Erro ao ler números autorizados:`, e.message);
+        notificationNumbers = [];
+      }
+    }
+    
+    tuyaMonitor = initTuyaMonitorModule({
+      tuya: (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) ? tuya : null,
+      whatsapp,
+      logger,
+      appRoot: APP_ROOT,
+      tuyaUid: TUYA_UID,
+      alertThresholdHours: TUYA_MONITOR_ALERT_HOURS,
+      checkIntervalMinutes: TUYA_MONITOR_CHECK_INTERVAL_MINUTES,
+      notificationNumbers
+    });
+    
+    if (tuyaMonitor) {
+      tuyaMonitor.startMonitoring();
+      log(`[INIT] Módulo Tuya Monitor inicializado e iniciado com sucesso`);
+      log(`[INIT] Monitoramento: alerta após ${TUYA_MONITOR_ALERT_HOURS}h, verificação a cada ${TUYA_MONITOR_CHECK_INTERVAL_MINUTES}min`);
+      if (notificationNumbers.length > 0) {
+        log(`[INIT] Notificações serão enviadas para ${notificationNumbers.length} número(s)`);
+      } else {
+        warn(`[INIT] Nenhum número configurado para receber notificações`);
+      }
+    }
+  } catch (monitorError) {
+    warn(`[INIT] Erro ao inicializar módulo Tuya Monitor:`, monitorError.message);
+    // Não encerra a aplicação se o monitor falhar
+  }
+} else {
+  if (!TUYA_MONITOR_ENABLED) {
+    log(`[INIT] Módulo Tuya Monitor desabilitado (TUYA_MONITOR_ENABLED=false)`);
+  } else if (!TUYA_CLIENT_ID || !TUYA_CLIENT_SECRET) {
+    log(`[INIT] Módulo Tuya Monitor desabilitado (credenciais Tuya não configuradas)`);
+  } else if (!whatsapp) {
+    log(`[INIT] Módulo Tuya Monitor desabilitado (módulo WhatsApp não disponível)`);
+  }
+}
 
 /* ===== Webhook para API Oficial do WhatsApp ===== */
 if (USE_OFFICIAL_API && WHATSAPP_ACCESS_TOKEN && WHATSAPP_PHONE_NUMBER_ID) {
@@ -394,13 +965,12 @@ if (USE_OFFICIAL_API && WHATSAPP_ACCESS_TOKEN && WHATSAPP_PHONE_NUMBER_ID) {
     const token = req.query['hub.verify_token'] || '';
     const challenge = req.query['hub.challenge'] || '';
     
-    log(`[WEBHOOK] GET recebido - Verificação do webhook`);
-    log(`[WEBHOOK] IP: ${req.ip || req.socket?.remoteAddress || req.headers['x-forwarded-for'] || 'unknown'}`);
-    log(`[WEBHOOK] Mode: ${mode}, Challenge: ${challenge}`);
-    
     // Debug detalhado
+    dbg(`[WEBHOOK] Verificação recebida:`);
+    dbg(`[WEBHOOK] Mode: ${mode}`);
     dbg(`[WEBHOOK] Token recebido (length: ${token.length}): ${token}`);
     dbg(`[WEBHOOK] Token esperado (length: ${WHATSAPP_WEBHOOK_VERIFY_TOKEN.length}): ${WHATSAPP_WEBHOOK_VERIFY_TOKEN}`);
+    dbg(`[WEBHOOK] Challenge: ${challenge}`);
     dbg(`[WEBHOOK] Query completa: ${JSON.stringify(req.query)}`);
     
     // Comparação exata (case-sensitive)
@@ -429,28 +999,22 @@ if (USE_OFFICIAL_API && WHATSAPP_ACCESS_TOKEN && WHATSAPP_PHONE_NUMBER_ID) {
     try {
       const body = req.body;
       
-      log(`[WEBHOOK] POST recebido - Objeto: ${body.object || 'não especificado'}`);
-      dbg(`[WEBHOOK] Body completo:`, JSON.stringify(body, null, 2));
+      // Log detalhado do webhook recebido
+      dbg(`[WEBHOOK] Webhook recebido:`, JSON.stringify(body, null, 2));
       
       // Verifica se é uma notificação do WhatsApp
       if (body.object === 'whatsapp_business_account') {
-        log(`[WEBHOOK] ✅ Objeto WhatsApp Business Account confirmado`);
-        log(`[WEBHOOK] Processando ${body.entry?.length || 0} entrada(s)`);
-        
         for (const entry of body.entry || []) {
-          log(`[WEBHOOK] Processando entrada...`);
+          log(`[WEBHOOK] Processando entry:`, entry.id);
           await whatsapp.processWebhookMessage(entry);
         }
-        
-        log(`[WEBHOOK] ✅ Processamento concluído, retornando 200`);
         res.sendStatus(200);
       } else {
-        warn(`[WEBHOOK] ⚠️ Objeto desconhecido recebido: ${body.object}`);
-        warn(`[WEBHOOK] Body:`, JSON.stringify(body, null, 2));
-        res.sendStatus(200); // Retorna 200 mesmo assim para não gerar erro no Meta
+        dbg(`[WEBHOOK] Objeto desconhecido recebido: ${body.object}`);
+        res.sendStatus(200);
       }
     } catch (error) {
-      err(`[WEBHOOK] ❌ Erro ao processar webhook:`, error.message);
+      err(`[WEBHOOK] Erro ao processar webhook:`, error.message);
       err(`[WEBHOOK] Stack:`, error.stack);
       res.sendStatus(500);
     }
@@ -461,16 +1025,119 @@ if (USE_OFFICIAL_API && WHATSAPP_ACCESS_TOKEN && WHATSAPP_PHONE_NUMBER_ID) {
   log(`[WEBHOOK] POST /webhook/whatsapp - Recebimento de mensagens`);
 }
 
-app.listen(PORT, () => { 
-  log(`🚀 API ouvindo em ${PORT}`); 
-  if (DEBUG) log('DEBUG ativo');
+// Tratamento de erros não capturados
+process.on('uncaughtException', (error) => {
+  err(`[FATAL] Erro não capturado:`, error.message);
+  err(`[FATAL] Stack:`, error.stack);
+  log(`═══════════════════════════════════════════════════════════`);
+  log(`🛑 [SHUTDOWN] Processo finalizado devido a erro não capturado`);
+  log(`📅 [SHUTDOWN] Data/Hora: ${nowISO()}`);
+  log(`🆔 [SHUTDOWN] PID: ${process.pid}`);
+  log(`═══════════════════════════════════════════════════════════`);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  err(`[FATAL] Promise rejeitada não tratada:`, reason);
+  if (reason && reason.stack) {
+    err(`[FATAL] Stack:`, reason.stack);
+  }
+  log(`═══════════════════════════════════════════════════════════`);
+  log(`🛑 [SHUTDOWN] Processo finalizado devido a promise rejeitada`);
+  log(`📅 [SHUTDOWN] Data/Hora: ${nowISO()}`);
+  log(`🆔 [SHUTDOWN] PID: ${process.pid}`);
+  log(`═══════════════════════════════════════════════════════════`);
+  process.exit(1);
+});
+
+// Handlers para graceful shutdown (SIGTERM, SIGINT)
+let server = null;
+let isShuttingDown = false;
+
+async function gracefulShutdown(signal) {
+  if (isShuttingDown) {
+    warn(`[SHUTDOWN] Já está em processo de encerramento, forçando saída...`);
+    process.exit(1);
+    return;
+  }
+  
+  isShuttingDown = true;
+  log(`═══════════════════════════════════════════════════════════`);
+  log(`🛑 [SHUTDOWN] Recebido sinal: ${signal}`);
+  log(`📅 [SHUTDOWN] Data/Hora: ${nowISO()}`);
+  log(`🆔 [SHUTDOWN] PID: ${process.pid}`);
+  log(`⏳ [SHUTDOWN] Iniciando encerramento graceful...`);
+  log(`═══════════════════════════════════════════════════════════`);
+  
+  // Para o monitor Tuya se estiver ativo
+  if (tuyaMonitor && tuyaMonitor.stopMonitoring) {
+    try {
+      log(`[SHUTDOWN] Parando monitor Tuya...`);
+      tuyaMonitor.stopMonitoring();
+      log(`[SHUTDOWN] Monitor Tuya parado`);
+    } catch (e) {
+      warn(`[SHUTDOWN] Erro ao parar monitor Tuya:`, e.message);
+    }
+  }
+  
+  // Fecha conexão com banco de IPs bloqueados
+  if (ipBlocker && ipBlocker.close) {
+    try {
+      log(`[SHUTDOWN] Fechando banco de IPs bloqueados...`);
+      await ipBlocker.close();
+      log(`[SHUTDOWN] Banco de IPs bloqueados fechado`);
+    } catch (e) {
+      warn(`[SHUTDOWN] Erro ao fechar banco de IPs bloqueados:`, e.message);
+    }
+  }
+  
+  // Fecha o servidor HTTP
+  if (server) {
+    server.close(() => {
+      log(`[SHUTDOWN] Servidor HTTP fechado`);
+      log(`═══════════════════════════════════════════════════════════`);
+      log(`✅ [SHUTDOWN] Processo finalizado com sucesso`);
+      log(`📅 [SHUTDOWN] Data/Hora: ${nowISO()}`);
+      log(`🆔 [SHUTDOWN] PID: ${process.pid}`);
+      log(`═══════════════════════════════════════════════════════════`);
+      process.exit(0);
+    });
+    
+    // Timeout de 10 segundos para forçar encerramento
+    setTimeout(() => {
+      warn(`[SHUTDOWN] Timeout de encerramento, forçando saída...`);
+      process.exit(1);
+    }, 10000);
+  } else {
+    log(`═══════════════════════════════════════════════════════════`);
+    log(`✅ [SHUTDOWN] Processo finalizado`);
+    log(`📅 [SHUTDOWN] Data/Hora: ${nowISO()}`);
+    log(`🆔 [SHUTDOWN] PID: ${process.pid}`);
+    log(`═══════════════════════════════════════════════════════════`);
+    process.exit(0);
+  }
+}
+
+// Registra handlers para sinais de encerramento
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Inicia o servidor
+server = app.listen(PORT, () => { 
+  log(`═══════════════════════════════════════════════════════════`);
+  log(`✅ [SERVER] Servidor HTTP iniciado com sucesso`);
+  log(`🌐 [SERVER] Ouvindo na porta: ${PORT}`);
+  log(`📅 [SERVER] Data/Hora: ${nowISO()}`);
+  log(`🆔 [SERVER] PID: ${process.pid}`);
+  if (DEBUG) log(`🔍 [SERVER] DEBUG ativo`);
   if (USE_OFFICIAL_API && WHATSAPP_ACCESS_TOKEN && WHATSAPP_PHONE_NUMBER_ID) {
-    log(`[INFO] API Oficial do WhatsApp Business ativa`);
+    log(`[SERVER] API Oficial do WhatsApp Business ativa`);
     const webhookUrl = WHATSAPP_WEBHOOK_DOMAIN.startsWith('http') 
       ? `${WHATSAPP_WEBHOOK_DOMAIN}/webhook/whatsapp`
       : `https://${WHATSAPP_WEBHOOK_DOMAIN}/webhook/whatsapp`;
-    log(`[INFO] Configure o webhook no Meta: ${webhookUrl}`);
-    log(`[INFO] Token de verificação: ${WHATSAPP_WEBHOOK_VERIFY_TOKEN}`);
-    log(`[INFO] Phone Number ID: ${WHATSAPP_PHONE_NUMBER_ID}`);
+    log(`[SERVER] Configure o webhook no Meta: ${webhookUrl}`);
+    log(`[SERVER] Token de verificação: ${WHATSAPP_WEBHOOK_VERIFY_TOKEN}`);
+    log(`[SERVER] Phone Number ID: ${WHATSAPP_PHONE_NUMBER_ID}`);
   }
+  log(`═══════════════════════════════════════════════════════════`);
 });

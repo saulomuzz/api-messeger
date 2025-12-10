@@ -59,17 +59,17 @@ Após reiniciar, você deve ver nos logs:
 ```
 [CONFIG] USE_WHATSAPP_OFFICIAL_API: true
 [INFO] API Oficial do WhatsApp Business ativa
-[INFO] Configure o webhook no Meta: https://api.biancavolken.com.br/webhook/whatsapp
-[INFO] Token de verificação: [seu_token_aqui]
+[INFO] Configure o webhook no Meta: https://seu-dominio.com/webhook/whatsapp
+[INFO] Token de verificação: seu_token_de_verificacao_aqui
 ```
 
 ## 🧪 Teste o Envio
 
 ```bash
-curl -X POST http://10.10.0.3:4000/send \
+curl -X POST http://localhost:3000/send \
   -H "Content-Type: application/json" \
   -d '{
-    "phone": "554299219594",
+    "phone": "5511999999999",
     "message": "Teste de mensagem via API Oficial!",
     "subject": "Teste"
   }'

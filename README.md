@@ -43,13 +43,25 @@ API REST para integração com o WhatsApp utilizando [whatsapp-web.js](https://g
 
 ## Documentação Completa
 
-Para documentação detalhada, consulte:
+Para documentação detalhada, consulte a pasta [`docs/`](docs/):
 
-- **[API_DOCUMENTATION.md](API_DOCUMENTATION.md)** - Documentação completa da API
-- **[ESP32_VALIDATION.md](ESP32_VALIDATION.md)** - Endpoint de validação ESP32
-- **[CAMERA_CONFIG.md](CAMERA_CONFIG.md)** - Configuração de câmera IP
-- **[TUYA_INTEGRATION.md](TUYA_INTEGRATION.md)** - Integração com API Tuya
-- **[TEST_CURL.md](TEST_CURL.md)** - Exemplos de teste com curl
+### Documentação Principal
+- **[docs/API_DOCUMENTATION.md](docs/API_DOCUMENTATION.md)** - Documentação completa da API
+- **[docs/SECURITY.md](docs/SECURITY.md)** - Medidas de segurança implementadas
+- **[docs/WHATSAPP_OFFICIAL_API.md](docs/WHATSAPP_OFFICIAL_API.md)** - Configuração da API Oficial do WhatsApp
+- **[docs/CONFIGURAR_WEBHOOK.md](docs/CONFIGURAR_WEBHOOK.md)** - Como configurar o webhook do WhatsApp
+
+### Integrações
+- **[docs/ESP32_VALIDATION.md](docs/ESP32_VALIDATION.md)** - Endpoint de validação ESP32
+- **[docs/CAMERA_CONFIG.md](docs/CAMERA_CONFIG.md)** - Configuração de câmera IP
+- **[docs/TUYA_INTEGRATION.md](docs/TUYA_INTEGRATION.md)** - Integração com API Tuya
+- **[docs/TUYA_ENV_SETUP.md](docs/TUYA_ENV_SETUP.md)** - Configuração do Tuya
+- **[docs/TUYA_TROUBLESHOOTING.md](docs/TUYA_TROUBLESHOOTING.md)** - Solução de problemas Tuya
+
+### Testes e Troubleshooting
+- **[docs/TESTE_ENVIO_RAPIDO.md](docs/TESTE_ENVIO_RAPIDO.md)** - Testes rápidos de envio
+- **[docs/TESTAR_ENVIO_MENSAGENS.md](docs/TESTAR_ENVIO_MENSAGENS.md)** - Guia de testes
+- **[docs/WHATSAPP_24H_WINDOW.md](docs/WHATSAPP_24H_WINDOW.md)** - Janela de 24h do WhatsApp
 
 ## Endpoints Principais
 
