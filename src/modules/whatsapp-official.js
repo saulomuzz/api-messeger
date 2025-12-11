@@ -52,6 +52,7 @@ function initWhatsAppOfficialModule({
   let isReady = true; // API oficial sempre está "pronta" (não precisa de QR)
   let tempVideoProcessor = null; // Função para processar vídeos temporários
   let listVideosFunction = null; // Função para listar histórico de vídeos
+  let triggerSnapshotFunction = null; // Função para disparar snapshot manualmente
   
   /**
    * Envia mensagem de texto
@@ -635,12 +636,7 @@ function initWhatsAppOfficialModule({
           {
             id: 'opt_tuya_list',
             title: '📋 Dispositivos Tuya',
-            description: 'Listar e gerenciar seus dispositivos Tuya'
-          },
-          {
-            id: 'opt_tuya_status',
-            title: '⚡ Status do Dispositivo',
-            description: 'Consultar status de um dispositivo específico'
+            description: 'Listar e gerenciar seus dispositivos (com status)'
           },
           {
             id: 'opt_tuya_count',
@@ -648,14 +644,24 @@ function initWhatsAppOfficialModule({
             description: 'Ver quantas luzes estão ligadas (lâmpadas e interruptores)'
           },
           {
-            id: 'opt_blocked_ips',
-            title: '🛡️ IPs Bloqueados',
-            description: 'Ver lista de IPs bloqueados por segurança'
+            id: 'opt_snapshot',
+            title: '📸 Snapshot da Câmera',
+            description: 'Tirar foto instantânea da câmera'
           },
           {
             id: 'opt_record',
             title: '🎥 Gravar Vídeo',
             description: 'Gravar vídeo da câmera (padrão: 30 segundos)'
+          },
+          {
+            id: 'opt_videos',
+            title: '📹 Histórico de Vídeos',
+            description: 'Ver vídeos gravados recentemente (últimas 24h)'
+          },
+          {
+            id: 'opt_blocked_ips',
+            title: '🛡️ IPs Bloqueados',
+            description: 'Ver lista de IPs bloqueados por segurança'
           },
           {
             id: 'opt_help',
@@ -684,13 +690,14 @@ function initWhatsAppOfficialModule({
           warn(`[MENU] Lista de transmissão não suporta mensagens interativas, usando texto simples`);
           // Pula botões e vai direto para texto
           const textMenu = '🏠 *Menu Principal*\n\n' +
-            '📋 *1. Dispositivos Tuya*\n   Digite: `!tuya list`\n\n' +
-            '⚡ *2. Status do Dispositivo*\n   Digite: `!tuya status <nome>`\n\n' +
-            '💡 *3. Luzes Ligadas*\n   Digite: `!tuya count`\n\n' +
-            '🛡️ *4. IPs Bloqueados*\n   Digite: `!blocked` ou `!ips`\n\n' +
-            '🎥 *5. Gravar Vídeo*\n   Digite: `!record` ou `!record 30`\n\n' +
-            '❓ *6. Ajuda*\n   Digite: `!tuya help`\n\n' +
-            '💡 *Dica:* Use os comandos acima para interagir.';
+            '📋 *1. Dispositivos Tuya*\n   Clique no botão ou digite: `!tuya list`\n\n' +
+            '💡 *2. Luzes Ligadas*\n   Clique no botão ou digite: `!tuya count`\n\n' +
+            '📸 *3. Snapshot da Câmera*\n   Clique no botão ou digite: `!snapshot`\n\n' +
+            '🎥 *4. Gravar Vídeo*\n   Clique no botão ou digite: `!record`\n\n' +
+            '📹 *5. Histórico de Vídeos*\n   Clique no botão ou digite: `!videos`\n\n' +
+            '🛡️ *6. IPs Bloqueados*\n   Clique no botão ou digite: `!blocked`\n\n' +
+            '❓ *7. Ajuda*\n   Clique no botão ou digite: `!tuya help`\n\n' +
+            '💡 *Dica:* Clique nos botões acima para interagir sem digitar!';
           await sendTextMessage(to, textMenu);
           log(`[MENU] Menu de opções enviado como texto para ${to}`);
           return;
@@ -700,18 +707,20 @@ function initWhatsAppOfficialModule({
           await sendInteractiveButtons(
             to,
             '🏠 *Menu Principal*\n\n*Selecione uma opção:*\n\n' +
-            '📋 *Dispositivos Tuya*\n   Listar e gerenciar dispositivos\n\n' +
-            '⚡ *Status do Dispositivo*\n   Consultar status específico\n\n' +
-            '💡 *Luzes Ligadas*\n   Ver quantas luzes estão ligadas (lâmpadas e interruptores)\n\n' +
-            '🛡️ *IPs Bloqueados*\n   Ver lista de IPs bloqueados por segurança\n\n' +
+            '📋 *Dispositivos Tuya*\n   Listar dispositivos com status completo\n\n' +
+            '💡 *Luzes Ligadas*\n   Ver quantas luzes estão ligadas\n\n' +
+            '📸 *Snapshot da Câmera*\n   Tirar foto instantânea\n\n' +
             '🎥 *Gravar Vídeo*\n   Gravar vídeo da câmera\n\n' +
+            '📹 *Histórico de Vídeos*\n   Ver vídeos recentes (24h)\n\n' +
+            '🛡️ *IPs Bloqueados*\n   Ver lista de IPs bloqueados\n\n' +
             '❓ *Ajuda*\n   Ver comandos disponíveis',
             [
               { id: 'opt_tuya_list', title: '📋 Dispositivos' },
-              { id: 'opt_tuya_status', title: '⚡ Status' },
               { id: 'opt_tuya_count', title: '💡 Lâmpadas' },
-              { id: 'opt_blocked_ips', title: '🛡️ IPs' },
+              { id: 'opt_snapshot', title: '📸 Foto' },
               { id: 'opt_record', title: '🎥 Gravar' },
+              { id: 'opt_videos', title: '📹 Vídeos' },
+              { id: 'opt_blocked_ips', title: '🛡️ IPs' },
               { id: 'opt_help', title: '❓ Ajuda' }
             ],
             'WhatsApp API - Controle Inteligente'
@@ -727,13 +736,14 @@ function initWhatsAppOfficialModule({
           }
           // Fallback final: texto
           const textMenu = '🏠 *Menu Principal*\n\n' +
-            '📋 *1. Dispositivos Tuya*\n   Digite: `!tuya list`\n\n' +
-            '⚡ *2. Status do Dispositivo*\n   Digite: `!tuya status <nome>`\n\n' +
-            '💡 *3. Luzes Ligadas*\n   Digite: `!tuya count`\n\n' +
-            '🛡️ *4. IPs Bloqueados*\n   Digite: `!blocked` ou `!ips`\n\n' +
-            '🎥 *5. Gravar Vídeo*\n   Digite: `!record` ou `!record 30`\n\n' +
-            '❓ *6. Ajuda*\n   Digite: `!tuya help`\n\n' +
-            '💡 *Dica:* Você também pode clicar nos botões acima (se disponível).';
+            '📋 *1. Dispositivos Tuya*\n   Clique no botão ou digite: `!tuya list`\n\n' +
+            '💡 *2. Luzes Ligadas*\n   Clique no botão ou digite: `!tuya count`\n\n' +
+            '📸 *3. Snapshot da Câmera*\n   Clique no botão ou digite: `!snapshot`\n\n' +
+            '🎥 *4. Gravar Vídeo*\n   Clique no botão ou digite: `!record`\n\n' +
+            '📹 *5. Histórico de Vídeos*\n   Clique no botão ou digite: `!videos`\n\n' +
+            '🛡️ *6. IPs Bloqueados*\n   Clique no botão ou digite: `!blocked`\n\n' +
+            '❓ *7. Ajuda*\n   Clique no botão ou digite: `!tuya help`\n\n' +
+            '💡 *Dica:* Clique nos botões acima para interagir sem digitar!';
           await sendTextMessage(to, textMenu);
           log(`[MENU] Menu de opções enviado como texto para ${to}`);
         }
@@ -742,7 +752,7 @@ function initWhatsAppOfficialModule({
       err(`[MENU] Erro ao enviar menu de opções:`, e.message);
       // Último fallback
       try {
-        await sendTextMessage(to, '🏠 Menu Principal\n\nDigite:\n- !tuya list\n- !tuya status <nome>\n- !tuya count\n- !blocked (IPs bloqueados)\n- !record\n- !tuya help');
+        await sendTextMessage(to, '🏠 Menu Principal\n\nClique nos botões ou digite:\n- !tuya list (dispositivos)\n- !tuya count (luzes)\n- !snapshot (foto)\n- !record (vídeo)\n- !videos (histórico)\n- !blocked (IPs bloqueados)\n- !tuya help');
       } catch (e2) {
         err(`[MENU] Erro no fallback final:`, e2.message);
       }
@@ -752,47 +762,150 @@ function initWhatsAppOfficialModule({
   /**
    * Envia lista de dispositivos Tuya
    */
-  async function sendDevicesList(to, devices) {
+  async function sendDevicesList(to, devices, page = 0) {
     try {
       if (!devices || devices.length === 0) {
         await sendTextMessage(to, '❌ Nenhum dispositivo encontrado.');
         return;
       }
       
-      // Tenta enviar como List Message
+      // Ordena dispositivos: online primeiro, depois offline
+      const sortedDevices = [...devices].sort((a, b) => {
+        const aOnline = a.online ? 1 : 0;
+        const bOnline = b.online ? 1 : 0;
+        // Online primeiro (ordem decrescente: 1 antes de 0)
+        if (bOnline !== aOnline) {
+          return bOnline - aOnline;
+        }
+        // Se ambos têm o mesmo status, ordena por nome
+        const aName = (a.name || '').toLowerCase();
+        const bName = (b.name || '').toLowerCase();
+        return aName.localeCompare(bName);
+      });
+      
+      const ITEMS_PER_PAGE = 10;
+      const totalPages = Math.ceil(sortedDevices.length / ITEMS_PER_PAGE);
+      const startIndex = page * ITEMS_PER_PAGE;
+      const endIndex = startIndex + ITEMS_PER_PAGE;
+      const pageDevices = sortedDevices.slice(startIndex, endIndex);
+      const hasMore = endIndex < sortedDevices.length;
+      
+      // Tenta enviar como List Message (sempre tenta primeiro)
       try {
-        const limitedDevices = devices.slice(0, 10);
+        // Limita a 10 itens por seção (limitação da API do WhatsApp)
+        const maxItemsPerSection = 10;
+        const deviceRows = pageDevices.slice(0, maxItemsPerSection).map((device, index) => {
+          const status = device.online ? '🟢' : '🔴';
+          const powered = device.poweredOn ? '⚡' : '⚫';
+          const onlineStatus = device.online ? 'Online' : 'Offline';
+          const deviceName = device.name || `Dispositivo ${startIndex + index + 1}`;
+          
+          // Limita tamanho do título e descrição (limitações da API)
+          const title = `${status} ${deviceName.substring(0, 20)}`; // Máximo ~24 caracteres
+          const description = `${powered} ${onlineStatus} | ${(device.category || 'Sem categoria').substring(0, 50)}`; // Máximo ~60 caracteres
+          
+          return {
+            id: `device_${device.id}`,
+            title: title,
+            description: description
+          };
+        });
+        
+        // Adiciona opção "Ver Mais" se houver mais páginas (dentro do limite de 10 itens)
+        if (hasMore && deviceRows.length < maxItemsPerSection) {
+          deviceRows.push({
+            id: `devices_page_${page + 1}`,
+            title: '📄 Ver Próxima Página',
+            description: `Mostrar mais ${Math.min(ITEMS_PER_PAGE, sortedDevices.length - endIndex)} dispositivo(s)`
+          });
+        }
+        
         const sections = [{
-          title: 'Dispositivos Disponíveis',
-          rows: limitedDevices.map((device, index) => {
-            const status = device.online ? '🟢' : '🔴';
-            const powered = device.poweredOn ? '⚡' : '⚫';
-            return {
-              id: `device_${device.id}`,
-              title: `${status} ${device.name || `Dispositivo ${index + 1}`}`,
-              description: `${powered} ${device.category || 'Sem categoria'}`
-            };
-          })
+          title: hasMore ? `Dispositivos (Página ${page + 1}/${totalPages})` : 'Dispositivos Disponíveis',
+          rows: deviceRows
         }];
+        
+        dbg(`[MENU] Tentando enviar List Message com ${deviceRows.length} item(ns) para ${to}`);
         
         await sendListMessage(
           to,
           '📋 Dispositivos Tuya',
-          `Selecione um dispositivo (${limitedDevices.length} de ${devices.length}):`,
+          `Selecione um dispositivo (${startIndex + 1}-${Math.min(endIndex, sortedDevices.length)} de ${sortedDevices.length}):`,
           'Ver Dispositivos',
           sections
         );
-        log(`[MENU] Lista de ${limitedDevices.length} dispositivo(s) enviada como List Message para ${to}`);
+        log(`[MENU] ✅ Lista de ${pageDevices.length} dispositivo(s) (página ${page + 1}/${totalPages}) enviada como List Message para ${to}`);
         return;
       } catch (listError) {
-        dbg(`[MENU] List Message não suportado, usando texto: ${listError.message}`);
+        const errorMsg = listError.response?.data || listError.message || String(listError);
+        err(`[MENU] ❌ Erro ao enviar List Message:`, errorMsg);
+        if (listError.response?.data) {
+          err(`[MENU] Detalhes do erro:`, JSON.stringify(listError.response.data, null, 2));
+        }
+        dbg(`[MENU] List Message falhou, usando texto como fallback`);
       }
       
       // Fallback: mensagem de texto formatada
       if (tuya && tuya.formatDevicesListMessage) {
-        const textList = tuya.formatDevicesListMessage(devices);
+        // Ordena dispositivos: online primeiro
+        const sortedDevices = [...devices].sort((a, b) => {
+          const aOnline = a.online ? 1 : 0;
+          const bOnline = b.online ? 1 : 0;
+          if (bOnline !== aOnline) {
+            return bOnline - aOnline;
+          }
+          const aName = (a.name || '').toLowerCase();
+          const bName = (b.name || '').toLowerCase();
+          return aName.localeCompare(bName);
+        });
+        
+        const ITEMS_PER_PAGE = 10;
+        const startIndex = page * ITEMS_PER_PAGE;
+        const endIndex = startIndex + ITEMS_PER_PAGE;
+        const pageDevices = sortedDevices.slice(startIndex, endIndex);
+        const hasMore = endIndex < sortedDevices.length;
+        const totalPages = Math.ceil(sortedDevices.length / ITEMS_PER_PAGE);
+        
+        let textList = `📋 *Dispositivos Tuya*\n\n`;
+        textList += `*Total:* ${sortedDevices.length} dispositivo(s)\n`;
+        textList += `*Página:* ${page + 1}/${totalPages}\n\n`;
+        textList += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        
+        // Agrupa por status
+        const onlineDevices = pageDevices.filter(d => d.online);
+        const offlineDevices = pageDevices.filter(d => !d.online);
+        
+        if (onlineDevices.length > 0) {
+          textList += `🟢 *ONLINE (${onlineDevices.length})*\n\n`;
+          onlineDevices.forEach((device, index) => {
+            const powered = device.poweredOn ? '⚡ Ligado' : '⚫ Desligado';
+            textList += `${startIndex + index + 1}. ${device.name || `Dispositivo ${startIndex + index + 1}`}\n`;
+            textList += `   ${powered} | ${device.category || 'Sem categoria'}\n`;
+            textList += `   ID: \`device_${device.id}\`\n\n`;
+          });
+        }
+        
+        if (offlineDevices.length > 0) {
+          if (onlineDevices.length > 0) {
+            textList += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+          }
+          textList += `🔴 *OFFLINE (${offlineDevices.length})*\n\n`;
+          offlineDevices.forEach((device, index) => {
+            const powered = device.poweredOn ? '⚡ Ligado' : '⚫ Desligado';
+            textList += `${startIndex + onlineDevices.length + index + 1}. ${device.name || `Dispositivo ${startIndex + onlineDevices.length + index + 1}`}\n`;
+            textList += `   ${powered} | ${device.category || 'Sem categoria'}\n`;
+            textList += `   ID: \`device_${device.id}\`\n\n`;
+          });
+        }
+        
+        if (hasMore) {
+          textList += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+          textList += `📄 *Mais ${Math.min(ITEMS_PER_PAGE, sortedDevices.length - endIndex)} dispositivo(s) disponível(is)*\n`;
+          textList += `💡 Digite \`!tuya list page ${page + 1}\` para ver a próxima página`;
+        }
+        
         await sendTextMessage(to, textList);
-        log(`[MENU] Lista de ${devices.length} dispositivo(s) enviada como texto para ${to}`);
+        log(`[MENU] Lista de ${pageDevices.length} dispositivo(s) (página ${page + 1}/${totalPages}) enviada como texto para ${to}`);
       } else {
         await sendTextMessage(to, `📋 *Dispositivos Tuya*\n\n${devices.length} dispositivo(s) encontrado(s).`);
       }
@@ -1083,6 +1196,28 @@ function initWhatsAppOfficialModule({
     }
     
     // Comandos de histórico de vídeos
+    // Comando !snapshot ou !foto
+    if (msgLower === '!snapshot' || msgLower === '!foto' || msgLower === '!photo') {
+      log(`[CMD] Comando de snapshot recebido de ${from}`);
+      try {
+        if (triggerSnapshotFunction) {
+          await sendTextMessage(from, '⏳ Tirando foto da câmera...');
+          const result = await triggerSnapshotFunction('📸 Snapshot solicitado manualmente', from);
+          if (result && result.ok) {
+            await sendTextMessage(from, `✅ Foto enviada com sucesso para ${result.successCount || 0} número(s)!`);
+          } else {
+            await sendTextMessage(from, `❌ Erro ao tirar foto: ${result?.error || 'Erro desconhecido'}`);
+          }
+        } else {
+          await sendTextMessage(from, '❌ Função de snapshot não disponível. Configure a câmera.');
+        }
+      } catch (e) {
+        err(`[CMD] Erro ao processar snapshot:`, e.message);
+        await sendTextMessage(from, `❌ Erro: ${e.message}`);
+      }
+      return;
+    }
+    
     if (msgLower === '!historico' || msgLower === '!histórico' || msgLower === '!videos' || msgLower === '!hist') {
       log(`[CMD] Comando de histórico recebido de ${from}`);
       
@@ -1093,36 +1228,154 @@ function initWhatsAppOfficialModule({
       
       try {
         const videos = listVideosFunction(from);
+        const fs = require('fs');
         
         if (videos.length === 0) {
-          await sendTextMessage(from, '📹 *Histórico de Vídeos*\n\nNenhum vídeo disponível no momento.');
+          await sendTextMessage(from, '📹 *Histórico de Vídeos*\n\nNenhum vídeo disponível no momento.\n\n💡 Vídeos são gravados automaticamente quando a campainha é tocada.');
           return;
         }
         
-        // Formata lista de vídeos
-        let message = `📹 *Histórico de Vídeos*\n\n`;
-        message += `Total: ${videos.length} vídeo(s) disponível(is)\n\n`;
+        // Limita a 10 vídeos mais recentes para não sobrecarregar
+        const displayVideos = videos.slice(0, 10);
+        const remainingCount = videos.length - displayVideos.length;
         
-        videos.slice(0, 10).forEach((video, index) => {
+        // Formata lista de vídeos com informações detalhadas
+        let message = `📹 *Histórico de Vídeos*\n\n`;
+        message += `📊 *Total:* ${videos.length} vídeo(s) disponível(is)\n`;
+        message += `⏰ *Válidos por:* 24 horas após gravação\n\n`;
+        message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        
+        displayVideos.forEach((video, index) => {
           const date = new Date(video.createdAt);
           const dateStr = date.toLocaleString('pt-BR', { 
             day: '2-digit', 
             month: '2-digit', 
             year: 'numeric',
             hour: '2-digit',
-            minute: '2-digit'
+            minute: '2-digit',
+            second: '2-digit'
           });
+          
+          // Calcula tempo restante até expirar
+          const now = Date.now();
+          const expiresAt = video.expiresAt || (video.createdAt + (24 * 60 * 60 * 1000));
+          const timeRemaining = expiresAt - now;
+          const hoursRemaining = Math.floor(timeRemaining / (60 * 60 * 1000));
+          const minutesRemaining = Math.floor((timeRemaining % (60 * 60 * 1000)) / (60 * 1000));
+          
+          // Obtém tamanho do arquivo se existir
+          let fileSize = 'N/A';
+          if (video.fileExists && video.filePath) {
+            try {
+              const stats = fs.statSync(video.filePath);
+              const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+              fileSize = `${sizeMB} MB`;
+            } catch (e) {
+              fileSize = 'Erro';
+            }
+          }
+          
           const status = video.fileExists ? '✅' : '❌';
-          message += `${index + 1}. ${status} ${dateStr}\n`;
-          message += `   ID: \`${video.videoId}\`\n`;
-          message += `   Use: \`!video ${video.videoId}\`\n\n`;
+          const timeStatus = timeRemaining > 0 ? `⏳ ${hoursRemaining}h ${minutesRemaining}min` : '⏰ Expirado';
+          
+          message += `${index + 1}. ${status} *${dateStr}*\n`;
+          message += `   📁 Tamanho: ${fileSize}\n`;
+          message += `   ${timeStatus} restante\n`;
+          message += `   🆔 ID: \`${video.videoId.substring(0, 20)}...\`\n`;
+          message += `   👁️ Ver: \`!video ${video.videoId}\`\n\n`;
         });
         
-        if (videos.length > 10) {
-          message += `\n... e mais ${videos.length - 10} vídeo(s). Use \`!video <ID>\` para ver.`;
+        if (remainingCount > 0) {
+          message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+          message += `📋 *E mais ${remainingCount} vídeo(s) disponível(is)*\n`;
         }
         
-        message += `\n💡 *Dica:* Use \`!video <ID>\` para ver um vídeo específico.`;
+        message += `\n💡 *Como usar:*\n`;
+        message += `• Digite \`!video <ID>\` para ver um vídeo\n`;
+        message += `• Ou clique no botão "Ver Vídeo" quando receber a notificação\n`;
+        message += `• Vídeos expiram automaticamente após 24 horas`;
+        
+        // Tenta enviar com List Message (permite mais opções que botões)
+        if (displayVideos.length > 0 && sendListMessage) {
+          try {
+            const sections = [{
+              title: 'Vídeos Disponíveis',
+              rows: displayVideos.map((video, index) => {
+                const date = new Date(video.createdAt);
+                const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+                const dateStr = date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+                
+                // Obtém tamanho do arquivo
+                let fileSize = 'N/A';
+                if (video.fileExists && video.filePath) {
+                  try {
+                    const fs = require('fs');
+                    const stats = fs.statSync(video.filePath);
+                    const sizeMB = (stats.size / (1024 * 1024)).toFixed(1);
+                    fileSize = `${sizeMB}MB`;
+                  } catch (e) {
+                    fileSize = 'N/A';
+                  }
+                }
+                
+                return {
+                  id: `view_video_${video.videoId}`,
+                  title: `🎥 ${dateStr} ${timeStr}`,
+                  description: `${fileSize} | ${video.fileExists ? 'Disponível' : 'Indisponível'}`
+                };
+              })
+            }];
+            
+            await sendListMessage(
+              from,
+              '📹 Histórico de Vídeos',
+              'Selecione um vídeo para visualizar:',
+              'Ver Vídeos',
+              sections
+            );
+            log(`[CMD] Histórico enviado como List Message com ${displayVideos.length} opção(ões) para ${from}`);
+            return;
+          } catch (listError) {
+            dbg(`[CMD] Erro ao enviar List Message, tentando botões:`, listError.message);
+            // Continua para botões interativos
+          }
+        }
+        
+        // Fallback: Tenta enviar com botões interativos (máximo 3 por limitação da API)
+        if (displayVideos.length > 0 && sendInteractiveButtons) {
+          try {
+            // Limita a 3 botões por vez (limitação da API do WhatsApp)
+            const maxButtons = Math.min(displayVideos.length, 3);
+            const buttons = displayVideos.slice(0, maxButtons).map((video, index) => {
+              const date = new Date(video.createdAt);
+              const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+              return {
+                id: `view_video_${video.videoId}`,
+                title: `🎥 ${timeStr}`
+              };
+            });
+            
+            // Adiciona botão "Ver Mais" se houver mais vídeos
+            if (videos.length > maxButtons) {
+              buttons.push({
+                id: 'opt_videos_list',
+                title: '📋 Ver Todos'
+              });
+            }
+            
+            await sendInteractiveButtons(
+              from,
+              message,
+              buttons,
+              'Histórico de Vídeos'
+            );
+            log(`[CMD] Histórico enviado com ${buttons.length} botão(ões) interativo(s) para ${from}`);
+            return;
+          } catch (buttonError) {
+            dbg(`[CMD] Erro ao enviar botões, usando texto:`, buttonError.message);
+            // Continua para enviar como texto
+          }
+        }
         
         await sendTextMessage(from, message);
       } catch (e) {
@@ -1427,27 +1680,6 @@ function initWhatsAppOfficialModule({
       return;
     }
     
-    if (responseId === 'opt_tuya_status') {
-      log(`[WHATSAPP-API] Opção "Status do Dispositivo" selecionada por ${from}`);
-      try {
-        await sendTextMessage(from, '⏳ Buscando seus dispositivos...');
-        if (tuya) {
-          const devices = await tuya.getCachedDevices();
-          if (devices && devices.length > 0) {
-            await sendTextMessage(from, '📋 *Status do Dispositivo*\n\nSelecione um dispositivo para ver o status completo:');
-            await sendDevicesList(from, devices);
-          } else {
-            await sendTextMessage(from, '❌ Nenhum dispositivo encontrado.\n\nDigite: `!tuya list` para listar dispositivos.');
-          }
-        } else {
-          await sendTextMessage(from, '❌ Módulo Tuya não configurado.');
-        }
-      } catch (e) {
-        err(`[WHATSAPP-API] Erro ao processar opt_tuya_status:`, e.message);
-        await sendTextMessage(from, `❌ Erro: ${e.message}`);
-      }
-      return;
-    }
     
     if (responseId === 'opt_tuya_count') {
       log(`[WHATSAPP-API] Opção "Luzes Ligadas" selecionada por ${from}`);
@@ -1508,6 +1740,249 @@ function initWhatsAppOfficialModule({
       return;
     }
     
+    if (responseId === 'opt_snapshot') {
+      log(`[WHATSAPP-API] Opção "Snapshot" selecionada por ${from}`);
+      try {
+        if (triggerSnapshotFunction) {
+          await sendTextMessage(from, '⏳ Tirando foto da câmera...');
+          const result = await triggerSnapshotFunction('📸 Snapshot solicitado manualmente', from);
+          if (result && result.ok) {
+            await sendTextMessage(from, `✅ Foto enviada com sucesso para ${result.successCount || 0} número(s)!`);
+          } else {
+            await sendTextMessage(from, `❌ Erro ao tirar foto: ${result?.error || 'Erro desconhecido'}`);
+          }
+        } else {
+          await sendTextMessage(from, '❌ Função de snapshot não disponível. Configure a câmera.');
+        }
+      } catch (e) {
+        err(`[WHATSAPP-API] Erro ao processar opt_snapshot:`, e.message);
+        await sendTextMessage(from, `❌ Erro: ${e.message}`);
+      }
+      return;
+    }
+    
+    if (responseId === 'opt_videos') {
+      log(`[WHATSAPP-API] Opção "Histórico de Vídeos" selecionada por ${from}`);
+      try {
+        if (listVideosFunction) {
+          const videos = listVideosFunction(from);
+          const fs = require('fs');
+          
+          if (videos.length === 0) {
+            await sendTextMessage(from, '📹 *Histórico de Vídeos*\n\nNenhum vídeo disponível no momento.\n\n💡 Vídeos são gravados automaticamente quando a campainha é tocada.');
+          } else {
+            // Limita a 10 vídeos mais recentes
+            const displayVideos = videos.slice(0, 10);
+            const remainingCount = videos.length - displayVideos.length;
+            
+            let message = `📹 *Histórico de Vídeos*\n\n`;
+            message += `📊 *Total:* ${videos.length} vídeo(s) disponível(is)\n`;
+            message += `⏰ *Válidos por:* 24 horas após gravação\n\n`;
+            message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+            
+            displayVideos.forEach((video, index) => {
+              const date = new Date(video.createdAt);
+              const dateStr = date.toLocaleString('pt-BR', { 
+                day: '2-digit', 
+                month: '2-digit', 
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit'
+              });
+              
+              // Calcula tempo restante
+              const now = Date.now();
+              const expiresAt = video.expiresAt || (video.createdAt + (24 * 60 * 60 * 1000));
+              const timeRemaining = expiresAt - now;
+              const hoursRemaining = Math.floor(timeRemaining / (60 * 60 * 1000));
+              const minutesRemaining = Math.floor((timeRemaining % (60 * 60 * 1000)) / (60 * 1000));
+              
+              // Obtém tamanho do arquivo
+              let fileSize = 'N/A';
+              if (video.fileExists && video.filePath) {
+                try {
+                  const stats = fs.statSync(video.filePath);
+                  const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+                  fileSize = `${sizeMB} MB`;
+                } catch (e) {
+                  fileSize = 'Erro';
+                }
+              }
+              
+              const status = video.fileExists ? '✅' : '❌';
+              const timeStatus = timeRemaining > 0 ? `⏳ ${hoursRemaining}h ${minutesRemaining}min` : '⏰ Expirado';
+              
+              message += `${index + 1}. ${status} *${dateStr}*\n`;
+              message += `   📁 Tamanho: ${fileSize}\n`;
+              message += `   ${timeStatus} restante\n`;
+              message += `   🆔 ID: \`${video.videoId.substring(0, 20)}...\`\n`;
+              message += `   👁️ Ver: \`!video ${video.videoId}\`\n\n`;
+            });
+            
+            if (remainingCount > 0) {
+              message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+              message += `📋 *E mais ${remainingCount} vídeo(s) disponível(is)*\n`;
+            }
+            
+            message += `\n💡 *Como usar:*\n`;
+            message += `• Digite \`!video <ID>\` para ver um vídeo\n`;
+            message += `• Ou clique no botão "Ver Vídeo" quando receber a notificação\n`;
+            message += `• Vídeos expiram automaticamente após 24 horas`;
+            
+            // Tenta enviar com List Message (permite mais opções que botões)
+            if (displayVideos.length > 0 && sendListMessage) {
+              try {
+                const sections = [{
+                  title: 'Vídeos Disponíveis',
+                  rows: displayVideos.map((video, index) => {
+                    const date = new Date(video.createdAt);
+                    const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+                    const dateStr = date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+                    
+                    // Obtém tamanho do arquivo
+                    let fileSize = 'N/A';
+                    if (video.fileExists && video.filePath) {
+                      try {
+                        const fs = require('fs');
+                        const stats = fs.statSync(video.filePath);
+                        const sizeMB = (stats.size / (1024 * 1024)).toFixed(1);
+                        fileSize = `${sizeMB}MB`;
+                      } catch (e) {
+                        fileSize = 'N/A';
+                      }
+                    }
+                    
+                    return {
+                      id: `view_video_${video.videoId}`,
+                      title: `🎥 ${dateStr} ${timeStr}`,
+                      description: `${fileSize} | ${video.fileExists ? 'Disponível' : 'Indisponível'}`
+                    };
+                  })
+                }];
+                
+                await sendListMessage(
+                  from,
+                  '📹 Histórico de Vídeos',
+                  'Selecione um vídeo para visualizar:',
+                  'Ver Vídeos',
+                  sections
+                );
+                log(`[WHATSAPP-API] Histórico enviado como List Message com ${displayVideos.length} opção(ões) para ${from}`);
+                return;
+              } catch (listError) {
+                dbg(`[WHATSAPP-API] Erro ao enviar List Message, tentando botões:`, listError.message);
+                // Continua para botões interativos
+              }
+            }
+            
+            // Fallback: Tenta enviar com botões interativos (máximo 3 por limitação da API)
+            if (displayVideos.length > 0 && sendInteractiveButtons) {
+              try {
+                // Limita a 3 botões por vez (limitação da API do WhatsApp)
+                const maxButtons = Math.min(displayVideos.length, 3);
+                const buttons = displayVideos.slice(0, maxButtons).map((video, index) => {
+                  const date = new Date(video.createdAt);
+                  const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+                  return {
+                    id: `view_video_${video.videoId}`,
+                    title: `🎥 ${timeStr}`
+                  };
+                });
+                
+                // Adiciona botão "Ver Mais" se houver mais vídeos
+                if (videos.length > maxButtons) {
+                  buttons.push({
+                    id: 'opt_videos_list',
+                    title: '📋 Ver Todos'
+                  });
+                }
+                
+                await sendInteractiveButtons(
+                  from,
+                  message,
+                  buttons,
+                  'Histórico de Vídeos'
+                );
+                log(`[WHATSAPP-API] Histórico enviado com ${buttons.length} botão(ões) interativo(s) para ${from}`);
+                return;
+              } catch (buttonError) {
+                dbg(`[WHATSAPP-API] Erro ao enviar botões, usando texto:`, buttonError.message);
+              }
+            }
+            
+            await sendTextMessage(from, message);
+          }
+        } else {
+          await sendTextMessage(from, '❌ Sistema de histórico não disponível.');
+        }
+      } catch (e) {
+        err(`[WHATSAPP-API] Erro ao processar opt_videos:`, e.message);
+        await sendTextMessage(from, `❌ Erro: ${e.message}`);
+      }
+      return;
+    }
+    
+    // Processa botão "Ver Todos" do histórico
+    if (responseId === 'opt_videos_list') {
+      log(`[WHATSAPP-API] Botão "Ver Todos" do histórico clicado por ${from}`);
+      // Reenvia a lista completa (mesma lógica de opt_videos)
+      // Isso permite que o usuário veja todos os vídeos se houver mais de 3
+      try {
+        if (listVideosFunction) {
+          const videos = listVideosFunction(from);
+          if (videos.length > 0) {
+            // Reutiliza a mesma lógica, mas mostra todos os vídeos
+            const fs = require('fs');
+            let message = `📹 *Todos os Vídeos Disponíveis*\n\n`;
+            message += `📊 *Total:* ${videos.length} vídeo(s)\n\n`;
+            message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+            
+            videos.forEach((video, index) => {
+              const date = new Date(video.createdAt);
+              const dateStr = date.toLocaleString('pt-BR', { 
+                day: '2-digit', 
+                month: '2-digit', 
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit'
+              });
+              
+              const now = Date.now();
+              const expiresAt = video.expiresAt || (video.createdAt + (24 * 60 * 60 * 1000));
+              const timeRemaining = expiresAt - now;
+              const hoursRemaining = Math.floor(timeRemaining / (60 * 60 * 1000));
+              const minutesRemaining = Math.floor((timeRemaining % (60 * 60 * 1000)) / (60 * 1000));
+              
+              let fileSize = 'N/A';
+              if (video.fileExists && video.filePath) {
+                try {
+                  const stats = fs.statSync(video.filePath);
+                  const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+                  fileSize = `${sizeMB} MB`;
+                } catch (e) {
+                  fileSize = 'Erro';
+                }
+              }
+              
+              const status = video.fileExists ? '✅' : '❌';
+              const timeStatus = timeRemaining > 0 ? `${hoursRemaining}h ${minutesRemaining}min` : 'Expirado';
+              
+              message += `${index + 1}. ${status} ${dateStr}\n`;
+              message += `   📁 ${fileSize} | ⏳ ${timeStatus}\n`;
+              message += `   \`!video ${video.videoId}\`\n\n`;
+            });
+            
+            await sendTextMessage(from, message);
+          }
+        }
+      } catch (e) {
+        err(`[WHATSAPP-API] Erro ao processar opt_videos_list:`, e.message);
+        await sendTextMessage(from, `❌ Erro: ${e.message}`);
+      }
+      return;
+    }
+    
     if (responseId === 'opt_record') {
       log(`[WHATSAPP-API] Opção "Gravar Vídeo" selecionada por ${from}`);
       try {
@@ -1551,9 +2026,24 @@ function initWhatsAppOfficialModule({
       }
       
       try {
-        const result = tempVideoProcessor(videoId, from);
+        // Normaliza o número do remetente para verificação
+        // O 'from' pode vir em diferentes formatos da API do WhatsApp
+        let normalizedFrom = from;
+        
+        // Remove prefixo do WhatsApp se existir
+        if (normalizedFrom.includes('@')) {
+          normalizedFrom = normalizedFrom.split('@')[0];
+        }
+        
+        // Normaliza usando a função normalizeBR
+        normalizedFrom = normalizeBR(normalizedFrom);
+        
+        log(`[WHATSAPP-API] Processando vídeo ${videoId} para ${from} (normalizado: ${normalizedFrom})`);
+        
+        const result = tempVideoProcessor(videoId, normalizedFrom);
         
         if (!result.success) {
+          err(`[WHATSAPP-API] Erro ao processar vídeo ${videoId}: ${result.error}`);
           await sendTextMessage(from, `❌ ${result.error || 'Erro ao processar vídeo'}`);
           return;
         }
@@ -1561,9 +2051,12 @@ function initWhatsAppOfficialModule({
         // Lê o arquivo de vídeo
         const fs = require('fs');
         if (!fs.existsSync(result.filePath)) {
-          await sendTextMessage(from, '❌ Arquivo de vídeo não encontrado.');
+          err(`[WHATSAPP-API] Arquivo não encontrado: ${result.filePath}`);
+          await sendTextMessage(from, '❌ Arquivo de vídeo não encontrado no servidor.');
           return;
         }
+        
+        log(`[WHATSAPP-API] Arquivo encontrado: ${result.filePath}`);
         
         // Divide vídeo em partes se necessário
         let videoParts;
@@ -1618,6 +2111,77 @@ function initWhatsAppOfficialModule({
       return;
     }
     
+    // Processa ações de dispositivo (action_on_*, action_off_*, action_toggle_*)
+    if (responseId.startsWith('action_on_') || responseId.startsWith('action_off_') || responseId.startsWith('action_toggle_')) {
+      const parts = responseId.split('_');
+      const action = parts[1]; // 'on', 'off' ou 'toggle'
+      const deviceId = parts.slice(2).join('_'); // Pega o resto (pode ter _ no ID)
+      
+      log(`[WHATSAPP-API] Ação ${action} solicitada para dispositivo ${deviceId} por ${from}`);
+      
+      try {
+        if (!tuya) {
+          await sendTextMessage(from, '❌ Módulo Tuya não configurado.');
+          return;
+        }
+        
+        const devices = await tuya.getCachedDevices();
+        const device = devices.find(d => d.id === deviceId);
+        
+        if (!device) {
+          await sendTextMessage(from, '❌ Dispositivo não encontrado.');
+          return;
+        }
+        
+        await sendTextMessage(from, `⏳ ${action === 'on' ? 'Ligando' : action === 'off' ? 'Desligando' : 'Alternando'} ${device.name}...`);
+        
+        let newStatus;
+        if (action === 'on') {
+          await tuya.turnOnDevice(device.id);
+          newStatus = await tuya.getDeviceStatus(device.id);
+        } else if (action === 'off') {
+          await tuya.turnOffDevice(device.id);
+          newStatus = await tuya.getDeviceStatus(device.id);
+        } else if (action === 'toggle') {
+          await tuya.toggleDevice(device.id);
+          newStatus = await tuya.getDeviceStatus(device.id);
+        }
+        
+        const poweredOn = newStatus.filter(s => {
+          const code = s.code?.toLowerCase() || '';
+          const value = s.value;
+          if (code.includes('switch') || code.includes('power')) {
+            return value === true || value === 1 || value === 'true' || value === 'on';
+          }
+          return false;
+        }).length > 0;
+        
+        const statusMsg = tuya.formatDeviceStatusMessage(device.name, newStatus, poweredOn);
+        
+        // Reenvia status atualizado com botões de ação
+        try {
+          await sendInteractiveButtons(
+            from,
+            `✅ *Ação executada com sucesso!*\n\n${statusMsg}`,
+            [
+              { id: `action_on_${device.id}`, title: '⚡ Ligar' },
+              { id: `action_off_${device.id}`, title: '⚫ Desligar' },
+              { id: `action_toggle_${device.id}`, title: '🔄 Alternar' },
+              { id: 'opt_tuya_list', title: '📋 Voltar' }
+            ],
+            `Dispositivo: ${device.name}`
+          );
+        } catch (buttonError) {
+          await sendTextMessage(from, `✅ *Ação executada com sucesso!*\n\n${statusMsg}`);
+        }
+        
+      } catch (e) {
+        err(`[WHATSAPP-API] Erro ao processar ação ${action}:`, e.message);
+        await sendTextMessage(from, `❌ Erro ao ${action === 'on' ? 'ligar' : action === 'off' ? 'desligar' : 'alternar'} dispositivo: ${e.message}`);
+      }
+      return;
+    }
+    
     if (responseId === 'opt_help') {
       log(`[WHATSAPP-API] Opção "Ajuda" selecionada por ${from}`);
       try {
@@ -1625,7 +2189,7 @@ function initWhatsAppOfficialModule({
           const helpMsg = tuya.formatHelpMessage();
           await sendTextMessage(from, helpMsg);
         } else {
-          await sendTextMessage(from, '❓ *Ajuda*\n\nComandos disponíveis:\n- `!menu` - Menu principal\n- `!tuya list` - Listar dispositivos\n- `!tuya status <nome>` - Status do dispositivo\n- `!tuya on <nome>` - Ligar dispositivo\n- `!tuya off <nome>` - Desligar dispositivo\n- `!tuya toggle <nome>` - Alternar dispositivo\n- `!record` - Gravar vídeo\n- `!ping` - Teste de conexão');
+          await sendTextMessage(from, '❓ *Ajuda*\n\nComandos disponíveis:\n- `!menu` - Menu principal\n- `!tuya list` - Listar dispositivos\n- `!tuya on <nome>` - Ligar dispositivo\n- `!tuya off <nome>` - Desligar dispositivo\n- `!tuya toggle <nome>` - Alternar dispositivo\n- `!record` - Gravar vídeo\n- `!ping` - Teste de conexão');
         }
       } catch (e) {
         err(`[WHATSAPP-API] Erro ao processar opt_help:`, e.message);
@@ -1698,6 +2262,10 @@ function initWhatsAppOfficialModule({
     setListVideosFunction: (listFunction) => {
       listVideosFunction = listFunction;
       log(`[WHATSAPP-API] Função de listagem de vídeos configurada`);
+    },
+    setTriggerSnapshotFunction: (triggerFunction) => {
+      triggerSnapshotFunction = triggerFunction;
+      log(`[WHATSAPP-API] Função de trigger de snapshot configurada`);
     },
     
     // Resolver número (para compatibilidade)

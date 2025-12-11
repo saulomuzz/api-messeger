@@ -47,28 +47,87 @@ function initWebSocketESP32Module({
   
   log(`[WS-ESP32] Servidor WebSocket inicializado em /ws/esp32`);
   
+  // Normaliza IP (remove prefixo IPv6 mapeado para IPv4)
+  function normalizeIp(ipAddress) {
+    if (!ipAddress) return ipAddress;
+    // Remove prefixo IPv6 mapeado para IPv4 (::ffff:)
+    if (ipAddress.startsWith('::ffff:')) {
+      return ipAddress.substring(7);
+    }
+    return ipAddress;
+  }
+  
+  // Verifica se IP está em CIDR
+  function ipInCidr(ipAddress, cidr) {
+    const [network, prefixStr] = cidr.split('/');
+    const prefixLength = parseInt(prefixStr, 10);
+    
+    if (isNaN(prefixLength) || prefixLength < 0 || prefixLength > 32) {
+      return false;
+    }
+    
+    const networkParts = network.split('.').map(Number);
+    const ipParts = ipAddress.split('.').map(Number);
+    
+    if (networkParts.length !== 4 || ipParts.length !== 4) {
+      return false;
+    }
+    
+    // Verifica se todos os valores são válidos
+    if (networkParts.some(p => isNaN(p) || p < 0 || p > 255) ||
+        ipParts.some(p => isNaN(p) || p < 0 || p > 255)) {
+      return false;
+    }
+    
+    const mask = (0xFFFFFFFF << (32 - prefixLength)) >>> 0;
+    const networkNum = (networkParts[0] << 24) + (networkParts[1] << 16) + (networkParts[2] << 8) + networkParts[3];
+    const ipNum = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
+    
+    return (networkNum & mask) === (ipNum & mask);
+  }
+  
   // Valida autorização de um cliente
   function validateClient(ws, req) {
-    const clientIp = req.socket.remoteAddress || 
-                     req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
-                     req.socket.address()?.address || 
-                     'unknown';
+    const rawClientIp = req.socket.remoteAddress || 
+                        req.headers['x-forwarded-for']?.split(',')[0]?.trim() || 
+                        req.socket.address()?.address || 
+                        'unknown';
+    
+    // Normaliza IP (remove prefixo IPv6 mapeado)
+    const clientIp = normalizeIp(rawClientIp);
+    
+    dbg(`[WS-ESP32] IP recebido: ${rawClientIp} -> normalizado: ${clientIp}`);
     
     // Verifica IP whitelist
     if (ESP32_ALLOWED_IPS.length > 0) {
+      dbg(`[WS-ESP32] Verificando IP ${clientIp} contra whitelist: ${ESP32_ALLOWED_IPS.join(', ')}`);
+      
       const isAllowed = ESP32_ALLOWED_IPS.some(allowedIp => {
+        // Normaliza IP permitido também
+        const normalizedAllowedIp = normalizeIp(allowedIp);
+        
         if (allowedIp.includes('/')) {
-          // CIDR - implementação simples
-          return clientIp.startsWith(allowedIp.split('/')[0]);
+          // CIDR - usa função completa
+          const inCidr = ipInCidr(clientIp, allowedIp);
+          dbg(`[WS-ESP32] Verificando CIDR: ${clientIp} em ${allowedIp} = ${inCidr}`);
+          return inCidr;
         }
-        return clientIp === allowedIp;
+        // Compara IPs normalizados
+        const matches = clientIp === normalizedAllowedIp;
+        dbg(`[WS-ESP32] Comparando: ${clientIp} === ${normalizedAllowedIp} = ${matches}`);
+        return matches;
       });
       
       if (!isAllowed) {
-        warn(`[WS-ESP32] IP não autorizado: ${clientIp}`);
+        warn(`[WS-ESP32] IP não autorizado: ${rawClientIp} (normalizado: ${clientIp})`);
+        warn(`[WS-ESP32] IPs permitidos: ${ESP32_ALLOWED_IPS.join(', ')}`);
         return { authorized: false, reason: 'IP não autorizado', ip: clientIp };
       }
+      
+      log(`[WS-ESP32] IP autorizado: ${clientIp} (match com whitelist)`);
     }
+    
+    log(`[WS-ESP32] IP autorizado: ${clientIp}`);
     
     // Token será validado na primeira mensagem
     return { authorized: true, ip: clientIp };

@@ -30,6 +30,7 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
   let isReady = false;
   let tempVideoProcessor = null; // Função para processar vídeos temporários
   let listVideosFunction = null; // Função para listar histórico de vídeos
+  let triggerSnapshotFunction = null; // Função para disparar snapshot manualmente
   
   // Cria cliente WhatsApp
   const client = new Client({
@@ -177,17 +178,27 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
             {
               id: 'opt_tuya_list',
               title: '📋 Dispositivos Tuya',
-              description: 'Listar e gerenciar seus dispositivos Tuya'
+              description: 'Listar e gerenciar seus dispositivos (com status)'
             },
             {
-              id: 'opt_tuya_status',
-              title: '⚡ Status do Dispositivo',
-              description: 'Consultar status de um dispositivo específico'
+              id: 'opt_tuya_count',
+              title: '💡 Luzes Ligadas',
+              description: 'Ver quantas luzes estão ligadas (lâmpadas e interruptores)'
+            },
+            {
+              id: 'opt_snapshot',
+              title: '📸 Snapshot da Câmera',
+              description: 'Tirar foto instantânea da câmera'
             },
             {
               id: 'opt_record',
               title: '🎥 Gravar Vídeo',
               description: 'Gravar vídeo da câmera (padrão: 30 segundos)'
+            },
+            {
+              id: 'opt_videos',
+              title: '📹 Histórico de Vídeos',
+              description: 'Ver vídeos gravados recentemente (últimas 24h)'
             },
             {
               id: 'opt_help',
@@ -216,16 +227,20 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
       try {
         const buttons = [
           { body: '📋 Dispositivos' },
-          { body: '⚡ Status' },
+          { body: '💡 Lâmpadas' },
+          { body: '📸 Foto' },
           { body: '🎥 Gravar' },
+          { body: '📹 Vídeos' },
           { body: '❓ Ajuda' }
         ];
         
         const buttonMessage = {
           text: '🏠 *Menu Principal*\n\n*Selecione uma opção:*\n\n' +
-            '📋 *Dispositivos Tuya*\n   Listar e gerenciar dispositivos\n\n' +
-            '⚡ *Status do Dispositivo*\n   Consultar status específico\n\n' +
+            '📋 *Dispositivos Tuya*\n   Listar dispositivos com status completo\n\n' +
+            '💡 *Luzes Ligadas*\n   Ver quantas luzes estão ligadas\n\n' +
+            '📸 *Snapshot da Câmera*\n   Tirar foto instantânea\n\n' +
             '🎥 *Gravar Vídeo*\n   Gravar vídeo da câmera\n\n' +
+            '📹 *Histórico de Vídeos*\n   Ver vídeos recentes (24h)\n\n' +
             '❓ *Ajuda*\n   Ver comandos disponíveis',
           buttons: buttons,
           footer: 'WhatsApp API - Controle Inteligente'
@@ -241,11 +256,13 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
       
       // Fallback final: mensagem de texto formatada
       const textMenu = '🏠 *Menu Principal*\n\n' +
-        '📋 *1. Dispositivos Tuya*\n   Digite: `!tuya list`\n\n' +
-        '⚡ *2. Status do Dispositivo*\n   Digite: `!tuya status <nome>`\n\n' +
-        '🎥 *3. Gravar Vídeo*\n   Digite: `!record` ou `!record 30`\n\n' +
-        '❓ *4. Ajuda*\n   Digite: `!tuya help`\n\n' +
-        '💡 *Dica:* Você também pode clicar nos botões acima (se disponível).';
+        '📋 *1. Dispositivos Tuya*\n   Clique no botão ou digite: `!tuya list`\n\n' +
+        '💡 *2. Luzes Ligadas*\n   Clique no botão ou digite: `!tuya count`\n\n' +
+        '📸 *3. Snapshot da Câmera*\n   Clique no botão ou digite: `!snapshot`\n\n' +
+        '🎥 *4. Gravar Vídeo*\n   Clique no botão ou digite: `!record`\n\n' +
+        '📹 *5. Histórico de Vídeos*\n   Clique no botão ou digite: `!videos`\n\n' +
+        '❓ *6. Ajuda*\n   Clique no botão ou digite: `!tuya help`\n\n' +
+        '💡 *Dica:* Clique nos botões acima para interagir sem digitar!';
       
       await client.sendMessage(chatId, textMenu);
       log(`[MENU] Menu de opções enviado como texto para ${chatId}`);
@@ -264,39 +281,68 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
    * Envia lista de dispositivos Tuya
    * Nota: whatsapp-web.js pode não suportar List Messages nativamente, então usamos mensagem de texto formatada
    */
-  async function sendDevicesList(chatId, devices) {
+  async function sendDevicesList(chatId, devices, page = 0) {
     try {
       if (!devices || devices.length === 0) {
         await client.sendMessage(chatId, '❌ Nenhum dispositivo encontrado.');
         return;
       }
       
+      // Ordena dispositivos: online primeiro, depois offline
+      const sortedDevices = [...devices].sort((a, b) => {
+        const aOnline = a.online ? 1 : 0;
+        const bOnline = b.online ? 1 : 0;
+        // Online primeiro (ordem decrescente: 1 antes de 0)
+        if (bOnline !== aOnline) {
+          return bOnline - aOnline;
+        }
+        // Se ambos têm o mesmo status, ordena por nome
+        const aName = (a.name || '').toLowerCase();
+        const bName = (b.name || '').toLowerCase();
+        return aName.localeCompare(bName);
+      });
+      
+      const ITEMS_PER_PAGE = 10;
+      const totalPages = Math.ceil(sortedDevices.length / ITEMS_PER_PAGE);
+      const startIndex = page * ITEMS_PER_PAGE;
+      const endIndex = startIndex + ITEMS_PER_PAGE;
+      const pageDevices = sortedDevices.slice(startIndex, endIndex);
+      const hasMore = endIndex < sortedDevices.length;
+      
       // Tenta enviar como List Message (pode não funcionar)
       try {
-        const limitedDevices = devices.slice(0, 10);
-        
         const sections = [{
-          title: 'Dispositivos Disponíveis',
-          rows: limitedDevices.map((device, index) => {
+          title: hasMore ? `Dispositivos (Página ${page + 1}/${totalPages})` : 'Dispositivos Disponíveis',
+          rows: pageDevices.map((device, index) => {
             const status = device.online ? '🟢' : '🔴';
             const powered = device.poweredOn ? '⚡' : '⚫';
+            const onlineStatus = device.online ? 'Online' : 'Offline';
             return {
               id: `device_${device.id}`,
-              title: `${status} ${device.name || `Dispositivo ${index + 1}`}`,
-              description: `${powered} ${device.category || 'Sem categoria'}`
+              title: `${status} ${device.name || `Dispositivo ${startIndex + index + 1}`}`,
+              description: `${powered} ${onlineStatus} | ${device.category || 'Sem categoria'}`
             };
           })
         }];
         
+        // Adiciona opção "Ver Mais" se houver mais páginas
+        if (hasMore) {
+          sections[0].rows.push({
+            id: `devices_page_${page + 1}`,
+            title: '📄 Ver Próxima Página',
+            description: `Mostrar mais ${Math.min(ITEMS_PER_PAGE, sortedDevices.length - endIndex)} dispositivo(s)`
+          });
+        }
+        
         const listMessage = {
           title: '📋 Dispositivos Tuya',
-          description: `Selecione um dispositivo (${limitedDevices.length} de ${devices.length}):`,
+          description: `Selecione um dispositivo (${startIndex + 1}-${Math.min(endIndex, sortedDevices.length)} de ${sortedDevices.length}):`,
           buttonText: 'Ver Dispositivos',
           sections: sections
         };
         
         await client.sendMessage(chatId, listMessage);
-        log(`[MENU] Lista de ${limitedDevices.length} dispositivo(s) enviada como List Message para ${chatId}`);
+        log(`[MENU] Lista de ${pageDevices.length} dispositivo(s) (página ${page + 1}/${totalPages}) enviada como List Message para ${chatId}`);
         return;
       } catch (listError) {
         dbg(`[MENU] List Message não suportado, usando fallback de texto: ${listError.message}`);
@@ -304,9 +350,46 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
       }
       
       // Fallback: mensagem de texto formatada (sempre funciona)
-      const textList = tuya.formatDevicesListMessage(devices);
+      let textList = `📋 *Dispositivos Tuya*\n\n`;
+      textList += `*Total:* ${sortedDevices.length} dispositivo(s)\n`;
+      textList += `*Página:* ${page + 1}/${totalPages}\n\n`;
+      textList += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+      
+      // Agrupa por status
+      const onlineDevices = pageDevices.filter(d => d.online);
+      const offlineDevices = pageDevices.filter(d => !d.online);
+      
+      if (onlineDevices.length > 0) {
+        textList += `🟢 *ONLINE (${onlineDevices.length})*\n\n`;
+        onlineDevices.forEach((device, index) => {
+          const powered = device.poweredOn ? '⚡ Ligado' : '⚫ Desligado';
+          textList += `${startIndex + index + 1}. ${device.name || `Dispositivo ${startIndex + index + 1}`}\n`;
+          textList += `   ${powered} | ${device.category || 'Sem categoria'}\n`;
+          textList += `   ID: \`device_${device.id}\`\n\n`;
+        });
+      }
+      
+      if (offlineDevices.length > 0) {
+        if (onlineDevices.length > 0) {
+          textList += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        }
+        textList += `🔴 *OFFLINE (${offlineDevices.length})*\n\n`;
+        offlineDevices.forEach((device, index) => {
+          const powered = device.poweredOn ? '⚡ Ligado' : '⚫ Desligado';
+          textList += `${startIndex + onlineDevices.length + index + 1}. ${device.name || `Dispositivo ${startIndex + onlineDevices.length + index + 1}`}\n`;
+          textList += `   ${powered} | ${device.category || 'Sem categoria'}\n`;
+          textList += `   ID: \`device_${device.id}\`\n\n`;
+        });
+      }
+      
+      if (hasMore) {
+        textList += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        textList += `📄 *Mais ${Math.min(ITEMS_PER_PAGE, sortedDevices.length - endIndex)} dispositivo(s) disponível(is)*\n`;
+        textList += `💡 Digite \`!tuya list page ${page + 1}\` para ver a próxima página`;
+      }
+      
       await client.sendMessage(chatId, textList);
-      log(`[MENU] Lista de ${devices.length} dispositivo(s) enviada como texto para ${chatId}`);
+      log(`[MENU] Lista de ${pageDevices.length} dispositivo(s) (página ${page + 1}/${totalPages}) enviada como texto para ${chatId}`);
     } catch (e) {
       err(`[MENU] Erro ao enviar lista de dispositivos:`, e.message);
       // Último fallback
@@ -528,7 +611,7 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
         try {
           await message.reply('⏳ Buscando seus dispositivos...');
           const devices = await tuya.getCachedDevices();
-          await sendDevicesList(message.from, devices);
+          await sendDevicesList(message.from, devices, 0);
         } catch (e) {
           err(`[MENU] Erro ao processar opt_tuya_list:`, e.message);
           await message.reply(`❌ Erro: ${e.message}`);
@@ -536,12 +619,122 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
         return;
       }
       
-      if (msgBody === 'opt_tuya_status' || msgLower.includes('status do dispositivo') || msgLower === 'status' || msgLower === '⚡ status') {
-        log(`[MENU] Opção "Status do Dispositivo" selecionada de ${message.from}`);
+      // Processa paginação de dispositivos (devices_page_*)
+      if (msgBody.startsWith('devices_page_')) {
+        const pageStr = msgBody.replace('devices_page_', '');
+        const page = parseInt(pageStr, 10);
+        
+        if (isNaN(page) || page < 0) {
+          await message.reply('❌ Página inválida.');
+          return;
+        }
+        
+        log(`[MENU] Página ${page} de dispositivos solicitada de ${message.from}`);
         try {
-          await message.reply('📋 *Status do Dispositivo*\n\nDigite o nome ou número do dispositivo:\nExemplo: `!tuya status 1` ou `!tuya status Power Clamp`');
+          const devices = await tuya.getCachedDevices();
+          await sendDevicesList(message.from, devices, page);
         } catch (e) {
-          err(`[MENU] Erro ao processar opt_tuya_status:`, e.message);
+          err(`[MENU] Erro ao processar devices_page_${page}:`, e.message);
+          await message.reply(`❌ Erro: ${e.message}`);
+        }
+        return;
+      }
+      
+      
+      if (msgBody === 'opt_snapshot' || msgLower === '!snapshot' || msgLower === '!foto' || msgLower === '!photo') {
+        log(`[MENU] Opção "Snapshot" selecionada de ${message.from}`);
+        try {
+          if (triggerSnapshotFunction) {
+            await message.reply('⏳ Tirando foto da câmera...');
+            const result = await triggerSnapshotFunction('📸 Snapshot solicitado manualmente', message.from);
+            if (result && result.ok) {
+              await message.reply(`✅ Foto enviada com sucesso para ${result.successCount || 0} número(s)!`);
+            } else {
+              await message.reply(`❌ Erro ao tirar foto: ${result?.error || 'Erro desconhecido'}`);
+            }
+          } else {
+            await message.reply('❌ Função de snapshot não disponível. Configure a câmera.');
+          }
+        } catch (e) {
+          err(`[MENU] Erro ao processar opt_snapshot:`, e.message);
+          await message.reply(`❌ Erro: ${e.message}`);
+        }
+        return;
+      }
+      
+      if (msgBody === 'opt_videos' || msgLower === '!videos' || msgLower === '!historico' || msgLower === '!histórico' || msgLower === '!hist') {
+        log(`[MENU] Opção "Histórico de Vídeos" selecionada de ${message.from}`);
+        try {
+          if (listVideosFunction) {
+            const videos = listVideosFunction(message.from);
+            const fs = require('fs');
+            
+            if (videos.length === 0) {
+              await message.reply('📹 *Histórico de Vídeos*\n\nNenhum vídeo disponível no momento.\n\n💡 Vídeos são gravados automaticamente quando a campainha é tocada.');
+            } else {
+              const displayVideos = videos.slice(0, 10);
+              const remainingCount = videos.length - displayVideos.length;
+              
+              let msg = `📹 *Histórico de Vídeos*\n\n`;
+              msg += `📊 *Total:* ${videos.length} vídeo(s) disponível(is)\n`;
+              msg += `⏰ *Válidos por:* 24 horas após gravação\n\n`;
+              msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+              
+              displayVideos.forEach((video, index) => {
+                const date = new Date(video.createdAt);
+                const dateStr = date.toLocaleString('pt-BR', { 
+                  day: '2-digit', 
+                  month: '2-digit', 
+                  year: 'numeric',
+                  hour: '2-digit',
+                  minute: '2-digit',
+                  second: '2-digit'
+                });
+                
+                const now = Date.now();
+                const expiresAt = video.expiresAt || (video.createdAt + (24 * 60 * 60 * 1000));
+                const timeRemaining = expiresAt - now;
+                const hoursRemaining = Math.floor(timeRemaining / (60 * 60 * 1000));
+                const minutesRemaining = Math.floor((timeRemaining % (60 * 60 * 1000)) / (60 * 1000));
+                
+                let fileSize = 'N/A';
+                if (video.fileExists && video.filePath) {
+                  try {
+                    const stats = fs.statSync(video.filePath);
+                    const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+                    fileSize = `${sizeMB} MB`;
+                  } catch (e) {
+                    fileSize = 'Erro';
+                  }
+                }
+                
+                const status = video.fileExists ? '✅' : '❌';
+                const timeStatus = timeRemaining > 0 ? `⏳ ${hoursRemaining}h ${minutesRemaining}min` : '⏰ Expirado';
+                
+                msg += `${index + 1}. ${status} *${dateStr}*\n`;
+                msg += `   📁 Tamanho: ${fileSize}\n`;
+                msg += `   ${timeStatus} restante\n`;
+                msg += `   🆔 ID: \`${video.videoId.substring(0, 20)}...\`\n`;
+                msg += `   👁️ Ver: \`!video ${video.videoId}\`\n\n`;
+              });
+              
+              if (remainingCount > 0) {
+                msg += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+                msg += `📋 *E mais ${remainingCount} vídeo(s) disponível(is)*\n`;
+              }
+              
+              msg += `\n💡 *Como usar:*\n`;
+              msg += `• Digite \`!video <ID>\` para ver um vídeo\n`;
+              msg += `• Ou clique no botão "Ver Vídeo" quando receber a notificação\n`;
+              msg += `• Vídeos expiram automaticamente após 24 horas`;
+              
+              await message.reply(msg);
+            }
+          } else {
+            await message.reply('❌ Sistema de histórico não disponível.');
+          }
+        } catch (e) {
+          err(`[MENU] Erro ao processar opt_videos:`, e.message);
           await message.reply(`❌ Erro: ${e.message}`);
         }
         return;
@@ -679,7 +872,7 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
         }
       }
       
-      // Processa seleção de dispositivo da lista (device_*)
+      // Processa seleção de dispositivo da lista (device_*) - mostra status completo com ações
       if (msgBody.startsWith('device_')) {
         const deviceId = msgBody.replace('device_', '');
         log(`[MENU] Dispositivo selecionado da lista: ${deviceId} por ${message.from}`);
@@ -689,9 +882,48 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
           const device = devices.find(d => d.id === deviceId);
           
           if (device) {
-            await sendDeviceActionsMenu(message.from, device);
+            await message.reply('⏳ Consultando status do dispositivo...');
+            const status = await tuya.getDeviceStatus(device.id);
+            const poweredOn = status.filter(s => {
+              const code = s.code?.toLowerCase() || '';
+              const value = s.value;
+              if (code.includes('switch') || code.includes('power')) {
+                return value === true || value === 1 || value === 'true' || value === 'on';
+              }
+              return false;
+            }).length > 0;
+            
+            const responseMsg = tuya.formatDeviceStatusMessage(device.name, status, poweredOn);
+            
+            // Envia status com botões de ação
+            try {
+              const buttons = [
+                { body: '⚡ Ligar', id: `action_on_${device.id}` },
+                { body: '⚫ Desligar', id: `action_off_${device.id}` },
+                { body: '🔄 Alternar', id: `action_toggle_${device.id}` },
+                { body: '📋 Voltar', id: 'opt_tuya_list' }
+              ];
+              
+              const buttonMessage = {
+                text: responseMsg,
+                buttons: buttons,
+                footer: `Dispositivo: ${device.name}`
+              };
+              
+              await client.sendMessage(message.from, buttonMessage);
+              log(`[MENU] Status do dispositivo ${device.name} enviado com botões de ação para ${message.from}`);
+            } catch (buttonError) {
+              // Se botões não funcionarem, envia apenas o texto
+              await message.reply(responseMsg);
+              await message.reply(`\n💡 *Ações disponíveis:*\n• Ligar: \`!tuya on ${device.name}\`\n• Desligar: \`!tuya off ${device.name}\`\n• Alternar: \`!tuya toggle ${device.name}\``);
+            }
           } else {
             await message.reply('❌ Dispositivo não encontrado.');
+            // Oferece lista de dispositivos
+            const devices = await tuya.getCachedDevices();
+            if (devices && devices.length > 0) {
+              await sendDevicesList(message.from, devices, 0);
+            }
           }
         } catch (e) {
           err(`[MENU] Erro ao processar seleção de dispositivo:`, e.message);
@@ -712,14 +944,22 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
         
         try {
           const senderNumber = getSenderNumber(message);
-          if (!senderNumber) return;
+          if (!senderNumber) {
+            await message.reply('❌ Não foi possível identificar seu número.');
+            return;
+          }
+          
+          log(`[MENU] Processando vídeo ${videoId} para ${senderNumber}`);
           
           const result = tempVideoProcessor(videoId, senderNumber);
           
           if (!result.success) {
+            err(`[MENU] Erro ao processar vídeo ${videoId}: ${result.error}`);
             await message.reply(`❌ ${result.error || 'Erro ao processar vídeo'}`);
             return;
           }
+          
+          log(`[MENU] Vídeo ${videoId} autorizado, arquivo: ${result.filePath}`);
           
           const fs = require('fs');
           if (!fs.existsSync(result.filePath)) {
@@ -785,6 +1025,28 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
         } catch (e) {
           err(`[CMD] Falha ao enviar menu após saudação:`, e.message);
         }
+      }
+      return;
+    }
+    
+    // Comando !snapshot ou !foto
+    if (msgLower === '!snapshot' || msgLower === '!foto' || msgLower === '!photo') {
+      log(`[CMD] Comando de snapshot recebido de ${message.from}`);
+      try {
+        if (triggerSnapshotFunction) {
+          await message.reply('⏳ Tirando foto da câmera...');
+          const result = await triggerSnapshotFunction('📸 Snapshot solicitado manualmente', message.from);
+          if (result && result.ok) {
+            await message.reply(`✅ Foto enviada com sucesso para ${result.successCount || 0} número(s)!`);
+          } else {
+            await message.reply(`❌ Erro ao tirar foto: ${result?.error || 'Erro desconhecido'}`);
+          }
+        } else {
+          await message.reply('❌ Função de snapshot não disponível. Configure a câmera.');
+        }
+      } catch (e) {
+        err(`[CMD] Erro ao processar snapshot:`, e.message);
+        await message.reply(`❌ Erro: ${e.message}`);
       }
       return;
     }
@@ -1397,6 +1659,10 @@ function initWhatsAppModule({ authDataPath, port, logger, camera, tuya, utils, n
     setListVideosFunction: (listFunction) => {
       listVideosFunction = listFunction;
       log(`[WHATSAPP] Função de listagem de vídeos configurada`);
+    },
+    setTriggerSnapshotFunction: (triggerFunction) => {
+      triggerSnapshotFunction = triggerFunction;
+      log(`[WHATSAPP] Função de trigger de snapshot configurada`);
     }
   };
 }
