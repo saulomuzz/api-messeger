@@ -87,6 +87,13 @@ DEBUG=false
 CAMERA_SNAPSHOT_URL=http://192.168.1.100/cgi-bin/snapshot.cgi?channel=1
 CAMERA_USER=admin
 CAMERA_PASS=senha
+RECORD_DURATION_SEC=30       # Duração padrão de gravação de vídeo em segundos (padrão: 30)
+MIN_SNAPSHOT_INTERVAL_MS=20000  # Intervalo mínimo entre snapshots em ms (padrão: 20000 = 20s)
+
+# Gravação de Vídeo ao Tocar Campainha
+ENABLE_VIDEO_RECORDING=true  # Habilitar gravação de vídeo ao tocar campainha (padrão: true)
+VIDEO_RECORD_DURATION_SEC=15  # Duração do vídeo ao tocar campainha em segundos (padrão: 15)
+MIN_VIDEO_RECORD_INTERVAL_MS=60000  # Intervalo mínimo entre gravações em ms (padrão: 60000 = 1 minuto)
 
 # Otimização de Imagem (opcional)
 MAX_IMAGE_SIZE_KB=500        # Tamanho máximo antes de comprimir (padrão: 500KB)
@@ -105,6 +112,18 @@ TUYA_REGION=us
 
 # Números de telefone
 NUMBERS_FILE=/opt/whatsapp-api/numbers.txt
+
+# AbuseIPDB - Validação e Bloqueio Automático de IPs
+ABUSEIPDB_ENABLED=true  # Habilitar validação AbuseIPDB (padrão: true)
+ABUSEIPDB_API_KEY=seu_api_key_aqui  # Chave da API do AbuseIPDB (obtenha em https://www.abuseipdb.com/)
+
+# Configurações de Listas AbuseIPDB
+ABUSEIPDB_WHITELIST_MAX_CONFIDENCE=50  # Confiança máxima para whitelist em % (padrão: 50)
+ABUSEIPDB_WHITELIST_TTL_DAYS=15  # Tempo de vida da whitelist em dias (padrão: 15)
+ABUSEIPDB_YELLOWLIST_MIN_CONFIDENCE=50  # Confiança mínima para yellowlist em % (padrão: 50)
+ABUSEIPDB_YELLOWLIST_MAX_CONFIDENCE=80  # Confiança máxima para yellowlist em % (padrão: 80)
+ABUSEIPDB_YELLOWLIST_TTL_DAYS=7  # Tempo de vida da yellowlist em dias (padrão: 7)
+ABUSEIPDB_BLACKLIST_MIN_CONFIDENCE=80  # Confiança mínima para blacklist em % (padrão: 80)
 ```
 
 ## Estrutura do Projeto

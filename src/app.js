@@ -18,6 +18,7 @@ const { initWhatsAppModule } = require('./modules/whatsapp');
 const { initRoutesModule } = require('./modules/routes');
 const { initTuyaMonitorModule } = require('./modules/tuya-monitor');
 const { initIPBlockerModule } = require('./modules/ip-blocker');
+const { initAbuseIPDBModule } = require('./modules/abuseipdb');
 const { initWebSocketESP32Module } = require('./modules/websocket-esp32');
 
 /* ===== env ===== */
@@ -57,6 +58,10 @@ const CAMERA_USER = process.env.CAMERA_USER || '';
 const CAMERA_PASS = process.env.CAMERA_PASS || '';
 const CAMERA_RTSP_URL = process.env.CAMERA_RTSP_URL || '';
 const RECORD_DURATION_SEC = parseInt(process.env.RECORD_DURATION_SEC || '30', 10); // Duração padrão: 30 segundos
+const MIN_SNAPSHOT_INTERVAL_MS = parseInt(process.env.MIN_SNAPSHOT_INTERVAL_MS || '20000', 10); // Intervalo mínimo entre snapshots em ms (padrão: 20 segundos)
+const ENABLE_VIDEO_RECORDING = /^true$/i.test(process.env.ENABLE_VIDEO_RECORDING || 'true'); // Habilitar gravação de vídeo (padrão: true)
+const VIDEO_RECORD_DURATION_SEC = parseInt(process.env.VIDEO_RECORD_DURATION_SEC || '15', 10); // Duração do vídeo ao tocar campainha (padrão: 15 segundos)
+const MIN_VIDEO_RECORD_INTERVAL_MS = parseInt(process.env.MIN_VIDEO_RECORD_INTERVAL_MS || '60000', 10); // Intervalo mínimo entre gravações em ms (padrão: 60 segundos = 1 minuto)
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(APP_ROOT, 'recordings');
 const NUMBERS_FILE = process.env.NUMBERS_FILE || path.join(APP_ROOT, 'numbers.txt');
 const AUTH_DATA_PATH = process.env.AUTH_DATA_PATH || path.join(APP_ROOT, '.wwebjs_auth');
@@ -263,17 +268,40 @@ try {
   // Não encerra a aplicação, mas loga o erro
 }
 
-// Middleware de verificação de IP bloqueado (executado no início de cada requisição)
+/* ===== AbuseIPDB Module ===== */
+let abuseIPDB = null;
+try {
+  log(`[INIT] Inicializando módulo AbuseIPDB...`);
+  abuseIPDB = initAbuseIPDBModule({
+    apiKey: process.env.ABUSEIPDB_API_KEY || '',
+    logger,
+    ipBlocker
+  });
+  log(`[INIT] Módulo AbuseIPDB inicializado com sucesso`);
+} catch (abuseIPDBError) {
+  warn(`[INIT] Erro ao inicializar módulo AbuseIPDB:`, abuseIPDBError.message);
+  // Não encerra a aplicação, mas loga o erro
+}
+
+// Middleware de verificação de IP bloqueado e validação AbuseIPDB (executado no início de cada requisição)
 app.use(async (req, res, next) => {
   const clientIp = getClientIp(req);
+  const normalizedIp = normalizeIp(clientIp);
+  
+  // Ignora IPs locais e inválidos
+  if (!normalizedIp || normalizedIp === 'unknown' || normalizedIp === 'localhost' || 
+      normalizedIp.startsWith('127.') || normalizedIp.startsWith('192.168.') || 
+      normalizedIp.startsWith('10.') || normalizedIp.startsWith('172.')) {
+    return next();
+  }
   
   // Ignora IPs na whitelist
   if (ENABLE_IP_WHITELIST && IP_WHITELIST.length > 0) {
     const isAllowed = IP_WHITELIST.some(allowedIp => {
       if (allowedIp.includes('/')) {
-        return ipInCidr(clientIp, allowedIp);
+        return ipInCidr(normalizedIp, allowedIp);
       }
-      return normalizeIp(clientIp) === normalizeIp(allowedIp);
+      return normalizeIp(normalizedIp) === normalizeIp(allowedIp);
     });
     if (isAllowed) {
       return next();
@@ -283,11 +311,11 @@ app.use(async (req, res, next) => {
   // Verifica se IP está bloqueado no banco
   if (ipBlocker && ipBlocker.isBlocked) {
     try {
-      const isBlocked = await ipBlocker.isBlocked(clientIp);
+      const isBlocked = await ipBlocker.isBlocked(normalizedIp);
       if (isBlocked) {
         // Registra tentativa de acesso bloqueado
-        await ipBlocker.recordBlockedAttempt(clientIp);
-        warn(`[SECURITY] Tentativa de acesso de IP bloqueado: ${clientIp} em ${req.path}`);
+        await ipBlocker.recordBlockedAttempt(normalizedIp);
+        warn(`[SECURITY] Tentativa de acesso de IP bloqueado: ${normalizedIp} em ${req.path}`);
         return res.status(403).json({ 
           error: 'ip_blocked',
           message: 'IP bloqueado'
@@ -296,6 +324,31 @@ app.use(async (req, res, next) => {
     } catch (e) {
       // Em caso de erro, permite acesso mas loga
       dbg(`[SECURITY] Erro ao verificar IP bloqueado:`, e.message);
+    }
+  }
+  
+  // Valida IP no AbuseIPDB para rotas não configuradas ou suspeitas
+  const knownRoutes = ['/health', '/webhook/whatsapp', '/esp32/validate', '/qr.png', '/qr/status', '/status', '/send', '/trigger-snapshot', '/tuya/', '/esp32/ota'];
+  const isKnownRoute = knownRoutes.some(route => req.path.startsWith(route));
+  
+  // Valida apenas se não for rota conhecida
+  if (!isKnownRoute && abuseIPDB && abuseIPDB.checkAndBlockIP) {
+    try {
+      // Verifica de forma assíncrona (não bloqueia a requisição imediatamente)
+      abuseIPDB.checkAndBlockIP(normalizedIp, `Tentativa de acesso a rota não configurada: ${req.method} ${req.path}`)
+        .then(result => {
+          if (result.blocked) {
+            log(`[ABUSEIPDB] IP ${normalizedIp} bloqueado automaticamente após verificação: ${result.reason}`);
+          } else if (result.abuseConfidence > 0) {
+            dbg(`[ABUSEIPDB] IP ${normalizedIp} verificado: ${result.abuseConfidence}% confiança, ${result.reports} report(s)`);
+          }
+        })
+        .catch(err => {
+          warn(`[ABUSEIPDB] Erro ao verificar/bloquear IP ${normalizedIp}:`, err.message);
+        });
+    } catch (abuseError) {
+      // Não bloqueia requisição em caso de erro na verificação
+      dbg(`[ABUSEIPDB] Erro ao iniciar verificação:`, abuseError.message);
     }
   }
   
@@ -883,6 +936,10 @@ try {
     authDataPath: AUTH_DATA_PATH,
     tuyaUid: TUYA_UID,
     recordingsDir: RECORDINGS_DIR,
+    minSnapshotIntervalMs: MIN_SNAPSHOT_INTERVAL_MS,
+    enableVideoRecording: ENABLE_VIDEO_RECORDING,
+    videoRecordDurationSec: VIDEO_RECORD_DURATION_SEC,
+    minVideoRecordIntervalMs: MIN_VIDEO_RECORD_INTERVAL_MS,
     strictRateLimit // Passa rate limit estrito para endpoints críticos
   });
   log(`[INIT] Módulo Routes inicializado com sucesso`);
@@ -916,6 +973,18 @@ try {
       } else {
         warn(`[INIT] setListVideosFunction não existe no módulo WhatsApp`);
       }
+    }
+    
+    // Configura função de trigger de snapshot
+    if (whatsapp.setTriggerSnapshotFunction) {
+      whatsapp.setTriggerSnapshotFunction(async (message, from) => {
+        // Cria um wrapper que chama triggerSnapshotForWS mas adapta para o formato esperado
+        const result = await triggerSnapshotForWS(message || '📸 Snapshot solicitado manualmente', from || 'whatsapp');
+        return result;
+      });
+      log(`[INIT] Função de trigger de snapshot configurada`);
+    } else {
+      warn(`[INIT] setTriggerSnapshotFunction não existe no módulo WhatsApp`);
     }
   } else {
     warn(`[INIT] whatsapp ou routesModule não disponível`);
@@ -1193,11 +1262,11 @@ async function triggerSnapshotForWS(message, clientIp) {
       return { ok: false, error: 'whatsapp not ready' };
     }
     
-    if (!camera || !cameraSnapshotUrl) {
+    if (!camera || !CAMERA_SNAPSHOT_URL) {
       return { ok: false, error: 'camera not configured' };
     }
     
-    const { base64, mimeType } = await camera.downloadSnapshot(cameraSnapshotUrl);
+    const { base64, mimeType } = await camera.downloadSnapshot(CAMERA_SNAPSHOT_URL);
     const numbers = readNumbersFromFile(NUMBERS_FILE);
     
     if (numbers.length === 0) {
@@ -1246,17 +1315,26 @@ async function triggerSnapshotForWS(message, clientIp) {
     const successCount = results.filter(r => r.success).length;
     
     // Inicia gravação de vídeo em background (não bloqueia)
-    if (camera && camera.buildRTSPUrl && camera.recordRTSPVideo) {
+    if (ENABLE_VIDEO_RECORDING && camera && camera.buildRTSPUrl && camera.recordRTSPVideo) {
       const rtspUrl = camera.buildRTSPUrl();
       if (rtspUrl) {
-        (async () => {
-          try {
-            const fakeMessage = { from: 'system', reply: async () => {} };
-            const result = await camera.recordRTSPVideo(rtspUrl, 15, fakeMessage);
+        // Verifica intervalo mínimo entre gravações
+        const now = Date.now();
+        const timeSinceLastVideo = now - lastVideoRecordTimeWS;
+        
+        if (timeSinceLastVideo < MIN_VIDEO_RECORD_INTERVAL_MS) {
+          const secondsRemaining = Math.ceil((MIN_VIDEO_RECORD_INTERVAL_MS - timeSinceLastVideo) / 1000);
+          log(`[WS-ESP32] Gravação de vídeo ignorada - cooldown ativo (${secondsRemaining}s restantes)`);
+        } else {
+          (async () => {
+            try {
+              const fakeMessage = { from: 'system', reply: async () => {} };
+              const result = await camera.recordRTSPVideo(rtspUrl, VIDEO_RECORD_DURATION_SEC, fakeMessage);
             if (result.success && result.filePath) {
               const finalVideoPath = await camera.compressVideoIfNeeded(result.filePath, fakeMessage);
               // Registra vídeo temporário usando a mesma lógica do routes
               // (registerTempVideo não é exportado, então fazemos manualmente)
+              let videoId = null;
               try {
                 const tempVideosDBPath = path.join(RECORDINGS_DIR, 'temp_videos', 'videos.json');
                 const VIDEO_EXPIRY_HOURS = 24;
@@ -1266,7 +1344,7 @@ async function triggerSnapshotForWS(message, clientIp) {
                   db = JSON.parse(fs.readFileSync(tempVideosDBPath, 'utf8'));
                 }
                 
-                const videoId = `video_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+                videoId = `video_${Date.now()}_${Math.random().toString(36).substring(7)}`;
                 const expiresAt = Date.now() + (VIDEO_EXPIRY_HOURS * 60 * 60 * 1000);
                 const phoneNumbers = validNumbers.map(n => normalizeBR(n.normalized));
                 
@@ -1286,14 +1364,70 @@ async function triggerSnapshotForWS(message, clientIp) {
                 
                 fs.writeFileSync(tempVideosDBPath, JSON.stringify(db, null, 2));
                 log(`[WS-ESP32] Vídeo registrado: ${videoId}`);
+                
+                // Atualiza timestamp APÓS gravação terminar
+                lastVideoRecordTimeWS = Date.now();
+                log(`[WS-ESP32] Timestamp de gravação atualizado: ${new Date(lastVideoRecordTimeWS).toISOString()}`);
+                
+                // Envia mensagem com botões para todos os números que receberam a imagem
+                if (videoId && validNumbers.length > 0) {
+                  log(`[WS-ESP32] Enviando notificação de vídeo para ${validNumbers.length} número(s)...`);
+                  
+                  // Aguarda um pouco para garantir que tudo está processado
+                  await new Promise(resolve => setTimeout(resolve, 1000));
+                  
+                  for (const { normalized, numberId } of validNumbers) {
+                    try {
+                      const to = numberId._serialized || normalized.replace(/^\+/, '') || normalized;
+                      
+                      if (whatsapp.sendInteractiveButtons) {
+                        // API Oficial - usa botões interativos
+                        log(`[WS-ESP32] Enviando botões interativos para ${to}...`);
+                        try {
+                          await whatsapp.sendInteractiveButtons(
+                            to,
+                            `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos da campainha.\n\nDeseja visualizar o vídeo? (Válido por 24 horas)`,
+                            [
+                              { id: `view_video_${videoId}`, title: '👁️ Ver Vídeo' },
+                              { id: 'skip_video', title: '⏭️ Pular' }
+                            ],
+                            'Campainha - Vídeo Temporário'
+                          );
+                          log(`[WS-ESP32] ✅ Botões interativos enviados com sucesso para ${to}`);
+                        } catch (buttonError) {
+                          err(`[WS-ESP32] ❌ Erro ao enviar botões interativos para ${to}:`, buttonError.message);
+                          // Tenta fallback para texto
+                          try {
+                            await whatsapp.sendTextMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
+                            log(`[WS-ESP32] ✅ Mensagem de texto enviada como fallback para ${to}`);
+                          } catch (textError) {
+                            err(`[WS-ESP32] ❌ Erro ao enviar mensagem de texto:`, textError.message);
+                          }
+                        }
+                      } else {
+                        warn(`[WS-ESP32] sendInteractiveButtons não disponível, enviando mensagem de texto`);
+                        await whatsapp.sendTextMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
+                        log(`[WS-ESP32] ✅ Mensagem de texto enviada para ${to}`);
+                      }
+                    } catch (sendError) {
+                      err(`[WS-ESP32] ❌ Erro ao enviar notificação de vídeo para ${normalized}:`, sendError.message);
+                    }
+                  }
+                }
               } catch (e) {
                 warn(`[WS-ESP32] Erro ao registrar vídeo:`, e.message);
               }
+            } else {
+              // Atualiza timestamp mesmo em caso de falha
+              lastVideoRecordTimeWS = Date.now();
             }
           } catch (e) {
             warn(`[WS-ESP32] Erro ao gravar vídeo:`, e.message);
+            // Atualiza timestamp mesmo em caso de erro
+            lastVideoRecordTimeWS = Date.now();
           }
         })();
+        }
       }
     }
     
@@ -1311,6 +1445,7 @@ async function triggerSnapshotForWS(message, clientIp) {
 
 // Inicializa WebSocket ESP32 (após servidor estar pronto)
 let wsESP32 = null;
+let lastVideoRecordTimeWS = 0; // Timestamp da última gravação via WebSocket
 
 // Inicia o servidor
 server = app.listen(PORT, () => { 
@@ -1345,6 +1480,37 @@ server = app.listen(PORT, () => {
   } catch (wsError) {
     warn(`[SERVER] Erro ao inicializar WebSocket ESP32:`, wsError.message);
   }
+  
+  // Middleware para rotas não configuradas (deve ser o último)
+  app.use((req, res) => {
+    const clientIp = getClientIp(req);
+    const normalizedIp = normalizeIp(clientIp);
+    
+    // Log de tentativa de acesso a rota não configurada
+    warn(`[ROUTE] Rota não configurada acessada: ${req.method} ${req.path} | ip=${normalizedIp}`);
+    
+    // Valida IP no AbuseIPDB para rotas não configuradas
+    if (abuseIPDB && abuseIPDB.checkAndBlockIP && normalizedIp && normalizedIp !== 'unknown' && normalizedIp !== 'localhost') {
+      // Verifica de forma assíncrona
+      abuseIPDB.checkAndBlockIP(normalizedIp, `Tentativa de acesso a rota não configurada: ${req.method} ${req.path}`)
+        .then(result => {
+          if (result.blocked) {
+            log(`[ABUSEIPDB] IP ${normalizedIp} bloqueado automaticamente: ${result.reason}`);
+          } else if (result.abuseConfidence > 0) {
+            dbg(`[ABUSEIPDB] IP ${normalizedIp} verificado: ${result.abuseConfidence}% confiança, ${result.reports} report(s)`);
+          }
+        })
+        .catch(err => {
+          warn(`[ABUSEIPDB] Erro ao verificar IP ${normalizedIp}:`, err.message);
+        });
+    }
+    
+    res.status(404).json({ 
+      error: 'not_found',
+      message: 'Rota não encontrada',
+      path: req.path
+    });
+  });
   
   log(`═══════════════════════════════════════════════════════════`);
 });

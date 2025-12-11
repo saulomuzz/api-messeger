@@ -25,6 +25,10 @@ const multer = require('multer');
  * @param {string} config.cameraSnapshotUrl - URL do snapshot da câmera
  * @param {string} config.authDataPath - Caminho dos dados de autenticação
  * @param {string} config.tuyaUid - UID padrão do Tuya
+ * @param {number} config.minSnapshotIntervalMs - Intervalo mínimo entre snapshots em ms
+ * @param {boolean} config.enableVideoRecording - Habilitar gravação de vídeo
+ * @param {number} config.videoRecordDurationSec - Duração do vídeo ao tocar campainha
+ * @param {number} config.minVideoRecordIntervalMs - Intervalo mínimo entre gravações em ms
  * @returns {Object} API do módulo Routes
  */
 function initRoutesModule({
@@ -42,10 +46,23 @@ function initRoutesModule({
   authDataPath,
   tuyaUid,
   recordingsDir,
+  minSnapshotIntervalMs = 20000,
+  enableVideoRecording = true,
+  videoRecordDurationSec = 15,
+  minVideoRecordIntervalMs = 60000,
   strictRateLimit
 }) {
   const { log, dbg, warn, err, nowISO } = logger;
   const { requestId, normalizeBR, readNumbersFromFile, getClientIp, isNumberAuthorized } = utils;
+  
+  // Sistema de bloqueio para evitar múltiplas gravações simultâneas
+  let isRecordingVideo = false;
+  let lastSnapshotTime = 0;
+  let lastVideoRecordTime = 0;
+  const MIN_SNAPSHOT_INTERVAL_MS = minSnapshotIntervalMs; // Configurável via .env
+  const ENABLE_VIDEO_RECORDING = enableVideoRecording; // Configurável via .env
+  const VIDEO_RECORD_DURATION_SEC = videoRecordDurationSec; // Configurável via .env
+  const MIN_VIDEO_RECORD_INTERVAL_MS = minVideoRecordIntervalMs; // Configurável via .env
   
   // Sistema de gerenciamento de vídeos temporários (24 horas)
   const TEMP_VIDEOS_DIR = path.join(recordingsDir || path.join(__dirname, '..', '..', 'recordings'), 'temp_videos');
@@ -554,6 +571,32 @@ function initRoutesModule({
     const rid = requestId();
     log(`[SNAPSHOT][${rid}] Requisição recebida do ESP32 | ip=${ip(req)}`);
     
+    // Verifica cooldown no servidor (proteção adicional)
+    const now = Date.now();
+    const timeSinceLastSnapshot = now - lastSnapshotTime;
+    if (timeSinceLastSnapshot < MIN_SNAPSHOT_INTERVAL_MS) {
+      const secondsRemaining = Math.ceil((MIN_SNAPSHOT_INTERVAL_MS - timeSinceLastSnapshot) / 1000);
+      warn(`[SNAPSHOT][${rid}] Cooldown ativo no servidor: ${secondsRemaining}s restantes`);
+      return res.status(429).json({ 
+        ok: false, 
+        error: 'cooldown_active', 
+        message: `Aguarde ${secondsRemaining} segundos antes de enviar novamente`,
+        retryAfter: secondsRemaining,
+        requestId: rid 
+      });
+    }
+    
+    // Verifica se já há uma gravação em andamento
+    if (isRecordingVideo) {
+      warn(`[SNAPSHOT][${rid}] Gravação de vídeo já em andamento, ignorando nova requisição`);
+      return res.status(429).json({ 
+        ok: false, 
+        error: 'recording_in_progress', 
+        message: 'Já existe uma gravação de vídeo em andamento. Aguarde a conclusão.',
+        requestId: rid 
+      });
+    }
+    
     if (!getIsReady()) {
       warn(`[SNAPSHOT][${rid}] WhatsApp não está pronto`);
       return res.status(503).json({ ok: false, error: 'whatsapp not ready', requestId: rid });
@@ -564,21 +607,22 @@ function initRoutesModule({
       return res.status(500).json({ ok: false, error: 'camera not configured', requestId: rid });
     }
     
+    // Atualiza timestamp do último snapshot
+    lastSnapshotTime = now;
+    
     try {
-      const { base64, mimeType } = await camera.downloadSnapshot(cameraSnapshotUrl);
-      
+      // Lê números primeiro (mais rápido que baixar snapshot)
       const numbers = readNumbersFromFile(numbersFile);
       if (numbers.length === 0) {
         warn(`[SNAPSHOT][${rid}] Nenhum número encontrado no arquivo`);
         return res.status(400).json({ ok: false, error: 'no numbers found in file', requestId: rid });
       }
       
-      const media = new MessageMedia(mimeType, base64, `snapshot_${Date.now()}.jpg`);
-      const message = req.body?.message || '📸 Snapshot da câmera';
-      
-      log(`[SNAPSHOT][${rid}] Resolvendo ${numbers.length} número(s) em paralelo...`);
-      const numberResolutions = await Promise.all(
-        numbers.map(async (rawPhone) => {
+      // Inicia download do snapshot e resolução de números em paralelo para otimizar tempo
+      log(`[SNAPSHOT][${rid}] Baixando snapshot e resolvendo ${numbers.length} número(s) em paralelo...`);
+      const [snapshotResult, ...numberResolutions] = await Promise.all([
+        camera.downloadSnapshot(cameraSnapshotUrl),
+        ...numbers.map(async (rawPhone) => {
           try {
             const normalized = normalizeBR(rawPhone);
             dbg(`[SNAPSHOT][${rid}] Resolvendo número: ${rawPhone} -> ${normalized}`);
@@ -590,7 +634,10 @@ function initRoutesModule({
             return { rawPhone, normalized: rawPhone, numberId: null, tried: [], error: String(e) };
           }
         })
-      );
+      ]);
+      
+      const { base64, mimeType } = snapshotResult;
+      const message = req.body?.message || '📸 Snapshot da câmera';
       
       const validNumbers = numberResolutions.filter(n => n.numberId !== null);
       const invalidNumbers = numberResolutions.filter(n => n.numberId === null);
@@ -617,20 +664,51 @@ function initRoutesModule({
       
       log(`[SNAPSHOT][${rid}] ${validNumbers.length} número(s) válido(s), ${invalidNumbers.length} inválido(s)`);
       
-      // Grava vídeo de 15 segundos em background (não bloqueia o envio da foto)
+      // Para API oficial: faz upload uma vez e reutiliza media ID (mais rápido)
+      let mediaId = null;
+      if (whatsapp && whatsapp.uploadMedia) {
+        try {
+          log(`[SNAPSHOT][${rid}] Fazendo upload de mídia uma vez para reutilizar...`);
+          mediaId = await whatsapp.uploadMedia(base64, mimeType);
+          log(`[SNAPSHOT][${rid}] Upload concluído, media ID: ${mediaId}`);
+        } catch (uploadError) {
+          warn(`[SNAPSHOT][${rid}] Erro no upload, usando método direto:`, uploadError.message);
+        }
+      }
+      
+      // Para whatsapp-web.js, usa MessageMedia
+      const media = client ? new MessageMedia(mimeType, base64, `snapshot_${Date.now()}.jpg`) : null;
+      
+      // Grava vídeo em background (não bloqueia o envio da foto)
       let videoIdPromise = Promise.resolve(null);
-      if (camera && camera.buildRTSPUrl && camera.recordRTSPVideo) {
+      if (ENABLE_VIDEO_RECORDING && camera && camera.buildRTSPUrl && camera.recordRTSPVideo) {
         const rtspUrl = camera.buildRTSPUrl();
         if (rtspUrl) {
-          log(`[SNAPSHOT][${rid}] Iniciando gravação de vídeo de 15 segundos em background...`);
-          videoIdPromise = (async () => {
-            try {
-              const fakeMessage = {
-                from: 'system',
-                reply: async () => {} // Não precisa responder durante gravação
-              };
-              
-              const result = await camera.recordRTSPVideo(rtspUrl, 15, fakeMessage);
+          // Verifica intervalo mínimo entre gravações
+          const now = Date.now();
+          const timeSinceLastVideo = now - lastVideoRecordTime;
+          
+          if (timeSinceLastVideo < MIN_VIDEO_RECORD_INTERVAL_MS) {
+            const secondsRemaining = Math.ceil((MIN_VIDEO_RECORD_INTERVAL_MS - timeSinceLastVideo) / 1000);
+            log(`[SNAPSHOT][${rid}] Gravação de vídeo ignorada - cooldown ativo (${secondsRemaining}s restantes)`);
+            } else {
+              // Verifica se já está gravando
+              if (isRecordingVideo) {
+                log(`[SNAPSHOT][${rid}] Gravação de vídeo ignorada - já existe uma gravação em andamento`);
+              } else {
+                // Marca que está gravando para evitar múltiplas gravações simultâneas
+                isRecordingVideo = true;
+                // NÃO atualiza lastVideoRecordTime aqui - será atualizado quando a gravação terminar
+                log(`[SNAPSHOT][${rid}] Iniciando gravação de vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos em background...`);
+                log(`[SNAPSHOT][${rid}] Última gravação: ${lastVideoRecordTime > 0 ? new Date(lastVideoRecordTime).toISOString() : 'nunca'} (${Math.floor((now - lastVideoRecordTime) / 1000)}s atrás)`);
+              videoIdPromise = (async () => {
+                try {
+                  const fakeMessage = {
+                    from: 'system',
+                    reply: async () => {} // Não precisa responder durante gravação
+                  };
+                  
+                  const result = await camera.recordRTSPVideo(rtspUrl, VIDEO_RECORD_DURATION_SEC, fakeMessage);
               
               if (result.success && result.filePath && fs.existsSync(result.filePath)) {
                 // Comprime vídeo apenas se necessário (função já verifica tamanho)
@@ -649,29 +727,62 @@ function initRoutesModule({
                 const phoneNumbers = validNumbers.map(n => n.normalized);
                 const videoId = registerTempVideo(finalVideoPath, phoneNumbers);
                 log(`[SNAPSHOT][${rid}] Vídeo gravado e registrado: ${videoId}`);
+                
+                // Atualiza timestamp APÓS gravação terminar (não quando inicia)
+                lastVideoRecordTime = Date.now();
+                log(`[SNAPSHOT][${rid}] Timestamp de gravação atualizado: ${new Date(lastVideoRecordTime).toISOString()}`);
+                
                 return videoId;
               } else {
                 warn(`[SNAPSHOT][${rid}] Falha na gravação de vídeo: ${result.error || 'Erro desconhecido'}`);
+                // Atualiza timestamp mesmo em caso de falha para evitar tentativas muito frequentes
+                lastVideoRecordTime = Date.now();
                 return null;
               }
             } catch (videoError) {
               err(`[SNAPSHOT][${rid}] Erro ao gravar vídeo:`, videoError.message);
+              // Atualiza timestamp mesmo em caso de erro para evitar tentativas muito frequentes
+              lastVideoRecordTime = Date.now();
               return null;
+            } finally {
+              // Libera o bloqueio de gravação após conclusão (sucesso ou erro)
+              // Timeout de segurança: libera após duração + margem mesmo se houver problema
+              const timeoutMs = (VIDEO_RECORD_DURATION_SEC + 10) * 1000;
+              setTimeout(() => {
+                if (isRecordingVideo) {
+                  warn(`[SNAPSHOT][${rid}] Timeout de segurança: liberando bloqueio de gravação`);
+                  isRecordingVideo = false;
+                }
+              }, timeoutMs);
+              
+              isRecordingVideo = false;
+              log(`[SNAPSHOT][${rid}] Bloqueio de gravação liberado`);
             }
           })();
+            }
+          }
+        } else {
+          // Se não há RTSP URL, não marca como gravando
+          log(`[SNAPSHOT][${rid}] RTSP URL não disponível, pulando gravação de vídeo`);
         }
+      } else if (!ENABLE_VIDEO_RECORDING) {
+        log(`[SNAPSHOT][${rid}] Gravação de vídeo desabilitada (ENABLE_VIDEO_RECORDING=false)`);
       }
       
+      // Envia para todos os números em paralelo para máxima velocidade
       const sendPromises = validNumbers.map(async ({ normalized, numberId, rawPhone }) => {
         try {
           const to = numberId._serialized;
           let r;
           
           // Verifica qual API está sendo usada
-          if (whatsapp.sendMediaFromBase64) {
-            // API Oficial do WhatsApp - usa base64 diretamente
+          if (whatsapp.sendMediaById && mediaId) {
+            // API Oficial do WhatsApp - usa media ID (mais rápido, upload já feito)
+            r = await whatsapp.sendMediaById(to, mediaId, 'image', message);
+          } else if (whatsapp.sendMediaFromBase64) {
+            // API Oficial do WhatsApp - fallback: usa base64 diretamente
             r = await whatsapp.sendMediaFromBase64(to, base64, mimeType, message);
-          } else if (client && client.sendMessage) {
+          } else if (client && client.sendMessage && media) {
             // whatsapp-web.js - usa MessageMedia
             r = await client.sendMessage(to, media, { caption: message });
           } else {
@@ -680,30 +791,50 @@ function initRoutesModule({
           
           log(`[SNAPSHOT OK][${rid}] Enviado para ${to} | id=${r.id?._serialized || r.messages?.[0]?.id || 'n/a'}`);
           
-          // Envia mensagem perguntando se quer ver o vídeo (aguarda gravação terminar)
+          // Envia mensagem perguntando se quer ver o vídeo (aguarda gravação terminar em background)
+          // Não bloqueia o retorno da requisição
           videoIdPromise.then(async (videoId) => {
-            if (!videoId) return; // Se não gravou vídeo, não envia mensagem
+            if (!videoId) {
+              log(`[SNAPSHOT][${rid}] Nenhum vídeo gravado, não enviando mensagem de vídeo para ${to}`);
+              return; // Se não gravou vídeo, não envia mensagem
+            }
+            
+            log(`[SNAPSHOT][${rid}] Vídeo gravado (ID: ${videoId}), enviando mensagem para ${to}...`);
             
             try {
               // Aguarda um pouco para garantir que tudo está processado
-              await new Promise(resolve => setTimeout(resolve, 500));
+              await new Promise(resolve => setTimeout(resolve, 1000));
               
               if (whatsapp.sendInteractiveButtons) {
                 // API Oficial - usa botões interativos
-                await whatsapp.sendInteractiveButtons(
-                  to,
-                  '🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de 15 segundos da campainha.\n\nDeseja visualizar o vídeo? (Válido por 24 horas)',
-                  [
-                    { id: `view_video_${videoId}`, title: '👁️ Ver Vídeo' },
-                    { id: 'skip_video', title: '⏭️ Pular' }
-                  ],
-                  'Campainha - Vídeo Temporário'
-                );
+                log(`[SNAPSHOT][${rid}] Enviando botões interativos para ${to}...`);
+                try {
+                  await whatsapp.sendInteractiveButtons(
+                    to,
+                    `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos da campainha.\n\nDeseja visualizar o vídeo? (Válido por 24 horas)`,
+                    [
+                      { id: `view_video_${videoId}`, title: '👁️ Ver Vídeo' },
+                      { id: 'skip_video', title: '⏭️ Pular' }
+                    ],
+                    'Campainha - Vídeo Temporário'
+                  );
+                  log(`[SNAPSHOT][${rid}] ✅ Botões interativos enviados com sucesso para ${to}`);
+                } catch (buttonError) {
+                  err(`[SNAPSHOT][${rid}] ❌ Erro ao enviar botões interativos:`, buttonError.message);
+                  // Tenta fallback para texto
+                  try {
+                    await whatsapp.sendTextMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
+                    log(`[SNAPSHOT][${rid}] ✅ Mensagem de texto enviada como fallback para ${to}`);
+                  } catch (textError) {
+                    err(`[SNAPSHOT][${rid}] ❌ Erro ao enviar mensagem de texto:`, textError.message);
+                  }
+                }
               } else if (client && client.sendMessage) {
                 // whatsapp-web.js - usa botões
+                log(`[SNAPSHOT][${rid}] Enviando botões (whatsapp-web.js) para ${to}...`);
                 try {
                   const buttonMessage = {
-                    text: '🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de 15 segundos da campainha.\n\nDeseja visualizar o vídeo? (Válido por 24 horas)',
+                    text: `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos da campainha.\n\nDeseja visualizar o vídeo? (Válido por 24 horas)`,
                     buttons: [
                       { body: `👁️ Ver Vídeo (${videoId.substring(0, 8)}...)` },
                       { body: '⏭️ Pular' }
@@ -711,18 +842,27 @@ function initRoutesModule({
                     footer: 'Campainha - Vídeo Temporário'
                   };
                   await client.sendMessage(to, buttonMessage);
+                  log(`[SNAPSHOT][${rid}] ✅ Botões enviados com sucesso para ${to}`);
                 } catch (buttonError) {
+                  warn(`[SNAPSHOT][${rid}] Erro ao enviar botões, usando fallback texto:`, buttonError.message);
                   // Fallback para texto
-                  await client.sendMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de 15 segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
+                  try {
+                    await client.sendMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
+                    log(`[SNAPSHOT][${rid}] ✅ Mensagem de texto enviada como fallback para ${to}`);
+                  } catch (textError) {
+                    err(`[SNAPSHOT][${rid}] ❌ Erro ao enviar mensagem de texto:`, textError.message);
+                  }
                 }
+              } else {
+                warn(`[SNAPSHOT][${rid}] Nenhum método de envio disponível para mensagem de vídeo`);
               }
-              
-              log(`[SNAPSHOT][${rid}] Mensagem de vídeo enviada para ${to} (videoId: ${videoId})`);
             } catch (videoMsgError) {
-              warn(`[SNAPSHOT][${rid}] Erro ao enviar mensagem de vídeo:`, videoMsgError.message);
+              err(`[SNAPSHOT][${rid}] ❌ Erro geral ao enviar mensagem de vídeo para ${to}:`, videoMsgError.message);
+              err(`[SNAPSHOT][${rid}] Stack:`, videoMsgError.stack);
             }
           }).catch((error) => {
-            warn(`[SNAPSHOT][${rid}] Erro ao processar vídeo:`, error.message);
+            err(`[SNAPSHOT][${rid}] ❌ Erro ao processar promise de vídeo:`, error.message);
+            err(`[SNAPSHOT][${rid}] Stack:`, error.stack);
           });
           
           return { phone: normalized, success: true, to, msgId: r.id?._serialized || r.messages?.[0]?.id || null };
@@ -732,6 +872,7 @@ function initRoutesModule({
         }
       });
       
+      // Aguarda todos os envios em paralelo (máxima velocidade)
       const sendResults = await Promise.all(sendPromises);
       
       const results = [
@@ -764,6 +905,11 @@ function initRoutesModule({
       return res.json(response);
     } catch (e) {
       err(`[SNAPSHOT][${rid}] ERRO`, e);
+      // Garante que o bloqueio seja liberado mesmo em caso de erro
+      if (isRecordingVideo) {
+        isRecordingVideo = false;
+        warn(`[SNAPSHOT][${rid}] Bloqueio de gravação liberado após erro`);
+      }
       return res.status(500).json({ ok: false, error: String(e), requestId: rid });
     }
   });
@@ -996,18 +1142,32 @@ function initRoutesModule({
   
   // Função helper para processar vídeos temporários (exportada para uso externo)
   function processTempVideo(videoId, phoneNumber) {
+    dbg(`[TEMP-VIDEOS] Processando vídeo ${videoId} para ${phoneNumber}`);
+    
+    // Limpa vídeos expirados antes de buscar
+    cleanupExpiredVideos();
+    
     const videoData = getTempVideo(videoId);
     
     if (!videoData) {
+      warn(`[TEMP-VIDEOS] Vídeo ${videoId} não encontrado no banco de dados`);
       return { success: false, error: 'Vídeo não encontrado ou expirado' };
     }
+    
+    dbg(`[TEMP-VIDEOS] Vídeo encontrado: ${videoId}, caminho: ${videoData.filePath}`);
     
     // Verifica se o número está autorizado para ver este vídeo
     // Agora permite que qualquer número autorizado veja qualquer vídeo
     const normalizedPhone = normalizeBR(phoneNumber);
+    dbg(`[TEMP-VIDEOS] Número normalizado: ${normalizedPhone}`);
+    
     const isAuthorized = videoData.phoneNumbers.some(p => {
       const normalized = normalizeBR(p);
-      return normalized === normalizedPhone || normalized.replace(/^\+/, '') === normalizedPhone.replace(/^\+/, '');
+      const matches = normalized === normalizedPhone || normalized.replace(/^\+/, '') === normalizedPhone.replace(/^\+/, '');
+      if (matches) {
+        dbg(`[TEMP-VIDEOS] Número autorizado na lista original: ${normalized}`);
+      }
+      return matches;
     });
     
     // Se não está na lista original, verifica se o número está autorizado no sistema
@@ -1017,18 +1177,30 @@ function initRoutesModule({
         // Se há números autorizados no sistema, verifica se o número atual está autorizado
         const isSystemAuthorized = isNumberAuthorized(phoneNumber, numbersFile || '', dbg);
         if (!isSystemAuthorized) {
+          warn(`[TEMP-VIDEOS] Número ${phoneNumber} não autorizado no sistema`);
           return { success: false, error: 'Você não está autorizado a ver este vídeo' };
         }
+        log(`[TEMP-VIDEOS] Número ${phoneNumber} autorizado no sistema (não estava na lista original)`);
       } else {
         // Se não há lista de autorizados, permite acesso
         log(`[TEMP-VIDEOS] Número ${phoneNumber} autorizado (sem lista de restrição)`);
       }
+    } else {
+      log(`[TEMP-VIDEOS] Número ${phoneNumber} autorizado na lista original do vídeo`);
     }
     
     // Verifica se o arquivo ainda existe
-    if (!fs.existsSync(videoData.filePath)) {
-      return { success: false, error: 'Arquivo de vídeo não encontrado' };
+    if (!videoData.filePath) {
+      warn(`[TEMP-VIDEOS] Vídeo ${videoId} não tem caminho de arquivo`);
+      return { success: false, error: 'Caminho do arquivo não encontrado' };
     }
+    
+    if (!fs.existsSync(videoData.filePath)) {
+      warn(`[TEMP-VIDEOS] Arquivo não existe: ${videoData.filePath}`);
+      return { success: false, error: 'Arquivo de vídeo não encontrado no servidor' };
+    }
+    
+    log(`[TEMP-VIDEOS] Vídeo ${videoId} autorizado e arquivo encontrado: ${videoData.filePath}`);
     
     return {
       success: true,
