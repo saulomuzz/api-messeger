@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin - Login</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            padding: 40px;
+            max-width: 400px;
+            width: 100%;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 14px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 500;
+            font-size: 14px;
+        }
+        
+        input {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        button {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        button:active {
+            transform: translateY(0);
+        }
+        
+        button:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .error {
+            background: #fee;
+            color: #c33;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            display: none;
+        }
+        
+        .success {
+            background: #efe;
+            color: #3c3;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            display: none;
+        }
+        
+        .step {
+            display: none;
+        }
+        
+        .step.active {
+            display: block;
+        }
+        
+        .code-display {
+            text-align: center;
+            font-size: 32px;
+            font-weight: bold;
+            color: #667eea;
+            letter-spacing: 8px;
+            margin: 20px 0;
+            padding: 20px;
+            background: #f5f5f5;
+            border-radius: 8px;
+        }
+        
+        .back-link {
+            text-align: center;
+            margin-top: 20px;
+        }
+        
+        .back-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 14px;
+        }
+        
+        .back-link a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 Admin</h1>
+        <p class="subtitle">Acesso administrativo ao sistema</p>
+        
+        <div id="error" class="error"></div>
+        <div id="success" class="success"></div>
+        
+        <!-- Step 1: Solicitar código -->
+        <div id="step1" class="step active">
+            <div class="form-group">
+                <label for="phone">Número de telefone</label>
+                <input type="tel" id="phone" placeholder="(11) 99999-9999" maxlength="15" required>
+            </div>
+            <button id="requestCodeBtn">Solicitar código</button>
+        </div>
+        
+        <!-- Step 2: Inserir código -->
+        <div id="step2" class="step">
+            <p style="margin-bottom: 20px; color: #666;">Digite o código enviado para seu WhatsApp:</p>
+            <div class="form-group">
+                <label for="code">Código de acesso</label>
+                <input type="text" id="code" placeholder="000000" maxlength="6" pattern="[0-9]{6}" required>
+            </div>
+            <button id="validateCodeBtn">Validar código</button>
+            <div class="back-link">
+                <a href="#" id="backLink">Voltar</a>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function showError(message) {
+            const errorDiv = document.getElementById('error');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+            document.getElementById('success').style.display = 'none';
+        }
+        
+        function showSuccess(message) {
+            const successDiv = document.getElementById('success');
+            successDiv.textContent = message;
+            successDiv.style.display = 'block';
+            document.getElementById('error').style.display = 'none';
+        }
+        
+        function hideMessages() {
+            document.getElementById('error').style.display = 'none';
+            document.getElementById('success').style.display = 'none';
+        }
+        
+        function showStep(step) {
+            document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+            document.getElementById(`step${step}`).classList.add('active');
+            hideMessages();
+        }
+        
+        function backToStep1() {
+            showStep(1);
+            document.getElementById('code').value = '';
+        }
+        
+        // Função para aplicar máscara de telefone brasileiro
+        function formatPhone(value) {
+            // Remove tudo que não é número
+            let numbers = value.replace(/\D/g, '');
+            
+            // Remove o prefixo +55 se existir
+            if (numbers.startsWith('55') && numbers.length > 10) {
+                numbers = numbers.substring(2);
+            }
+            
+            // Aplica máscara: (XX) XXXXX-XXXX
+            if (numbers.length <= 10) {
+                return numbers.replace(/(\d{2})(\d{4})(\d{0,4})/, function(match, p1, p2, p3) {
+                    if (p3) return `(${p1}) ${p2}-${p3}`;
+                    if (p2) return `(${p1}) ${p2}`;
+                    if (p1) return `(${p1}`;
+                    return numbers;
+                });
+            } else {
+                // Para números com DDD + 9 dígitos
+                return numbers.replace(/(\d{2})(\d{5})(\d{0,4})/, function(match, p1, p2, p3) {
+                    if (p3) return `(${p1}) ${p2}-${p3}`;
+                    if (p2) return `(${p1}) ${p2}`;
+                    if (p1) return `(${p1}`;
+                    return numbers;
+                });
+            }
+        }
+        
+        // Função para normalizar telefone (remove formatação e adiciona +55)
+        function normalizePhone(value) {
+            // Remove tudo que não é número
+            let numbers = value.replace(/\D/g, '');
+            
+            // Remove o prefixo +55 se existir
+            if (numbers.startsWith('55') && numbers.length > 10) {
+                numbers = numbers.substring(2);
+            }
+            
+            // Adiciona +55 se não tiver
+            if (numbers.length >= 10 && numbers.length <= 11) {
+                return `+55${numbers}`;
+            }
+            
+            return value; // Retorna original se não conseguir normalizar
+        }
+        
+        async function requestCode() {
+            const phoneInput = document.getElementById('phone');
+            const phone = normalizePhone(phoneInput.value.trim());
+            const btn = document.getElementById('requestCodeBtn');
+            
+            if (!phone || phone.length < 12) {
+                showError('Por favor, insira um número de telefone válido');
+                return;
+            }
+            
+            btn.disabled = true;
+            btn.textContent = 'Enviando...';
+            hideMessages();
+            
+            try {
+                const response = await fetch('/admin/request-code', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ phone })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showSuccess('Código enviado com sucesso! Verifique seu WhatsApp.');
+                    setTimeout(() => {
+                        showStep(2);
+                        document.getElementById('code').focus();
+                    }, 1000);
+                } else {
+                    showError(data.error || 'Erro ao enviar código');
+                }
+            } catch (error) {
+                showError('Erro ao solicitar código: ' + error.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Solicitar código';
+            }
+        }
+        
+        async function validateCode() {
+            const phoneInput = document.getElementById('phone');
+            const phone = normalizePhone(phoneInput.value.trim());
+            const code = document.getElementById('code').value.trim();
+            const btn = document.getElementById('validateCodeBtn');
+            
+            if (!code || code.length !== 6) {
+                showError('Por favor, insira um código válido (6 dígitos)');
+                return;
+            }
+            
+            btn.disabled = true;
+            btn.textContent = 'Validando...';
+            hideMessages();
+            
+            try {
+                const response = await fetch('/admin/validate-code', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ phone, code })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    showSuccess('Código válido! Redirecionando...');
+                    setTimeout(() => {
+                        window.location.href = '/admin/dashboard';
+                    }, 1000);
+                } else {
+                    showError(data.error || 'Código inválido');
+                }
+            } catch (error) {
+                showError('Erro ao validar código: ' + error.message);
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Validar código';
+            }
+        }
+        
+        // Event listeners (adicionados após DOM estar pronto)
+        document.addEventListener('DOMContentLoaded', () => {
+            const requestBtn = document.getElementById('requestCodeBtn');
+            const validateBtn = document.getElementById('validateCodeBtn');
+            const backLink = document.getElementById('backLink');
+            
+            if (requestBtn) {
+                requestBtn.addEventListener('click', requestCode);
+            }
+            if (validateBtn) {
+                validateBtn.addEventListener('click', validateCode);
+            }
+            if (backLink) {
+                backLink.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    backToStep1();
+                });
+            }
+            
+            // Enter key support e máscara de telefone
+            const phoneInput = document.getElementById('phone');
+            const codeInput = document.getElementById('code');
+            
+            if (phoneInput) {
+                // Aplica máscara enquanto digita
+                phoneInput.addEventListener('input', (e) => {
+                    const cursorPosition = e.target.selectionStart;
+                    const oldValue = e.target.value;
+                    const newValue = formatPhone(e.target.value);
+                    e.target.value = newValue;
+                    
+                    // Mantém a posição do cursor
+                    const diff = newValue.length - oldValue.length;
+                    e.target.setSelectionRange(cursorPosition + diff, cursorPosition + diff);
+                });
+                
+                // Remove +55 se o usuário colar
+                phoneInput.addEventListener('paste', (e) => {
+                    e.preventDefault();
+                    const pasted = (e.clipboardData || window.clipboardData).getData('text');
+                    const cleaned = formatPhone(pasted);
+                    e.target.value = cleaned;
+                });
+                
+                phoneInput.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') requestCode();
+                });
+            }
+            
+            if (codeInput) {
+                codeInput.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') validateCode();
+                });
+            }
+        });
+    </script>
+</body>
+</html>
+

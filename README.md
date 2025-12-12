@@ -116,14 +116,23 @@ NUMBERS_FILE=/opt/whatsapp-api/numbers.txt
 # AbuseIPDB - Validação e Bloqueio Automático de IPs
 ABUSEIPDB_ENABLED=true  # Habilitar validação AbuseIPDB (padrão: true)
 ABUSEIPDB_API_KEY=seu_api_key_aqui  # Chave da API do AbuseIPDB (obtenha em https://www.abuseipdb.com/)
+ABUSEIPDB_RECATEGORIZE_IPS=false  # Recategorizar todos os IPs na inicialização (padrão: false)
+                                    # Use "true" para forçar reanálise e corrigir classificações incorretas
 
 # Configurações de Listas AbuseIPDB
-ABUSEIPDB_WHITELIST_MAX_CONFIDENCE=50  # Confiança máxima para whitelist em % (padrão: 50)
-ABUSEIPDB_WHITELIST_TTL_DAYS=15  # Tempo de vida da whitelist em dias (padrão: 15)
-ABUSEIPDB_YELLOWLIST_MIN_CONFIDENCE=50  # Confiança mínima para yellowlist em % (padrão: 50)
-ABUSEIPDB_YELLOWLIST_MAX_CONFIDENCE=80  # Confiança máxima para yellowlist em % (padrão: 80)
-ABUSEIPDB_YELLOWLIST_TTL_DAYS=7  # Tempo de vida da yellowlist em dias (padrão: 7)
-ABUSEIPDB_BLACKLIST_MIN_CONFIDENCE=80  # Confiança mínima para blacklist em % (padrão: 80)
+# IMPORTANTE: Os intervalos devem ser contíguos sem sobreposição
+# WHITELIST: < WHITELIST_MAX_CONFIDENCE
+# YELLOWLIST: >= WHITELIST_MAX_CONFIDENCE && < YELLOWLIST_MAX_CONFIDENCE
+# BLACKLIST: >= BLACKLIST_MIN_CONFIDENCE
+ABUSEIPDB_WHITELIST_MAX_CONFIDENCE=30  # Confiança máxima para whitelist em % (padrão: 30)
+                                        # IPs com confiança < este valor vão para WHITELIST
+ABUSEIPDB_WHITELIST_TTL_DAYS=7  # Tempo de vida da whitelist em dias (padrão: 7)
+ABUSEIPDB_YELLOWLIST_MAX_CONFIDENCE=70  # Confiança máxima para yellowlist em % (padrão: 70)
+                                         # IPs com confiança >= WHITELIST_MAX_CONFIDENCE e < este valor vão para YELLOWLIST
+                                         # NOTA: YELLOWLIST_MIN_CONFIDENCE não é mais necessário (usa WHITELIST_MAX_CONFIDENCE)
+ABUSEIPDB_YELLOWLIST_TTL_DAYS=3  # Tempo de vida da yellowlist em dias (padrão: 3)
+ABUSEIPDB_BLACKLIST_MIN_CONFIDENCE=70  # Confiança mínima para blacklist em % (padrão: 70)
+                                        # IPs com confiança >= este valor vão para BLACKLIST (permanente)
 ```
 
 ## Estrutura do Projeto

@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin - Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        
+        .header-content {
+            max-width: 1400px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        h1 {
+            font-size: 24px;
+        }
+        
+        .logout-btn {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            text-decoration: none;
+            transition: background 0.3s;
+        }
+        
+        .logout-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 30px auto;
+            padding: 0 20px;
+        }
+        
+        /* Tabs */
+        .tabs {
+            display: flex;
+            background: white;
+            border-radius: 12px 12px 0 0;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+            overflow-x: auto;
+        }
+        
+        .tab {
+            padding: 16px 24px;
+            cursor: pointer;
+            border: none;
+            background: transparent;
+            color: #666;
+            font-size: 15px;
+            font-weight: 500;
+            transition: all 0.3s;
+            border-bottom: 3px solid transparent;
+            white-space: nowrap;
+        }
+        
+        .tab:hover {
+            background: #f8f9fa;
+            color: #667eea;
+        }
+        
+        .tab.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+            background: #f8f9fa;
+        }
+        
+        .tab-content {
+            display: none;
+            background: white;
+            padding: 30px;
+            border-radius: 0 0 12px 12px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+            min-height: 400px;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        /* Stats Grid */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+            color: white;
+            transition: transform 0.3s;
+        }
+        
+        .stat-card:hover {
+            transform: translateY(-4px);
+        }
+        
+        .stat-card.blocked { background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); }
+        .stat-card.whitelist { background: linear-gradient(135deg, #27ae60 0%, #229954 100%); }
+        .stat-card.yellowlist { background: linear-gradient(135deg, #f39c12 0%, #e67e22 100%); }
+        .stat-card.migrations { background: linear-gradient(135deg, #3498db 0%, #2980b9 100%); }
+        .stat-card.messages-sent { background: linear-gradient(135deg, #9b59b6 0%, #8e44ad 100%); }
+        .stat-card.messages-received { background: linear-gradient(135deg, #1abc9c 0%, #16a085 100%); }
+        .stat-card.devices { background: linear-gradient(135deg, #34495e 0%, #2c3e50 100%); }
+        .stat-card.routes { background: linear-gradient(135deg, #e67e22 0%, #d35400 100%); }
+        
+        .stat-label {
+            font-size: 14px;
+            opacity: 0.9;
+            margin-bottom: 8px;
+        }
+        
+        .stat-value {
+            font-size: 36px;
+            font-weight: bold;
+        }
+        
+        .stat-subtitle {
+            font-size: 12px;
+            opacity: 0.8;
+            margin-top: 4px;
+        }
+        
+        /* Charts Section */
+        .charts-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .chart-card {
+            background: white;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+        
+        .chart-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 20px;
+            color: #333;
+        }
+        
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+        }
+        
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+            color: #666;
+            font-size: 14px;
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+            padding-right: 24px;
+        }
+        
+        th:hover {
+            background: #e9ecef;
+        }
+        
+        th.sortable::after {
+            content: ' ↕';
+            position: absolute;
+            right: 8px;
+            opacity: 0.5;
+        }
+        
+        th.sort-asc::after {
+            content: ' ↑';
+            opacity: 1;
+        }
+        
+        th.sort-desc::after {
+            content: ' ↓';
+            opacity: 1;
+        }
+        
+        tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .badge.blacklist { background: #fee; color: #c33; }
+        .badge.whitelist { background: #efe; color: #3c3; }
+        .badge.yellowlist { background: #ffe; color: #c93; }
+        .badge.websocket { background: #e3f2fd; color: #1976d2; }
+        .badge.http { background: #f3e5f5; color: #7b1fa2; }
+        
+        .btn-action {
+            background: none;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 4px 8px;
+            margin: 0 2px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: all 0.2s;
+        }
+        
+        .btn-action:hover {
+            background: #f0f0f0;
+            transform: scale(1.1);
+        }
+        
+        .btn-action:active {
+            transform: scale(0.95);
+        }
+        
+        .btn-unblock { border-color: #28a745; color: #28a745; }
+        .btn-whitelist { border-color: #28a745; color: #28a745; }
+        .btn-yellowlist { border-color: #ffc107; color: #ffc107; }
+        .btn-block { border-color: #dc3545; color: #dc3545; }
+        .btn-remove { border-color: #6c757d; color: #6c757d; }
+        
+        /* Server Metrics Styles */
+        .server-metrics {
+            padding: 20px;
+        }
+        
+        .metric-section {
+            margin-bottom: 40px;
+            background: white;
+            padding: 24px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+        
+        .metric-section h3 {
+            margin: 0 0 20px 0;
+            color: #333;
+            font-size: 20px;
+        }
+        
+        .cpu-metrics, .memory-metrics, .disk-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+        }
+        
+        .cpu-card, .memory-card, .disk-card {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #e0e0e0;
+        }
+        
+        .cpu-label, .memory-label, .disk-label {
+            font-size: 14px;
+            color: #666;
+            margin-bottom: 8px;
+        }
+        
+        .cpu-value, .memory-value, .disk-value {
+            font-size: 24px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 12px;
+        }
+        
+        .cpu-bar, .memory-bar, .disk-bar {
+            height: 20px;
+            background: #e0e0e0;
+            border-radius: 10px;
+            overflow: hidden;
+            position: relative;
+        }
+        
+        .cpu-bar-fill, .memory-bar-fill, .disk-bar-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.3s ease;
+            border-radius: 10px;
+        }
+        
+        .cpu-bar-fill {
+            background: linear-gradient(90deg, #f39c12 0%, #e67e22 100%);
+        }
+        
+        .memory-bar-fill, .disk-bar-fill {
+            background: linear-gradient(90deg, #e74c3c 0%, #c0392b 100%);
+        }
+        
+        .memory-bar-fill.available, .disk-bar-fill.available {
+            background: linear-gradient(90deg, #27ae60 0%, #229954 100%);
+        }
+        
+        .system-info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 16px;
+        }
+        
+        .info-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px;
+            background: #f8f9fa;
+            border-radius: 6px;
+        }
+        
+        .info-item .info-label {
+            font-weight: 600;
+            color: #666;
+        }
+        
+        .info-item .info-value {
+            color: #333;
+            font-family: monospace;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        
+        .pagination {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 20px;
+        }
+        
+        .pagination button {
+            padding: 8px 16px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        
+        .pagination button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        
+        .status-online { background: #27ae60; }
+        .status-offline { background: #e74c3c; }
+        
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        .info-card {
+            background: #f8f9fa;
+            padding: 16px;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .info-label {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 4px;
+        }
+        
+        .info-value {
+            font-size: 16px;
+            font-weight: 600;
+            color: #333;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-content">
+            <h1>🛡️ Dashboard Administrativo</h1>
+            <button class="logout-btn" onclick="logout()">Sair</button>
+        </div>
+    </div>
+    
+    <div class="container">
+        <!-- Tabs -->
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('overview', event)">📊 Visão Geral</button>
+            <button class="tab" onclick="switchTab('ips', event)">🚫 IPs Bloqueados</button>
+            <button class="tab" onclick="switchTab('whitelist', event)">✅ Whitelist</button>
+            <button class="tab" onclick="switchTab('yellowlist', event)">⚠️ Yellowlist</button>
+            <button class="tab" onclick="switchTab('devices', event)">📱 Dispositivos</button>
+            <button class="tab" onclick="switchTab('migrations', event)">🔄 Migrações</button>
+            <button class="tab" onclick="switchTab('server', event)">🖥️ Servidor</button>
+        </div>
+        
+        <!-- Tab: Visão Geral -->
+        <div id="tab-overview" class="tab-content active">
+            <div class="stats-grid" id="overviewStats">
+                <!-- Será preenchido via JavaScript -->
+            </div>
+            
+            <div class="charts-grid">
+                <div class="chart-card">
+                    <div class="chart-title">📈 Mensagens (Últimas 24h)</div>
+                    <div id="messagesChart">
+                        <div class="loading">Carregando gráfico...</div>
+                    </div>
+                </div>
+                
+                <div class="chart-card">
+                    <div class="chart-title">🌐 Top 5 Rotas</div>
+                    <div id="routesChart">
+                        <div class="loading">Carregando rotas...</div>
+                    </div>
+                </div>
+                
+                <div class="chart-card">
+                    <div class="chart-title">🔝 Top 5 IPs</div>
+                    <div id="topIPsChart">
+                        <div class="loading">Carregando IPs...</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="info-grid" id="systemInfo">
+                <!-- Informações do sistema -->
+            </div>
+        </div>
+        
+        <!-- Tab: IPs Bloqueados -->
+        <div id="tab-ips" class="tab-content">
+            <div id="blockedTable">
+                <div class="loading">Carregando...</div>
+            </div>
+        </div>
+        
+        <!-- Tab: Whitelist -->
+        <div id="tab-whitelist" class="tab-content">
+            <div id="whitelistTable">
+                <div class="loading">Carregando...</div>
+            </div>
+        </div>
+        
+        <!-- Tab: Yellowlist -->
+        <div id="tab-yellowlist" class="tab-content">
+            <div id="yellowlistTable">
+                <div class="loading">Carregando...</div>
+            </div>
+        </div>
+        
+        <!-- Tab: Dispositivos -->
+        <div id="tab-devices" class="tab-content">
+            <div id="devicesTable">
+                <div class="loading">Carregando...</div>
+            </div>
+        </div>
+        
+        <!-- Tab: Migrações -->
+        <div id="tab-migrations" class="tab-content">
+            <div id="migrationsTable">
+                <div class="loading">Carregando...</div>
+            </div>
+        </div>
+        
+        <!-- Tab: Servidor -->
+        <div id="tab-server" class="tab-content">
+            <div class="server-metrics">
+                <div class="metric-section">
+                    <h3>💻 Processamento (CPU)</h3>
+                    <div class="cpu-metrics">
+                        <div class="cpu-card">
+                            <div class="cpu-label">Último minuto</div>
+                            <div class="cpu-value" id="cpu1min">-</div>
+                            <div class="cpu-bar">
+                                <div class="cpu-bar-fill" id="cpu1minBar" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        <div class="cpu-card">
+                            <div class="cpu-label">Últimos 5 minutos</div>
+                            <div class="cpu-value" id="cpu5min">-</div>
+                            <div class="cpu-bar">
+                                <div class="cpu-bar-fill" id="cpu5minBar" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        <div class="cpu-card">
+                            <div class="cpu-label">Últimos 15 minutos</div>
+                            <div class="cpu-value" id="cpu15min">-</div>
+                            <div class="cpu-bar">
+                                <div class="cpu-bar-fill" id="cpu15minBar" style="width: 0%"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="metric-section">
+                    <h3>💾 Memória</h3>
+                    <div class="memory-metrics">
+                        <div class="memory-card">
+                            <div class="memory-label">Total</div>
+                            <div class="memory-value" id="memTotal">-</div>
+                        </div>
+                        <div class="memory-card">
+                            <div class="memory-label">Em Uso</div>
+                            <div class="memory-value" id="memUsed">-</div>
+                            <div class="memory-bar">
+                                <div class="memory-bar-fill" id="memUsedBar" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        <div class="memory-card">
+                            <div class="memory-label">Disponível</div>
+                            <div class="memory-value" id="memFree">-</div>
+                            <div class="memory-bar">
+                                <div class="memory-bar-fill available" id="memFreeBar" style="width: 0%"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="metric-section">
+                    <h3>💿 Disco</h3>
+                    <div class="disk-metrics">
+                        <div class="disk-card">
+                            <div class="disk-label">Total</div>
+                            <div class="disk-value" id="diskTotal">-</div>
+                        </div>
+                        <div class="disk-card">
+                            <div class="disk-label">Em Uso</div>
+                            <div class="disk-value" id="diskUsed">-</div>
+                            <div class="disk-bar">
+                                <div class="disk-bar-fill" id="diskUsedBar" style="width: 0%"></div>
+                            </div>
+                        </div>
+                        <div class="disk-card">
+                            <div class="disk-label">Disponível</div>
+                            <div class="disk-value" id="diskFree">-</div>
+                            <div class="disk-bar">
+                                <div class="disk-bar-fill available" id="diskFreeBar" style="width: 0%"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="metric-section">
+                    <h3>📊 Informações do Sistema</h3>
+                    <div class="system-info-grid" id="systemInfoGrid">
+                        <div class="info-item">
+                            <span class="info-label">Sistema Operacional:</span>
+                            <span class="info-value" id="sysOS">-</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Arquitetura:</span>
+                            <span class="info-value" id="sysArch">-</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Uptime:</span>
+                            <span class="info-value" id="sysUptime">-</span>
+                        </div>
+                        <div class="info-item">
+                            <span class="info-label">Plataforma:</span>
+                            <span class="info-value" id="sysPlatform">-</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="/admin/static/js/dashboard.js"></script>
+</body>
+</html>
+

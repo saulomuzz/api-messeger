@@ -42,10 +42,21 @@ function initWebSocketESP32Module({
   const wss = new WebSocket.Server({ 
     server,
     path: '/ws/esp32',
-    perMessageDeflate: false // Desabilita compressão para reduzir latência
+    perMessageDeflate: false, // Desabilita compressão para reduzir latência
+    verifyClient: (info) => {
+      // Log da tentativa de conexão
+      const rawIp = info.origin || info.req?.socket?.remoteAddress || 'unknown';
+      const normalizedIp = normalizeIp(rawIp);
+      log(`[WS-ESP32] 🔌 Tentativa de conexão WebSocket de ${normalizedIp} (raw: ${rawIp})`);
+      
+      // Permite a conexão - validação será feita no handler de conexão
+      return true;
+    }
   });
   
-  log(`[WS-ESP32] Servidor WebSocket inicializado em /ws/esp32`);
+  log(`[WS-ESP32] ✅ Servidor WebSocket inicializado em /ws/esp32`);
+  log(`[WS-ESP32] ✅ Server disponível: ${server ? 'sim' : 'não'}`);
+  log(`[WS-ESP32] ✅ Path: /ws/esp32`);
   
   // Normaliza IP (remove prefixo IPv6 mapeado para IPv4)
   function normalizeIp(ipAddress) {
@@ -182,6 +193,10 @@ function initWebSocketESP32Module({
       switch (type) {
         case 'ping':
           connection.lastPing = Date.now();
+          // Atualiza estatística de dispositivo
+          if (global.statisticsModel) {
+            global.statisticsModel.updateDeviceLastSeen(connection.ip);
+          }
           sendToClient(ws, 'pong');
           break;
           
@@ -252,10 +267,14 @@ function initWebSocketESP32Module({
   
   // Gerencia conexões
   wss.on('connection', (ws, req) => {
+    log(`[WS-ESP32] 🔌 Nova tentativa de conexão WebSocket recebida`);
     const validation = validateClient(ws, req);
     
+    log(`[WS-ESP32] 🔍 Validação: authorized=${validation.authorized}, reason=${validation.reason}, ip=${validation.ip}`);
+    
     if (!validation.authorized) {
-      warn(`[WS-ESP32] Conexão rejeitada: ${validation.reason}`);
+      warn(`[WS-ESP32] ❌ Conexão rejeitada: ${validation.reason}`);
+      warn(`[WS-ESP32] ❌ IP: ${validation.ip}`);
       ws.close(1008, validation.reason);
       return;
     }
@@ -272,6 +291,13 @@ function initWebSocketESP32Module({
     activeConnections.set(validation.ip, connection);
     log(`[WS-ESP32] Nova conexão de ${validation.ip} (total: ${activeConnections.size})`);
     
+    // Adiciona dispositivo nas estatísticas
+    if (global.statisticsModel) {
+      global.statisticsModel.addDevice(validation.ip, 'websocket', {
+        connectedAt: connection.connectedAt
+      });
+    }
+    
     // Envia mensagem de boas-vindas
     sendToClient(ws, 'connected', { 
       message: 'Conectado ao servidor WebSocket',
@@ -286,6 +312,10 @@ function initWebSocketESP32Module({
     // Gerencia desconexão
     ws.on('close', (code, reason) => {
       activeConnections.delete(validation.ip);
+      // Remove dispositivo das estatísticas
+      if (global.statisticsModel) {
+        global.statisticsModel.removeDevice(validation.ip);
+      }
       log(`[WS-ESP32] Conexão fechada: ${validation.ip} (code: ${code}, reason: ${reason.toString()})`);
     });
     
@@ -339,6 +369,18 @@ function initWebSocketESP32Module({
           lastPing: c.lastPing
         }))
       };
+    },
+    
+    // Retorna lista de dispositivos conectados
+    getConnectedDevices: () => {
+      return Array.from(activeConnections.values())
+        .filter(c => c.authenticated)
+        .map(c => ({
+          ip: c.ip,
+          connectedAt: c.connectedAt,
+          lastPing: c.lastPing,
+          connectionType: 'websocket'
+        }));
     },
     
     // Fecha todas as conexões

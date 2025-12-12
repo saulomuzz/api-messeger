@@ -55,46 +55,125 @@ function initWhatsAppOfficialModule({
   let triggerSnapshotFunction = null; // Função para disparar snapshot manualmente
   
   /**
-   * Envia mensagem de texto
+   * Divide mensagem longa em partes menores (limite do WhatsApp: 4096 caracteres)
+   * @param {string} message - Mensagem completa
+   * @param {number} maxLength - Tamanho máximo por parte (padrão: 4000 para margem de segurança)
+   * @returns {Array<string>} Array com partes da mensagem
+   */
+  function splitLongMessage(message, maxLength = 4000) {
+    if (message.length <= maxLength) {
+      return [message];
+    }
+    
+    const parts = [];
+    let currentPart = '';
+    const lines = message.split('\n');
+    
+    for (const line of lines) {
+      // Se a linha sozinha excede o limite, quebra ela também
+      if (line.length > maxLength) {
+        // Se já tem conteúdo na parte atual, salva ela primeiro
+        if (currentPart) {
+          parts.push(currentPart.trim());
+          currentPart = '';
+        }
+        // Quebra a linha longa em pedaços
+        for (let i = 0; i < line.length; i += maxLength) {
+          parts.push(line.substring(i, i + maxLength));
+        }
+      } else if ((currentPart + line + '\n').length > maxLength) {
+        // Se adicionar esta linha excederia o limite, salva a parte atual e começa nova
+        if (currentPart) {
+          parts.push(currentPart.trim());
+        }
+        currentPart = line + '\n';
+      } else {
+        currentPart += line + '\n';
+      }
+    }
+    
+    // Adiciona a última parte se houver
+    if (currentPart.trim()) {
+      parts.push(currentPart.trim());
+    }
+    
+    return parts;
+  }
+  
+  /**
+   * Envia mensagem de texto (divide automaticamente se muito longa)
    */
   async function sendTextMessage(to, message) {
     try {
       const normalized = normalizeBR(to);
       const toNumber = normalized.replace(/^\+/, ''); // Remove o + para a API
       
-      log(`[WHATSAPP-API] Enviando mensagem para ${toNumber}...`);
+      // Divide mensagem se muito longa
+      const parts = splitLongMessage(message);
       
-      const response = await axios.post(
-        `${BASE_URL}/${PHONE_NUMBER_ID}/messages`,
-        {
-          messaging_product: 'whatsapp',
-          recipient_type: 'individual',
-          to: toNumber,
-          type: 'text',
-          text: {
-            preview_url: false,
-            body: message
+      if (parts.length > 1) {
+        log(`[WHATSAPP-API] Mensagem muito longa (${message.length} chars), dividindo em ${parts.length} parte(s) para ${toNumber}...`);
+      }
+      
+      // Envia cada parte
+      const results = [];
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const partNumber = parts.length > 1 ? ` (${i + 1}/${parts.length})` : '';
+        
+        log(`[WHATSAPP-API] Enviando mensagem${partNumber} para ${toNumber}...`);
+        
+        const response = await axios.post(
+          `${BASE_URL}/${PHONE_NUMBER_ID}/messages`,
+          {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            to: toNumber,
+            type: 'text',
+            text: {
+              preview_url: false,
+              body: part
+            }
+          },
+          {
+            headers: {
+              'Authorization': `Bearer ${ACCESS_TOKEN}`,
+              'Content-Type': 'application/json'
+            }
           }
-        },
-        {
-          headers: {
-            'Authorization': `Bearer ${ACCESS_TOKEN}`,
-            'Content-Type': 'application/json'
-          }
+        );
+        
+        const messageId = response.data.messages?.[0]?.id || 'unknown';
+        log(`[WHATSAPP-API] ✅ Mensagem${partNumber} enviada com sucesso para ${toNumber}: ${messageId}`);
+        
+        // Incrementa estatística de mensagem enviada
+        if (global.statisticsModel) {
+          global.statisticsModel.incrementSent();
         }
-      );
+        
+        results.push({
+          id: {
+            _serialized: messageId
+          },
+          ...response.data
+        });
+        
+        // Pequeno delay entre partes para não sobrecarregar
+        if (i < parts.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
       
-      const messageId = response.data.messages?.[0]?.id || 'unknown';
-      log(`[WHATSAPP-API] ✅ Mensagem enviada com sucesso para ${toNumber}: ${messageId}`);
-      
-      // Retorna formato compatível com whatsapp-web.js
-      return {
-        id: {
-          _serialized: messageId
-        },
-        ...response.data
+      // Retorna o primeiro resultado (compatibilidade)
+      return results[0] || {
+        id: { _serialized: 'unknown' }
       };
     } catch (error) {
+      // Incrementa estatística de mensagem falhada
+      if (global.statisticsModel) {
+        global.statisticsModel.incrementFailed();
+      }
+      
       // Log detalhado do erro
       if (error.response?.data) {
         const errorData = error.response.data;
@@ -448,6 +527,11 @@ function initWhatsAppOfficialModule({
             
             log(`[WHATSAPP-API] Processando mensagem tipo: ${messageType} de ${from} (ID: ${messageId})`);
             dbg(`[WHATSAPP-API] Mensagem completa:`, JSON.stringify(message, null, 2));
+            
+            // Incrementa estatística de mensagem recebida
+            if (global.statisticsModel) {
+              global.statisticsModel.incrementReceived();
+            }
             
             // Processa mensagens interativas (botões e listas)
             if (messageType === 'interactive') {
@@ -1703,32 +1787,94 @@ function initWhatsAppOfficialModule({
       log(`[WHATSAPP-API] Opção "IPs Bloqueados" selecionada por ${from}`);
       try {
         if (ipBlocker && ipBlocker.listBlockedIPs) {
-          await sendTextMessage(from, '⏳ Buscando IPs bloqueados...');
-          const blockedIPs = await ipBlocker.listBlockedIPs(50, 0); // Limite de 50 IPs
-          const total = await ipBlocker.countBlockedIPs();
+          await sendTextMessage(from, '⏳ Buscando informações de IPs...');
           
-          if (blockedIPs.length === 0) {
-            await sendTextMessage(from, '✅ *IPs Bloqueados*\n\nNenhum IP bloqueado no momento.');
-          } else {
-            let message = `🛡️ *IPs Bloqueados*\n\n`;
-            message += `*Total:* ${total} IP(s) bloqueado(s)\n\n`;
-            message += `*Últimos ${blockedIPs.length} bloqueios:*\n\n`;
-            
+          // Busca todas as listas em paralelo (limita a 10 IPs por lista para evitar mensagem muito longa)
+          const [blockedIPs, whitelistIPs, yellowlistIPs, totalBlocked, totalWhitelist, totalYellowlist] = await Promise.all([
+            ipBlocker.listBlockedIPs(10, 0),
+            ipBlocker.listWhitelistIPs ? ipBlocker.listWhitelistIPs(10, 0) : Promise.resolve([]),
+            ipBlocker.listYellowlistIPs ? ipBlocker.listYellowlistIPs(10, 0) : Promise.resolve([]),
+            ipBlocker.countBlockedIPs(),
+            ipBlocker.countWhitelistIPs ? ipBlocker.countWhitelistIPs() : Promise.resolve(0),
+            ipBlocker.countYellowlistIPs ? ipBlocker.countYellowlistIPs() : Promise.resolve(0)
+          ]);
+          
+          // Formata data de forma mais curta
+          const formatShortDate = (timestamp) => {
+            if (!timestamp) return 'Nunca';
+            const date = new Date(timestamp * 1000);
+            return date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+          };
+          
+          // Envia resumo primeiro
+          const summary = `🛡️ *Status de IPs*\n\n` +
+            `📊 *Resumo:*\n` +
+            `🔴 Bloqueados: ${totalBlocked}\n` +
+            `🟡 Monitorados: ${totalYellowlist}\n` +
+            `🟢 Permitidos: ${totalWhitelist}\n` +
+            `📈 *Total:* ${totalBlocked + totalYellowlist + totalWhitelist} IP(s)\n\n` +
+            `💡 Mostrando últimos 10 IPs de cada lista.`;
+          
+          await sendTextMessage(from, summary);
+          
+          // Blacklist (Bloqueados)
+          if (blockedIPs.length > 0) {
+            let blacklistMsg = `🔴 *Blacklist (${totalBlocked} bloqueado${totalBlocked !== 1 ? 's' : ''})*\n\n`;
             blockedIPs.forEach((ipData, index) => {
-              const blockedDate = new Date(ipData.blocked_at * 1000).toLocaleString('pt-BR');
-              const lastSeen = ipData.last_seen ? new Date(ipData.last_seen * 1000).toLocaleString('pt-BR') : 'Nunca';
-              message += `${index + 1}. *${ipData.ip}*\n`;
-              message += `   📅 Bloqueado: ${blockedDate}\n`;
-              message += `   👁️ Última tentativa: ${lastSeen}\n`;
-              message += `   🔢 Tentativas: ${ipData.request_count || 0}\n`;
-              message += `   📝 Motivo: ${ipData.reason || 'Não especificado'}\n\n`;
+              const blockedDate = formatShortDate(ipData.blocked_at);
+              blacklistMsg += `${index + 1}. *${ipData.ip}*\n`;
+              blacklistMsg += `   📅 ${blockedDate} | 🔢 ${ipData.request_count || 0} tentativa${(ipData.request_count || 0) !== 1 ? 's' : ''}\n`;
+              // Trunca motivo se muito longo
+              const reason = (ipData.reason || 'Não especificado').substring(0, 50);
+              if ((ipData.reason || '').length > 50) {
+                blacklistMsg += `   📝 ${reason}...\n\n`;
+              } else {
+                blacklistMsg += `   📝 ${reason}\n\n`;
+              }
             });
-            
-            if (total > blockedIPs.length) {
-              message += `\n💡 Mostrando ${blockedIPs.length} de ${total} IP(s) bloqueado(s).`;
+            if (totalBlocked > blockedIPs.length) {
+              blacklistMsg += `💡 +${totalBlocked - blockedIPs.length} outro(s) bloqueado(s).`;
             }
-            
-            await sendTextMessage(from, message);
+            await sendTextMessage(from, blacklistMsg);
+          }
+          
+          // Yellowlist (Monitorados)
+          if (yellowlistIPs.length > 0) {
+            let yellowlistMsg = `🟡 *Yellowlist (${totalYellowlist} monitorado${totalYellowlist !== 1 ? 's' : ''})*\n\n`;
+            yellowlistIPs.forEach((ipData, index) => {
+              const expiresDate = formatShortDate(ipData.expires_at);
+              const lastSeenDate = ipData.last_seen ? formatShortDate(ipData.last_seen) : 'Nunca';
+              yellowlistMsg += `${index + 1}. *${ipData.ip}*\n`;
+              yellowlistMsg += `   ⚠️ ${ipData.abuse_confidence}% | 📊 ${ipData.reports || 0} report${(ipData.reports || 0) !== 1 ? 's' : ''}\n`;
+              yellowlistMsg += `   🔢 ${ipData.request_count || 0} tentativa${(ipData.request_count || 0) !== 1 ? 's' : ''} | 👁️ Última: ${lastSeenDate}\n`;
+              yellowlistMsg += `   ⏰ Expira: ${expiresDate}\n\n`;
+            });
+            if (totalYellowlist > yellowlistIPs.length) {
+              yellowlistMsg += `💡 +${totalYellowlist - yellowlistIPs.length} outro(s) monitorado(s).`;
+            }
+            await sendTextMessage(from, yellowlistMsg);
+          }
+          
+          // Whitelist (Permitidos)
+          if (whitelistIPs.length > 0) {
+            let whitelistMsg = `🟢 *Whitelist (${totalWhitelist} permitido${totalWhitelist !== 1 ? 's' : ''})*\n\n`;
+            whitelistIPs.forEach((ipData, index) => {
+              const expiresDate = formatShortDate(ipData.expires_at);
+              const lastSeenDate = ipData.last_seen ? formatShortDate(ipData.last_seen) : 'Nunca';
+              whitelistMsg += `${index + 1}. *${ipData.ip}*\n`;
+              whitelistMsg += `   ✅ ${ipData.abuse_confidence}% | 📊 ${ipData.reports || 0} report${(ipData.reports || 0) !== 1 ? 's' : ''}\n`;
+              whitelistMsg += `   🔢 ${ipData.request_count || 0} tentativa${(ipData.request_count || 0) !== 1 ? 's' : ''} | 👁️ Última: ${lastSeenDate}\n`;
+              whitelistMsg += `   ⏰ Expira: ${expiresDate}\n\n`;
+            });
+            if (totalWhitelist > whitelistIPs.length) {
+              whitelistMsg += `💡 +${totalWhitelist - whitelistIPs.length} outro(s) permitido(s).`;
+            }
+            await sendTextMessage(from, whitelistMsg);
+          }
+          
+          // Se todas as listas estão vazias
+          if (blockedIPs.length === 0 && yellowlistIPs.length === 0 && whitelistIPs.length === 0) {
+            await sendTextMessage(from, '✅ Nenhum IP nas listas no momento.');
           }
         } else {
           await sendTextMessage(from, '❌ Módulo de bloqueio de IPs não configurado.');

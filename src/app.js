@@ -8,18 +8,19 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const cookieParser = require('cookie-parser');
 // Removidos imports não utilizados diretamente (agora nos módulos)
 
 // Importar módulos
 const { initLogger, normalizeBR, toggleNineBR, requestId, readNumbersFromFile, isNumberAuthorized, getClientIp } = require('./modules/utils');
 const { initTuyaModule } = require('./modules/tuya');
 const { initCameraModule } = require('./modules/camera');
-const { initWhatsAppModule } = require('./modules/whatsapp');
 const { initRoutesModule } = require('./modules/routes');
 const { initTuyaMonitorModule } = require('./modules/tuya-monitor');
 const { initIPBlockerModule } = require('./modules/ip-blocker');
 const { initAbuseIPDBModule } = require('./modules/abuseipdb');
 const { initWebSocketESP32Module } = require('./modules/websocket-esp32');
+const { initAdminModule } = require('./modules/admin');
 
 /* ===== env ===== */
 // Detecta APP_ROOT automaticamente baseado no diretório do script
@@ -45,7 +46,10 @@ const RATE_LIMIT_STRICT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_STRICT_WINDO
 const RATE_LIMIT_STRICT_MAX = parseInt(process.env.RATE_LIMIT_STRICT_MAX || '10', 10); // Máximo para endpoints críticos (ex: /send, /trigger-snapshot)
 const ENABLE_IP_WHITELIST = /^true$/i.test(process.env.ENABLE_IP_WHITELIST || 'false'); // Whitelist global de IPs
 const IP_WHITELIST = process.env.IP_WHITELIST ? process.env.IP_WHITELIST.split(',').map(ip => ip.trim()) : [];
-const BLOCKED_IPS_FILE = process.env.BLOCKED_IPS_FILE || path.join(APP_ROOT, 'blocked_ips.json');
+const GLOBAL_IP_WHITELIST = process.env.GLOBAL_IP_WHITELIST ? process.env.GLOBAL_IP_WHITELIST.split(',').map(ip => ip.trim()) : [];
+const ENABLE_GLOBAL_IP_VALIDATION = /^true$/i.test(process.env.ENABLE_GLOBAL_IP_VALIDATION || 'true');
+// BLOCKED_IPS_FILE removido - agora usa banco SQLite via ip-blocker.js
+// Mantido apenas para referência (não é mais usado)
 const ENABLE_REQUEST_TIMEOUT = /^true$/i.test(process.env.ENABLE_REQUEST_TIMEOUT || 'true');
 const REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '30000', 10); // Timeout de 30 segundos
 const LOG_PATH = process.env.LOG_PATH || '/var/log/whatsapp-api.log';
@@ -179,6 +183,8 @@ try {
 /* ===== express ===== */
 const app = express();
 app.set('trust proxy', 1);
+// Cookie parser para sessões admin
+app.use(cookieParser());
 // Validação de tamanho de payload
 app.use(express.json({
   limit: '256kb',
@@ -192,22 +198,52 @@ app.use(express.json({
 }));
 
 // Configuração do Helmet com opções de segurança
-app.use(helmet({
-  contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'self'"],
-      styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
-      imgSrc: ["'self'", "data:", "https:"],
-    },
-  },
-  crossOriginEmbedderPolicy: false, // Permite CORS para APIs
-  hsts: {
-    maxAge: 31536000,
-    includeSubDomains: true,
-    preload: true
+// CSP será ajustado dinamicamente para rotas admin
+app.use((req, res, next) => {
+  const isAdminRoute = req.path.startsWith('/admin');
+  
+  // Para rotas admin, permite scripts inline (necessário para funcionalidade)
+  // Para outras rotas, mantém CSP restritivo
+  if (isAdminRoute) {
+    // Configuração permissiva para admin (permite scripts inline)
+    return helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          styleSrc: ["'self'", "'unsafe-inline'"],
+          scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"], // Permite scripts inline para admin
+          scriptSrcAttr: ["'unsafe-inline'"], // Permite event handlers inline (onclick, etc)
+          imgSrc: ["'self'", "data:", "https:"],
+          connectSrc: ["'self'"], // Permite fetch/XMLHttpRequest
+        },
+      },
+      crossOriginEmbedderPolicy: false,
+      hsts: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+        preload: true
+      }
+    })(req, res, next);
+  } else {
+    // Configuração restritiva para outras rotas
+    return helmet({
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'self'"],
+          styleSrc: ["'self'", "'unsafe-inline'"],
+          scriptSrc: ["'self'"], // Restritivo para outras rotas
+          imgSrc: ["'self'", "data:", "https:"],
+        },
+      },
+      crossOriginEmbedderPolicy: false,
+      hsts: {
+        maxAge: 31536000,
+        includeSubDomains: true,
+        preload: true
+      }
+    })(req, res, next);
   }
-}));
+});
 
 // Middleware de timeout de requisições
 if (ENABLE_REQUEST_TIMEOUT) {
@@ -244,7 +280,8 @@ if (ENABLE_IP_WHITELIST && IP_WHITELIST.length > 0) {
     next();
   });
 }
-app.use(helmet());
+// Helmet já está configurado dinamicamente acima (linha ~200)
+// Não aplicar novamente para evitar sobrescrever CSP
 app.use(cors({
   origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN,
   methods: ['GET','POST'],
@@ -257,14 +294,31 @@ app.use(cors({
 let ipBlocker = null;
 try {
   log(`[INIT] Inicializando módulo IP Blocker...`);
-  ipBlocker = initIPBlockerModule({
+  log(`[INIT] APP_ROOT: ${APP_ROOT}`);
+  const ipBlockerResult = initIPBlockerModule({
     appRoot: APP_ROOT,
     logger
   });
-  log(`[INIT] Módulo IP Blocker inicializado com sucesso`);
+  log(`[INIT] initIPBlockerModule retornou: ${typeof ipBlockerResult}`);
+  log(`[INIT] ipBlockerResult é null: ${ipBlockerResult === null}`);
+  log(`[INIT] ipBlockerResult é undefined: ${ipBlockerResult === undefined}`);
+  
+  if (ipBlockerResult) {
+    ipBlocker = ipBlockerResult;
+    const functions = Object.keys(ipBlocker).filter(key => typeof ipBlocker[key] === 'function');
+    log(`[INIT] ✅ Módulo IP Blocker inicializado com sucesso - ${functions.length} funções disponíveis`);
+    log(`[INIT] Funções: ${functions.join(', ')}`);
+    log(`[INIT] ipBlocker atribuído: ${!!ipBlocker}`);
+  } else {
+    err(`[INIT] ❌ ATENÇÃO: initIPBlockerModule retornou null/undefined`);
+    err(`[INIT] ❌ Tipo retornado: ${typeof ipBlockerResult}`);
+    err(`[INIT] ❌ Valor retornado: ${ipBlockerResult}`);
+    ipBlocker = null;
+  }
 } catch (ipBlockerError) {
   err(`[FATAL] Erro ao inicializar módulo IP Blocker:`, ipBlockerError.message);
   err(`[FATAL] Stack:`, ipBlockerError.stack);
+  ipBlocker = null; // Garante que está null em caso de erro
   // Não encerra a aplicação, mas loga o erro
 }
 
@@ -278,6 +332,34 @@ try {
     ipBlocker
   });
   log(`[INIT] Módulo AbuseIPDB inicializado com sucesso`);
+  
+  // Verifica se deve recategorizar IPs na inicialização
+  const RECATEGORIZE_IPS = /^true$/i.test(process.env.ABUSEIPDB_RECATEGORIZE_IPS || 'false');
+  if (RECATEGORIZE_IPS && abuseIPDB && abuseIPDB.recategorizeAllIPs && ipBlocker) {
+    log(`[INIT] Recategorização de IPs habilitada (ABUSEIPDB_RECATEGORIZE_IPS=true)`);
+    log(`[INIT] Iniciando recategorização em background...`);
+    
+    // Executa em background para não bloquear a inicialização
+    (async () => {
+      try {
+        const result = await abuseIPDB.recategorizeAllIPs(ipBlocker);
+        log(`[INIT] ✅ Recategorização concluída: ${result.recategorized} IP(s) recategorizado(s), ${result.errors} erro(s)`);
+        
+        // Log resumido dos IPs que mudaram
+        const changedIPs = result.results.filter(r => r.changed);
+        if (changedIPs.length > 0) {
+          log(`[INIT] IPs recategorizados:`);
+          changedIPs.forEach(r => {
+            log(`[INIT]   - ${r.ip}: ${r.previousList} (${r.previousConfidence}%) → ${r.newList} (${r.newConfidence}%)`);
+          });
+        }
+      } catch (recatError) {
+        err(`[INIT] Erro na recategorização:`, recatError.message);
+      }
+    })();
+  } else if (RECATEGORIZE_IPS) {
+    warn(`[INIT] Recategorização solicitada mas módulos não disponíveis`);
+  }
 } catch (abuseIPDBError) {
   warn(`[INIT] Erro ao inicializar módulo AbuseIPDB:`, abuseIPDBError.message);
   // Não encerra a aplicação, mas loga o erro
@@ -285,6 +367,11 @@ try {
 
 // Middleware de verificação de IP bloqueado e validação AbuseIPDB (executado no início de cada requisição)
 app.use(async (req, res, next) => {
+  // Ignora requisições WebSocket (upgrade requests) - elas são tratadas pelo módulo WebSocket
+  if (req.headers.upgrade === 'websocket' || req.path === '/ws/esp32') {
+    return next();
+  }
+  
   const clientIp = getClientIp(req);
   const normalizedIp = normalizeIp(clientIp);
   
@@ -314,11 +401,19 @@ app.use(async (req, res, next) => {
       const isBlocked = await ipBlocker.isBlocked(normalizedIp);
       if (isBlocked) {
         // Registra tentativa de acesso bloqueado
-        await ipBlocker.recordBlockedAttempt(normalizedIp);
+        if (ipBlocker.recordBlockedAttempt) {
+          await ipBlocker.recordBlockedAttempt(normalizedIp);
+        }
         warn(`[SECURITY] Tentativa de acesso de IP bloqueado: ${normalizedIp} em ${req.path}`);
-        return res.status(403).json({ 
-          error: 'ip_blocked',
-          message: 'IP bloqueado'
+        // Retorna 404 genérico para não revelar que o IP está bloqueado
+        return res.status(404).send('Not Found');
+      }
+      
+      // Se não está bloqueado, verifica se está em whitelist/yellowlist e registra tentativa
+      if (ipBlocker && ipBlocker.recordIPAttempt) {
+        // Registra tentativa de acesso (atualiza contador se estiver em alguma lista)
+        ipBlocker.recordIPAttempt(normalizedIp).catch(err => {
+          dbg(`[SECURITY] Erro ao registrar tentativa de IP:`, err.message);
         });
       }
     } catch (e) {
@@ -328,7 +423,7 @@ app.use(async (req, res, next) => {
   }
   
   // Valida IP no AbuseIPDB para rotas não configuradas ou suspeitas
-  const knownRoutes = ['/health', '/webhook/whatsapp', '/esp32/validate', '/qr.png', '/qr/status', '/status', '/send', '/trigger-snapshot', '/tuya/', '/esp32/ota'];
+  const knownRoutes = ['/health', '/webhook/whatsapp', '/esp32/validate', '/qr.png', '/qr/status', '/status', '/send', '/trigger-snapshot', '/tuya/', '/esp32/ota', '/esp32/ota/check', '/esp32/ota/download', '/admin'];
   const isKnownRoute = knownRoutes.some(route => req.path.startsWith(route));
   
   // Valida apenas se não for rota conhecida
@@ -428,8 +523,8 @@ if (DEBUG) {
   });
 }
 
-// Sistema de bloqueio de IPs
-let blockedIPs = new Set();
+// Sistema de bloqueio de IPs (agora usando banco SQLite via ipBlocker)
+// Código antigo removido - tudo é gerenciado pelo módulo ip-blocker.js
 let failedAttempts = new Map(); // IP -> { count, firstAttempt, lastAttempt }
 let scannerDetection = new Map(); // IP -> { suspiciousPaths: Set, firstSeen, lastSeen, count }
 
@@ -456,30 +551,9 @@ const SUSPICIOUS_PATHS = [
   '/docs'
 ];
 
-// Carrega IPs bloqueados do arquivo
-function loadBlockedIPs() {
-  try {
-    if (fs.existsSync(BLOCKED_IPS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(BLOCKED_IPS_FILE, 'utf8'));
-      blockedIPs = new Set(data.blockedIPs || []);
-      log(`[SECURITY] ${blockedIPs.size} IP(s) bloqueado(s) carregado(s)`);
-    }
-  } catch (e) {
-    warn(`[SECURITY] Erro ao carregar IPs bloqueados:`, e.message);
-  }
-}
-
-// Salva IPs bloqueados
-function saveBlockedIPs() {
-  try {
-    fs.writeFileSync(BLOCKED_IPS_FILE, JSON.stringify({ 
-      blockedIPs: Array.from(blockedIPs),
-      updatedAt: new Date().toISOString()
-    }, null, 2), 'utf8');
-  } catch (e) {
-    warn(`[SECURITY] Erro ao salvar IPs bloqueados:`, e.message);
-  }
-}
+// Funções antigas de carregar/salvar IPs bloqueados removidas
+// Agora tudo é gerenciado pelo módulo ip-blocker.js usando SQLite
+// A migração do JSON é feita automaticamente pelo módulo na primeira inicialização
 
 // Limpa tentativas antigas (mais de 1 hora)
 setInterval(() => {
@@ -491,13 +565,20 @@ setInterval(() => {
   }
 }, 60 * 60 * 1000); // A cada hora
 
-// Carrega IPs bloqueados na inicialização
-loadBlockedIPs();
+// IPs bloqueados são carregados do banco SQLite pelo módulo ip-blocker.js
+// Não precisa mais carregar do arquivo JSON
 
 // Middleware de detecção de scanners/bots
 async function detectScanner(req, res, next) {
   const clientIp = getClientIp(req);
   const path = req.path.toLowerCase();
+  
+  // Ignora rotas administrativas e outras rotas conhecidas
+  const adminRoutes = ['/admin'];
+  const isAdminRoute = adminRoutes.some(route => path.startsWith(route));
+  if (isAdminRoute) {
+    return next();
+  }
   
   // Ignora IPs na whitelist
   if (ENABLE_IP_WHITELIST && IP_WHITELIST.length > 0) {
@@ -554,18 +635,14 @@ async function detectScanner(req, res, next) {
         }
       }
       
-      // Mantém compatibilidade com sistema antigo (opcional)
-      blockedIPs.add(clientIp);
-      saveBlockedIPs();
-      
       err(`[SECURITY] IP ${clientIp} bloqueado automaticamente por varredura/reconhecimento (${scannerData.suspiciousPaths.size} endpoints suspeitos: ${Array.from(scannerData.suspiciousPaths).join(', ')})`);
       
       // Remove da detecção
       scannerDetection.delete(clientIp);
       
       return res.status(403).json({ 
-        error: 'ip_blocked',
-        message: 'IP bloqueado por atividade suspeita'
+          error: 'not_found',
+          message: 'Not Found'
       });
     } else {
       warn(`[SECURITY] Atividade suspeita detectada de ${clientIp}: ${path} (${scannerData.suspiciousPaths.size}/${BLOCK_THRESHOLD} endpoints suspeitos)`);
@@ -619,14 +696,10 @@ async function auth(req, res, next) {
           }
         }
         
-        // Mantém compatibilidade com sistema antigo (opcional)
-        blockedIPs.add(clientIp);
-        saveBlockedIPs();
-        
         err(`[SECURITY] IP ${clientIp} bloqueado após ${attempts.count} tentativas falhadas`);
         return res.status(403).json({ 
-          error: 'ip_blocked',
-          message: 'IP bloqueado por múltiplas tentativas falhadas'
+          error: 'not_found',
+          message: 'Not Found'
         });
       } else {
         // Reset contador se passou muito tempo
@@ -823,80 +896,56 @@ log(`[CONFIG] USE_WHATSAPP_OFFICIAL_API: ${USE_OFFICIAL_API}`);
 let whatsapp;
 let client = null;
 
-// Escolhe qual API usar
-if (USE_OFFICIAL_API && WHATSAPP_ACCESS_TOKEN && WHATSAPP_PHONE_NUMBER_ID) {
-  log(`[INIT] Usando API Oficial do WhatsApp Business`);
-  try {
-    log(`[INIT] Carregando módulo whatsapp-official...`);
-    const { initWhatsAppOfficialModule } = require('./modules/whatsapp-official');
-    log(`[INIT] Módulo whatsapp-official carregado com sucesso`);
-    
-    log(`[INIT] Inicializando módulo WhatsApp Official...`);
-    log(`[INIT] Parâmetros: camera=${!!camera}, tuya=${!!tuya}, whatsappMaxVideoSizeMB=${WHATSAPP_MAX_VIDEO_SIZE_MB}`);
-    whatsapp = initWhatsAppOfficialModule({
-      accessToken: WHATSAPP_ACCESS_TOKEN,
-      phoneNumberId: WHATSAPP_PHONE_NUMBER_ID,
-      businessAccountId: WHATSAPP_BUSINESS_ACCOUNT_ID,
-      webhookVerifyToken: WHATSAPP_WEBHOOK_VERIFY_TOKEN,
-      apiVersion: WHATSAPP_API_VERSION,
-      logger,
-      camera,
-      tuya: (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) ? tuya : null,
-      utils: { normalizeBR, toggleNineBR, isNumberAuthorized },
-      ipBlocker,
-      numbersFile: NUMBERS_FILE,
-      recordDurationSec: RECORD_DURATION_SEC,
-      whatsappMaxVideoSizeMB: WHATSAPP_MAX_VIDEO_SIZE_MB
-    });
-    log(`[INIT] Módulo WhatsApp Official inicializado com sucesso`);
-  } catch (whatsappError) {
-    err(`[FATAL] Erro ao inicializar módulo WhatsApp Official:`, whatsappError.message);
-    err(`[FATAL] Stack:`, whatsappError.stack);
-    process.exit(1);
-  }
+// Usa apenas API Oficial do WhatsApp Business
+if (!WHATSAPP_ACCESS_TOKEN || !WHATSAPP_PHONE_NUMBER_ID) {
+  err(`[FATAL] WHATSAPP_ACCESS_TOKEN e WHATSAPP_PHONE_NUMBER_ID são obrigatórios.`);
+  err(`[FATAL] Configure essas variáveis no arquivo .env para usar a API Oficial do WhatsApp Business.`);
+  process.exit(1);
+}
+
+log(`[INIT] Usando API Oficial do WhatsApp Business`);
+try {
+  log(`[INIT] Carregando módulo whatsapp-official...`);
+  const { initWhatsAppOfficialModule } = require('./modules/whatsapp-official');
+  log(`[INIT] Módulo whatsapp-official carregado com sucesso`);
   
-  // API oficial não tem cliente (usa HTTP direto)
-  // Cria um objeto mock para compatibilidade
-  client = {
-    sendMessage: async (to, message) => {
-      if (typeof message === 'string') {
-        return await whatsapp.sendTextMessage(to, message);
-      }
-      // Para outros tipos, implementar conforme necessário
-      throw new Error('Tipo de mensagem não suportado na API oficial');
-    },
-    getState: async () => 'CONNECTED',
-    getNumberId: async () => null
-  };
-} else {
-  log(`[INIT] Usando whatsapp-web.js (API não oficial)`);
-  
-  if (USE_OFFICIAL_API) {
-    warn(`[INIT] USE_WHATSAPP_OFFICIAL_API=true mas WHATSAPP_ACCESS_TOKEN ou WHATSAPP_PHONE_NUMBER_ID não configurados. Usando whatsapp-web.js como fallback.`);
-  }
-  
-  whatsapp = initWhatsAppModule({
-    authDataPath: AUTH_DATA_PATH,
-    port: PORT,
+  log(`[INIT] Inicializando módulo WhatsApp Official...`);
+  log(`[INIT] Parâmetros: camera=${!!camera}, tuya=${!!tuya}, whatsappMaxVideoSizeMB=${WHATSAPP_MAX_VIDEO_SIZE_MB}`);
+  whatsapp = initWhatsAppOfficialModule({
+    accessToken: WHATSAPP_ACCESS_TOKEN,
+    phoneNumberId: WHATSAPP_PHONE_NUMBER_ID,
+    businessAccountId: WHATSAPP_BUSINESS_ACCOUNT_ID,
+    webhookVerifyToken: WHATSAPP_WEBHOOK_VERIFY_TOKEN,
+    apiVersion: WHATSAPP_API_VERSION,
     logger,
     camera,
     tuya: (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) ? tuya : null,
     utils: { normalizeBR, toggleNineBR, isNumberAuthorized },
+    ipBlocker,
     numbersFile: NUMBERS_FILE,
-    recordDurationSec: RECORD_DURATION_SEC
+    recordDurationSec: RECORD_DURATION_SEC,
+    whatsappMaxVideoSizeMB: WHATSAPP_MAX_VIDEO_SIZE_MB
   });
-  
-  client = whatsapp.client;
-  
-  // Garante que diretórios necessários existem
-  if (!fs.existsSync(RECORDINGS_DIR)) {
-    fs.mkdirSync(RECORDINGS_DIR, { recursive: true });
-    log(`[INIT] Diretório de gravações criado: ${RECORDINGS_DIR}`);
-  }
-  
-  // Inicializa o cliente WhatsApp (apenas para whatsapp-web.js)
-  whatsapp.initialize();
+  log(`[INIT] Módulo WhatsApp Official inicializado com sucesso`);
+} catch (whatsappError) {
+  err(`[FATAL] Erro ao inicializar módulo WhatsApp Official:`, whatsappError.message);
+  err(`[FATAL] Stack:`, whatsappError.stack);
+  process.exit(1);
 }
+
+// API oficial não tem cliente (usa HTTP direto)
+// Cria um objeto mock para compatibilidade
+client = {
+  sendMessage: async (to, message) => {
+    if (typeof message === 'string') {
+      return await whatsapp.sendTextMessage(to, message);
+    }
+    // Para outros tipos, implementar conforme necessário
+    throw new Error('Tipo de mensagem não suportado na API oficial');
+  },
+  getState: async () => 'CONNECTED',
+  getNumberId: async () => null
+};
 
 // Garante que diretórios necessários existem
 if (!fs.existsSync(RECORDINGS_DIR)) {
@@ -1443,6 +1492,219 @@ async function triggerSnapshotForWS(message, clientIp) {
   }
 }
 
+// ===== MIDDLEWARE GLOBAL DE VALIDAÇÃO DE IP =====
+// Valida TODAS as requisições, verifica no AbuseIPDB e incrementa contadores
+// DEVE ser adicionado ANTES de qualquer rota ser registrada
+if (ENABLE_GLOBAL_IP_VALIDATION && ipBlocker && abuseIPDB) {
+  log(`[INIT] Habilitando validação global de IPs (verificação AbuseIPDB em todas as requisições)`);
+  
+  // Função para verificar se IP é local
+  function isLocalIP(ip) {
+    if (!ip || ip === 'unknown' || ip === 'localhost') return true;
+    
+    // Remove prefixo IPv6
+    let normalizedIp = ip;
+    if (normalizedIp.startsWith('::ffff:')) {
+      normalizedIp = normalizedIp.substring(7);
+    }
+    
+    // IPs locais
+    if (normalizedIp === '127.0.0.1' || normalizedIp === '::1') return true;
+    
+    // Verifica ranges privados
+    const parts = normalizedIp.split('.');
+    if (parts.length === 4) {
+      const [a, b] = parts.map(Number);
+      
+      // 10.0.0.0/8
+      if (a === 10) return true;
+      
+      // 192.168.0.0/16
+      if (a === 192 && b === 168) return true;
+      
+      // 172.16.0.0/12
+      if (a === 172 && b >= 16 && b <= 31) return true;
+      
+      // 127.0.0.0/8
+      if (a === 127) return true;
+      
+      // 169.254.0.0/16 (link-local)
+      if (a === 169 && b === 254) return true;
+    }
+    
+    return false;
+  }
+  
+  // Função para verificar se IP está na whitelist
+  function isWhitelisted(ip) {
+    if (!ip || ip === 'unknown') return false;
+    
+    // Combina whitelists
+    const allWhitelists = [...IP_WHITELIST, ...GLOBAL_IP_WHITELIST, ...ESP32_ALLOWED_IPS];
+    
+    if (allWhitelists.length === 0) return false;
+    
+    let normalizedIp = ip;
+    if (normalizedIp.startsWith('::ffff:')) {
+      normalizedIp = normalizedIp.substring(7);
+    }
+    
+    return allWhitelists.some(allowedIp => {
+      if (allowedIp.includes('/')) {
+        // CIDR notation
+        return ipInCidr(normalizedIp, allowedIp);
+      }
+      return normalizeIp(normalizedIp) === normalizeIp(allowedIp);
+    });
+  }
+  
+  // Middleware global de validação de IP (DEVE ser ANTES de todas as rotas)
+  app.use(async (req, res, next) => {
+    // Ignora arquivos estáticos e health checks
+    if (req.path.startsWith('/admin/static/') || 
+        req.path === '/health' || 
+        req.path === '/favicon.ico') {
+      return next();
+    }
+    
+    const clientIp = getClientIp(req);
+    let normalizedIp = clientIp;
+    if (normalizedIp && normalizedIp.startsWith('::ffff:')) {
+      normalizedIp = normalizedIp.substring(7);
+    }
+    
+    // Se IP é local ou está na whitelist do ENV, permite sem validação
+    if (isLocalIP(normalizedIp) || isWhitelisted(normalizedIp)) {
+      dbg(`[IP-VALIDATION] IP ${normalizedIp} é local ou whitelisted - permitindo sem validação`);
+      return next();
+    }
+    
+    // Para outros IPs, valida e incrementa contador
+    if (normalizedIp && normalizedIp !== 'unknown') {
+      // Registra requisição do IP e rota nas estatísticas
+      // O statisticsModel já salva no banco automaticamente
+      if (global.statisticsModel) {
+        global.statisticsModel.incrementIPRequest(normalizedIp);
+        global.statisticsModel.incrementRoute(req.path);
+      }
+      
+      // Também salva diretamente no banco via ipBlocker (garante persistência)
+      if (ipBlocker && ipBlocker._ready && ipBlocker._ready()) {
+        if (ipBlocker.incrementIPStat) {
+          ipBlocker.incrementIPStat(normalizedIp).catch((err) => {
+            dbg(`[IP-VALIDATION] Erro ao salvar IP no banco:`, err.message);
+          });
+        }
+        if (ipBlocker.incrementRouteStat) {
+          ipBlocker.incrementRouteStat(req.path).catch((err) => {
+            dbg(`[IP-VALIDATION] Erro ao salvar rota no banco:`, err.message);
+          });
+        }
+      }
+      
+      // Verifica primeiro se IP já está bloqueado (síncrono - bloqueia requisição)
+      if (ipBlocker.isBlocked) {
+        try {
+          const isBlocked = await Promise.race([
+            ipBlocker.isBlocked(normalizedIp),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 1000))
+          ]);
+          
+          if (isBlocked) {
+            warn(`[IP-VALIDATION] 🚫 Requisição bloqueada: IP ${normalizedIp} está na lista de bloqueados`);
+            // Retorna 404 genérico para não revelar que o IP está bloqueado
+            return res.status(404).send('Not Found');
+          }
+        } catch (err) {
+          // Se timeout ou erro, permite a requisição (fail-open)
+          dbg(`[IP-VALIDATION] Erro ao verificar se IP está bloqueado (permitindo requisição):`, err.message);
+        }
+      }
+      
+      // Verifica se IP está na whitelist ou yellowlist do banco (não vencido)
+      let shouldCheckAbuseIPDB = true;
+      if (ipBlocker.isInWhitelist && ipBlocker.isInYellowlist) {
+        try {
+          const [inWhitelist, inYellowlist] = await Promise.all([
+            Promise.race([
+              ipBlocker.isInWhitelist(normalizedIp),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 500))
+            ]).catch(() => ({ inWhitelist: false })),
+            Promise.race([
+              ipBlocker.isInYellowlist(normalizedIp),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 500))
+            ]).catch(() => ({ inYellowlist: false }))
+          ]);
+          
+          // Verifica se o resultado é um objeto com a propriedade inWhitelist/inYellowlist
+          const isInWhitelist = inWhitelist && (inWhitelist.inWhitelist === true || inWhitelist === true);
+          const isInYellowlist = inYellowlist && (inYellowlist.inYellowlist === true || inYellowlist === true);
+          
+          if (isInWhitelist || isInYellowlist) {
+            dbg(`[IP-VALIDATION] IP ${normalizedIp} encontrado na ${isInWhitelist ? 'whitelist' : 'yellowlist'} - não consultando AbuseIPDB`);
+            if (isInWhitelist && inWhitelist.expiresAt) {
+              const now = Math.floor(Date.now() / 1000);
+              dbg(`[IP-VALIDATION] IP ${normalizedIp} whitelist válido até ${inWhitelist.expiresAt}, now=${now}`);
+            }
+            shouldCheckAbuseIPDB = false;
+          }
+        } catch (err) {
+          dbg(`[IP-VALIDATION] Erro ao verificar listas (consultando AbuseIPDB):`, err.message);
+        }
+      }
+      
+      // Incrementa contador de tentativas (não bloqueia, apenas registra)
+      if (ipBlocker.recordIPAttempt) {
+        ipBlocker.recordIPAttempt(normalizedIp).catch(err => {
+          dbg(`[IP-VALIDATION] Erro ao registrar tentativa para ${normalizedIp}:`, err.message);
+        });
+      }
+      
+      // Verifica no AbuseIPDB APENAS se não estiver nas listas
+      if (shouldCheckAbuseIPDB && abuseIPDB.checkIP) {
+        abuseIPDB.checkIP(normalizedIp, 90, false)
+          .then(result => {
+            if (result && result.abuseConfidence !== undefined) {
+              dbg(`[IP-VALIDATION] IP ${normalizedIp} verificado no AbuseIPDB: ${result.abuseConfidence}% confiança, ${result.reports || 0} report(s)`);
+              
+              // Se confiança alta, bloqueia automaticamente
+              if (result.abuseConfidence >= 75 && ipBlocker.blockIP) {
+                ipBlocker.isBlocked(normalizedIp).then(isBlocked => {
+                  if (!isBlocked) {
+                    log(`[IP-VALIDATION] 🚫 Bloqueando IP ${normalizedIp} automaticamente (confiança: ${result.abuseConfidence}%)`);
+                    ipBlocker.blockIP(normalizedIp, `Alta confiança de abuso (${result.abuseConfidence}%) - verificação automática`)
+                      .then(() => {
+                        log(`[IP-VALIDATION] ✅ IP ${normalizedIp} bloqueado com sucesso`);
+                      })
+                      .catch(err => {
+                        warn(`[IP-VALIDATION] ❌ Erro ao bloquear IP ${normalizedIp}:`, err.message);
+                      });
+                  }
+                }).catch(() => {});
+              }
+            }
+          })
+          .catch(err => {
+            dbg(`[IP-VALIDATION] Erro ao verificar IP ${normalizedIp} no AbuseIPDB:`, err.message);
+          });
+      }
+    }
+    
+    // Continua com a requisição
+    next();
+  });
+  
+  log(`[INIT] ✅ Middleware global de validação de IP habilitado`);
+} else {
+  if (!ENABLE_GLOBAL_IP_VALIDATION) {
+    log(`[INIT] ⚠️ Validação global de IP desabilitada (ENABLE_GLOBAL_IP_VALIDATION=false)`);
+  } else if (!ipBlocker) {
+    warn(`[INIT] ⚠️ Validação global de IP desabilitada (módulo IP Blocker não disponível)`);
+  } else if (!abuseIPDB) {
+    warn(`[INIT] ⚠️ Validação global de IP desabilitada (módulo AbuseIPDB não disponível)`);
+  }
+}
+
 // Inicializa WebSocket ESP32 (após servidor estar pronto)
 let wsESP32 = null;
 let lastVideoRecordTimeWS = 0; // Timestamp da última gravação via WebSocket
@@ -1481,10 +1743,70 @@ server = app.listen(PORT, () => {
     warn(`[SERVER] Erro ao inicializar WebSocket ESP32:`, wsError.message);
   }
   
-  // Middleware para rotas não configuradas (deve ser o último)
+  log(`═══════════════════════════════════════════════════════════`);
+  
+  /* ===== Admin Module ===== */
+  let adminModule = null;
+  try {
+    log(`[INIT] Inicializando módulo Admin...`);
+    log(`[INIT] Verificando ipBlocker: ${ipBlocker ? 'disponível' : 'NÃO DISPONÍVEL'}`);
+    log(`[INIT] Tipo de ipBlocker: ${typeof ipBlocker}`);
+    log(`[INIT] Valor de ipBlocker: ${ipBlocker}`);
+    if (ipBlocker) {
+      const functions = Object.keys(ipBlocker).filter(key => typeof ipBlocker[key] === 'function');
+      log(`[INIT] ipBlocker funções (${functions.length}): ${functions.join(', ')}`);
+    } else {
+      err(`[INIT] ⚠️ ATENÇÃO: ipBlocker é null/undefined - admin não terá acesso às funcionalidades de IP`);
+      err(`[INIT] ⚠️ Verifique se houve erro na inicialização do módulo IP Blocker acima`);
+    }
+    // Expõe APP_ROOT globalmente para Statistics
+    global.APP_ROOT = APP_ROOT;
+    
+    adminModule = initAdminModule({
+      app,
+      appRoot: APP_ROOT,
+      logger,
+      getCurrentIpBlocker: () => ipBlocker, // Função getter para acesso dinâmico
+      whatsappOfficial: whatsapp,
+      websocketESP32: wsESP32,
+      getClientIp: getClientIp
+    });
+    log(`[INIT] Módulo Admin inicializado com sucesso`);
+  } catch (adminError) {
+    warn(`[INIT] Erro ao inicializar módulo Admin:`, adminError.message);
+    warn(`[INIT] Stack:`, adminError.stack);
+  }
+  
+  // Middleware para rastrear rotas nas estatísticas
+  app.use((req, res, next) => {
+    if (global.statisticsModel) {
+      global.statisticsModel.incrementRoute(req.path);
+    }
+    // Também salva diretamente no banco (garante persistência)
+    if (ipBlocker && ipBlocker._ready && ipBlocker._ready() && ipBlocker.incrementRouteStat) {
+      ipBlocker.incrementRouteStat(req.path).catch((err) => {
+        dbg(`[ROUTE-TRACK] Erro ao salvar rota no banco:`, err.message);
+      });
+    }
+    next();
+  });
+
+// Middleware para rotas não configuradas (deve ser o último, após todas as rotas)
   app.use((req, res) => {
     const clientIp = getClientIp(req);
     const normalizedIp = normalizeIp(clientIp);
+    const path = req.path.toLowerCase();
+    
+    // Ignora rotas administrativas (já registradas pelo módulo admin)
+    if (path.startsWith('/admin')) {
+      // Se chegou aqui, a rota admin não foi encontrada - retorna 404
+      res.status(404).json({ 
+        error: 'not_found',
+        message: 'Rota administrativa não encontrada',
+        path: req.path
+      });
+      return;
+    }
     
     // Log de tentativa de acesso a rota não configurada
     warn(`[ROUTE] Rota não configurada acessada: ${req.method} ${req.path} | ip=${normalizedIp}`);
@@ -1511,6 +1833,4 @@ server = app.listen(PORT, () => {
       path: req.path
     });
   });
-  
-  log(`═══════════════════════════════════════════════════════════`);
 });

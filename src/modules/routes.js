@@ -4,7 +4,6 @@
  */
 
 const QRCode = require('qrcode');
-const { MessageMedia } = require('whatsapp-web.js');
 const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
@@ -207,8 +206,7 @@ function initRoutesModule({
   // Limpa na inicialização
   cleanupExpiredVideos();
   
-  // Compatibilidade: API oficial não tem client da mesma forma
-  const client = whatsapp.client || null;
+  // API oficial não usa client (usa HTTP direto)
   const getLastQR = whatsapp.getLastQR || (() => null);
   // Garante que getIsReady sempre retorna boolean (compatível com ESP32)
   const getIsReady = () => {
@@ -220,16 +218,12 @@ function initRoutesModule({
     return { id: { _serialized: normalized.replace(/^\+/, '') }, tried: [normalized] };
   });
   
-  // Função para enviar mensagem (compatível com ambas APIs)
+  // Função para enviar mensagem (API Oficial)
   const sendMessage = async (to, message) => {
     if (whatsapp.sendTextMessage) {
-      // API Oficial
       return await whatsapp.sendTextMessage(to, message);
-    } else if (client) {
-      // whatsapp-web.js
-      return await client.sendMessage(to, message);
     }
-    throw new Error('Nenhuma API WhatsApp configurada');
+    throw new Error('API WhatsApp não configurada');
   };
   
   const ip = getClientIp;
@@ -254,11 +248,10 @@ function initRoutesModule({
   // Status
   app.get('/status', auth, async (_req, res) => {
     try {
-      const state = await client.getState().catch(() => null);
       res.json({ 
         ok: true, 
         ready: getIsReady(), 
-        state: state || 'unknown', 
+        state: 'CONNECTED', // API oficial sempre está conectada
         ts: nowISO() 
       });
     } catch (e) {
@@ -271,51 +264,19 @@ function initRoutesModule({
     }
   });
   
-  // QR Code PNG
+  // QR Code PNG (não aplicável para API oficial - sempre retorna que está conectado)
   app.get('/qr.png', async (_req, res) => {
-    const lastQR = getLastQR();
-    if (!lastQR) {
-      try {
-        const state = await client.getState().catch(() => null);
-        log(`[QR-API] QR não disponível. Estado: ${state}, isReady: ${getIsReady()}`);
-        
-        if (state === 'CONNECTED' || state === 'OPENING' || getIsReady()) {
-          return res.status(200).send('Cliente já autenticado. Não é necessário QR code.');
-        }
-        
-        if (state === 'UNPAIRED' || state === 'UNKNOWN') {
-          log(`[QR-API] Estado ${state} - QR deve ser gerado em breve. Aguarde...`);
-          return res.status(404).send('QR code ainda não foi gerado. Aguarde alguns segundos e tente novamente.');
-        }
-      } catch (e) {
-        log(`[QR-API] Erro ao obter estado:`, e.message);
-      }
-      
-      return res.status(404).send(`No QR available. Estado: ${getIsReady() ? 'ready' : 'not ready'}. Se já estava autenticado, limpe a pasta ${authDataPath} e reinicie.`);
-    }
-    
-    try {
-      const png = await QRCode.toBuffer(lastQR, { type: 'png', margin: 1, scale: 6 });
-      res.setHeader('Content-Type', 'image/png');
-      res.send(png);
-      log(`[QR-API] QR code enviado com sucesso`);
-    } catch (e) {
-      err('[QR-API] Erro ao renderizar QR:', e);
-      res.status(500).send('Failed to render QR');
-    }
+    res.status(200).send('API Oficial do WhatsApp não requer QR code. Cliente sempre autenticado.');
   });
   
-  // QR Status
+  // QR Status (não aplicável para API oficial)
   app.get('/qr/status', async (_req, res) => {
     try {
-      const state = await client.getState().catch(() => null);
-      const hasQR = !!getLastQR();
-      
       return res.json({
         ok: true,
-        hasQR,
+        hasQR: false,
         isReady: getIsReady(),
-        state: state || 'unknown',
+        state: 'CONNECTED', // API oficial sempre está conectada
         authPath: authDataPath,
         message: hasQR 
           ? 'QR code disponível. Acesse /qr.png para visualizar.'
@@ -491,6 +452,69 @@ function initRoutesModule({
         size: req.file.size,
         url: firmwareUrl,
         expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() // 24 horas
+      },
+      requestId: rid
+    });
+  });
+  
+  // Verifica se há atualização OTA disponível
+  app.get('/esp32/ota/check', (req, res) => {
+    const rid = requestId();
+    const clientIp = ip(req);
+    const currentVersion = req.query.version || req.headers['x-firmware-version'] || null;
+    
+    const otaDir = path.join(recordingsDir || path.join(__dirname, '..', '..', 'recordings'), 'ota');
+    
+    // Verifica se o diretório existe
+    if (!fs.existsSync(otaDir)) {
+      dbg(`[OTA][${rid}] Diretório OTA não existe | ip=${clientIp}`);
+      return res.json({
+        ok: true,
+        updateAvailable: false,
+        message: 'Nenhuma atualização disponível',
+        requestId: rid
+      });
+    }
+    
+    // Lista todos os arquivos .bin no diretório OTA
+    const files = fs.readdirSync(otaDir)
+      .filter(file => file.endsWith('.bin'))
+      .map(file => {
+        const filePath = path.join(otaDir, file);
+        const stats = fs.statSync(filePath);
+        return {
+          filename: file,
+          size: stats.size,
+          modified: stats.mtime,
+          path: filePath
+        };
+      })
+      .sort((a, b) => b.modified - a.modified); // Mais recente primeiro
+    
+    if (files.length === 0) {
+      dbg(`[OTA][${rid}] Nenhum firmware disponível | ip=${clientIp}`);
+      return res.json({
+        ok: true,
+        updateAvailable: false,
+        message: 'Nenhuma atualização disponível',
+        requestId: rid
+      });
+    }
+    
+    // Pega o firmware mais recente
+    const latestFirmware = files[0];
+    const firmwareUrl = `${req.protocol}://${req.get('host')}/esp32/ota/download/${latestFirmware.filename}`;
+    
+    log(`[OTA][${rid}] Verificação de atualização | ip=${clientIp} | versão atual=${currentVersion || 'desconhecida'} | firmware disponível=${latestFirmware.filename}`);
+    
+    res.json({
+      ok: true,
+      updateAvailable: true,
+      firmware: {
+        filename: latestFirmware.filename,
+        size: latestFirmware.size,
+        url: firmwareUrl,
+        modified: latestFirmware.modified.toISOString()
       },
       requestId: rid
     });
@@ -676,9 +700,6 @@ function initRoutesModule({
         }
       }
       
-      // Para whatsapp-web.js, usa MessageMedia
-      const media = client ? new MessageMedia(mimeType, base64, `snapshot_${Date.now()}.jpg`) : null;
-      
       // Grava vídeo em background (não bloqueia o envio da foto)
       let videoIdPromise = Promise.resolve(null);
       if (ENABLE_VIDEO_RECORDING && camera && camera.buildRTSPUrl && camera.recordRTSPVideo) {
@@ -775,18 +796,15 @@ function initRoutesModule({
           const to = numberId._serialized;
           let r;
           
-          // Verifica qual API está sendo usada
+          // Usa API Oficial do WhatsApp
           if (whatsapp.sendMediaById && mediaId) {
-            // API Oficial do WhatsApp - usa media ID (mais rápido, upload já feito)
+            // Usa media ID (mais rápido, upload já feito)
             r = await whatsapp.sendMediaById(to, mediaId, 'image', message);
           } else if (whatsapp.sendMediaFromBase64) {
-            // API Oficial do WhatsApp - fallback: usa base64 diretamente
+            // Fallback: usa base64 diretamente
             r = await whatsapp.sendMediaFromBase64(to, base64, mimeType, message);
-          } else if (client && client.sendMessage && media) {
-            // whatsapp-web.js - usa MessageMedia
-            r = await client.sendMessage(to, media, { caption: message });
           } else {
-            throw new Error('Nenhuma API WhatsApp configurada para envio de mídia');
+            throw new Error('API WhatsApp não configurada para envio de mídia');
           }
           
           log(`[SNAPSHOT OK][${rid}] Enviado para ${to} | id=${r.id?._serialized || r.messages?.[0]?.id || 'n/a'}`);
@@ -824,30 +842,6 @@ function initRoutesModule({
                   // Tenta fallback para texto
                   try {
                     await whatsapp.sendTextMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
-                    log(`[SNAPSHOT][${rid}] ✅ Mensagem de texto enviada como fallback para ${to}`);
-                  } catch (textError) {
-                    err(`[SNAPSHOT][${rid}] ❌ Erro ao enviar mensagem de texto:`, textError.message);
-                  }
-                }
-              } else if (client && client.sendMessage) {
-                // whatsapp-web.js - usa botões
-                log(`[SNAPSHOT][${rid}] Enviando botões (whatsapp-web.js) para ${to}...`);
-                try {
-                  const buttonMessage = {
-                    text: `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos da campainha.\n\nDeseja visualizar o vídeo? (Válido por 24 horas)`,
-                    buttons: [
-                      { body: `👁️ Ver Vídeo (${videoId.substring(0, 8)}...)` },
-                      { body: '⏭️ Pular' }
-                    ],
-                    footer: 'Campainha - Vídeo Temporário'
-                  };
-                  await client.sendMessage(to, buttonMessage);
-                  log(`[SNAPSHOT][${rid}] ✅ Botões enviados com sucesso para ${to}`);
-                } catch (buttonError) {
-                  warn(`[SNAPSHOT][${rid}] Erro ao enviar botões, usando fallback texto:`, buttonError.message);
-                  // Fallback para texto
-                  try {
-                    await client.sendMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
                     log(`[SNAPSHOT][${rid}] ✅ Mensagem de texto enviada como fallback para ${to}`);
                   } catch (textError) {
                     err(`[SNAPSHOT][${rid}] ❌ Erro ao enviar mensagem de texto:`, textError.message);
