@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin - Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f5;
+            color: #333;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        
+        .header-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        h1 {
+            font-size: 24px;
+        }
+        
+        .logout-btn {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border: 1px solid rgba(255, 255, 255, 0.3);
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            text-decoration: none;
+            transition: background 0.3s;
+        }
+        
+        .logout-btn:hover {
+            background: rgba(255, 255, 255, 0.3);
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 30px auto;
+            padding: 0 20px;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+        }
+        
+        .stat-label {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+        
+        .stat-value {
+            font-size: 32px;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .stat-card.blocked .stat-value { color: #e74c3c; }
+        .stat-card.whitelist .stat-value { color: #27ae60; }
+        .stat-card.yellowlist .stat-value { color: #f39c12; }
+        .stat-card.migrations .stat-value { color: #3498db; }
+        
+        .section {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+            margin-bottom: 20px;
+        }
+        
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .section-title {
+            font-size: 20px;
+            font-weight: 600;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }
+        
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+            color: #666;
+            font-size: 14px;
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+            padding-right: 24px;
+        }
+        
+        th:hover {
+            background: #e9ecef;
+        }
+        
+        th.sortable::after {
+            content: ' ↕';
+            position: absolute;
+            right: 8px;
+            opacity: 0.5;
+        }
+        
+        th.sort-asc::after {
+            content: ' ↑';
+            opacity: 1;
+        }
+        
+        th.sort-desc::after {
+            content: ' ↓';
+            opacity: 1;
+        }
+        
+        tr:hover {
+            background: #f8f9fa;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+        
+        .badge.blacklist { background: #fee; color: #c33; }
+        .badge.whitelist { background: #efe; color: #3c3; }
+        .badge.yellowlist { background: #ffe; color: #c93; }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        
+        .pagination {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 20px;
+        }
+        
+        .pagination button {
+            padding: 8px 16px;
+            background: #667eea;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        
+        .pagination button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="header-content">
+            <h1>🛡️ Dashboard Administrativo</h1>
+            <button class="logout-btn" onclick="logout()">Sair</button>
+        </div>
+    </div>
+    
+    <div class="container">
+        <div class="stats-grid" id="statsGrid">
+            <div class="stat-card blocked">
+                <div class="stat-label">IPs Bloqueados</div>
+                <div class="stat-value" id="statBlocked">-</div>
+            </div>
+            <div class="stat-card whitelist">
+                <div class="stat-label">Whitelist</div>
+                <div class="stat-value" id="statWhitelist">-</div>
+            </div>
+            <div class="stat-card yellowlist">
+                <div class="stat-label">Yellowlist</div>
+                <div class="stat-value" id="statYellowlist">-</div>
+            </div>
+            <div class="stat-card migrations">
+                <div class="stat-label">Migrações</div>
+                <div class="stat-value" id="statMigrations">-</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">📋 Logs de Migração</h2>
+            </div>
+            <div id="migrationsTable">
+                <div class="loading">Carregando...</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">🚫 IPs Bloqueados</h2>
+            </div>
+            <div id="blockedTable">
+                <div class="loading">Carregando...</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">✅ IPs Whitelist</h2>
+            </div>
+            <div id="whitelistTable">
+                <div class="loading">Carregando...</div>
+            </div>
+        </div>
+        
+        <div class="section">
+            <div class="section-header">
+                <h2 class="section-title">⚠️ IPs Yellowlist</h2>
+            </div>
+            <div id="yellowlistTable">
+                <div class="loading">Carregando...</div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let migrationsOffset = 0;
+        let blockedOffset = 0;
+        let whitelistOffset = 0;
+        let yellowlistOffset = 0;
+        const limit = 20;
+        
+        // Estado de ordenação para cada tabela
+        const sortState = {
+            blocked: { field: 'blocked_at', order: 'desc' },
+            whitelist: { field: 'created_at', order: 'desc' },
+            yellowlist: { field: 'created_at', order: 'desc' },
+            migrations: { field: 'created_at', order: 'desc' }
+        };
+        
+        async function loadStats() {
+            try {
+                const response = await fetch('/admin/api/stats');
+                const data = await response.json();
+                
+                if (data.success) {
+                    document.getElementById('statBlocked').textContent = data.stats.blocked;
+                    document.getElementById('statWhitelist').textContent = data.stats.whitelist;
+                    document.getElementById('statYellowlist').textContent = data.stats.yellowlist;
+                    document.getElementById('statMigrations').textContent = data.stats.migrations;
+                }
+            } catch (error) {
+                console.error('Erro ao carregar estatísticas:', error);
+            }
+        }
+        
+        async function loadMigrations() {
+            try {
+                const response = await fetch(`/admin/api/migrations?limit=${limit}&offset=${migrationsOffset}`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    const table = document.getElementById('migrationsTable');
+                    
+                    if (data.data.length === 0) {
+                        table.innerHTML = '<div class="loading">Nenhuma migração encontrada</div>';
+                        return;
+                    }
+                    
+                    const sortedData = sortData(data.data, sortState.migrations.field, sortState.migrations.order);
+                    
+                    let html = `
+                        <table>
+                            <thead>
+                                <tr>
+                                    ${createSortableHeader('IP', 'ip', 'migrations')}
+                                    ${createSortableHeader('De', 'from_list', 'migrations')}
+                                    ${createSortableHeader('Para', 'to_list', 'migrations')}
+                                    ${createSortableHeader('Confiança', 'new_confidence', 'migrations')}
+                                    ${createSortableHeader('Reports', 'new_reports', 'migrations')}
+                                    ${createSortableHeader('Data', 'created_at', 'migrations')}
+                                </tr>
+                            </thead>
+                            <tbody>
+                    `;
+                    
+                    sortedData.forEach(log => {
+                        const date = new Date(log.created_at * 1000).toLocaleString('pt-BR');
+                        html += `
+                            <tr>
+                                <td><strong>${log.ip}</strong></td>
+                                <td><span class="badge ${log.from_list || 'none'}">${log.from_list || 'Nenhuma'}</span></td>
+                                <td><span class="badge ${log.to_list}">${log.to_list}</span></td>
+                                <td>${log.old_confidence !== null ? log.old_confidence + '%' : '-'} → ${log.new_confidence !== null ? log.new_confidence + '%' : '-'}</td>
+                                <td>${log.old_reports !== null ? log.old_reports : '-'} → ${log.new_reports !== null ? log.new_reports : '-'}</td>
+                                <td>${date}</td>
+                            </tr>
+                        `;
+                    });
+                    
+                    html += '</tbody></table>';
+                    
+                    if (data.pagination.total > limit) {
+                        html += `
+                            <div class="pagination">
+                                <button onclick="prevMigrations()" ${migrationsOffset === 0 ? 'disabled' : ''}>Anterior</button>
+                                <span>Página ${Math.floor(migrationsOffset / limit) + 1} de ${Math.ceil(data.pagination.total / limit)} (Total: ${data.pagination.total})</span>
+                                <button onclick="nextMigrations()" ${!data.pagination.hasMore ? 'disabled' : ''}>Próxima</button>
+                            </div>
+                        `;
+                    }
+                    
+                    table.innerHTML = html;
+                }
+            } catch (error) {
+                console.error('Erro ao carregar migrações:', error);
+                document.getElementById('migrationsTable').innerHTML = '<div class="loading">Erro ao carregar migrações</div>';
+            }
+        }
+        
+        function sortData(data, field, order) {
+            return [...data].sort((a, b) => {
+                let aVal = a[field];
+                let bVal = b[field];
+                
+                // Trata valores numéricos
+                if (typeof aVal === 'number' && typeof bVal === 'number') {
+                    return order === 'asc' ? aVal - bVal : bVal - aVal;
+                }
+                
+                // Trata strings
+                aVal = String(aVal || '').toLowerCase();
+                bVal = String(bVal || '').toLowerCase();
+                
+                if (order === 'asc') {
+                    return aVal.localeCompare(bVal);
+                } else {
+                    return bVal.localeCompare(aVal);
+                }
+            });
+        }
+        
+        function createSortableHeader(text, field, tableType) {
+            const currentSort = sortState[tableType];
+            const isActive = currentSort.field === field;
+            const sortClass = isActive ? (currentSort.order === 'asc' ? 'sort-asc' : 'sort-desc') : '';
+            return `<th class="sortable ${sortClass}" onclick="sortTable('${tableType}', '${field}')">${text}</th>`;
+        }
+        
+        function sortTable(tableType, field) {
+            const current = sortState[tableType];
+            if (current.field === field) {
+                current.order = current.order === 'asc' ? 'desc' : 'asc';
+            } else {
+                current.field = field;
+                current.order = 'desc';
+            }
+            
+            // Recarrega a tabela correspondente
+            if (tableType === 'blocked') loadBlocked();
+            else if (tableType === 'whitelist') loadWhitelist();
+            else if (tableType === 'yellowlist') loadYellowlist();
+            else if (tableType === 'migrations') loadMigrations();
+        }
+        
+        async function loadBlocked() {
+            try {
+                const response = await fetch(`/admin/api/blocked?limit=${limit}&offset=${blockedOffset}`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    const table = document.getElementById('blockedTable');
+                    
+                    if (data.data.length === 0) {
+                        table.innerHTML = '<div class="loading">Nenhum IP bloqueado</div>';
+                        return;
+                    }
+                    
+                    // Ordena os dados
+                    const sortedData = sortData(data.data, sortState.blocked.field, sortState.blocked.order);
+                    
+                    let html = `
+                        <table>
+                            <thead>
+                                <tr>
+                                    ${createSortableHeader('IP', 'ip', 'blocked')}
+                                    ${createSortableHeader('Motivo', 'reason', 'blocked')}
+                                    ${createSortableHeader('Tentativas', 'request_count', 'blocked')}
+                                    ${createSortableHeader('Bloqueado em', 'blocked_at', 'blocked')}
+                                    ${createSortableHeader('Última tentativa', 'last_seen', 'blocked')}
+                                </tr>
+                            </thead>
+                            <tbody>
+                    `;
+                    
+                    sortedData.forEach(ip => {
+                        const blockedDate = ip.blocked_at ? new Date(ip.blocked_at * 1000).toLocaleString('pt-BR') : 'N/A';
+                        const lastSeen = ip.last_seen ? new Date(ip.last_seen * 1000).toLocaleString('pt-BR') : 'Nunca';
+                        
+                        html += `
+                            <tr>
+                                <td><strong>${ip.ip}</strong></td>
+                                <td>${ip.reason || 'Não especificado'}</td>
+                                <td>${ip.request_count || 0}</td>
+                                <td>${blockedDate}</td>
+                                <td>${lastSeen}</td>
+                            </tr>
+                        `;
+                    });
+                    
+                    html += '</tbody></table>';
+                    
+                    if (data.pagination.total > limit) {
+                        html += `
+                            <div class="pagination">
+                                <button onclick="prevBlocked()" ${blockedOffset === 0 ? 'disabled' : ''}>Anterior</button>
+                                <span>Página ${Math.floor(blockedOffset / limit) + 1} de ${Math.ceil(data.pagination.total / limit)} (Total: ${data.pagination.total})</span>
+                                <button onclick="nextBlocked()" ${!data.pagination.hasMore ? 'disabled' : ''}>Próxima</button>
+                            </div>
+                        `;
+                    }
+                    
+                    table.innerHTML = html;
+                }
+            } catch (error) {
+                console.error('Erro ao carregar IPs bloqueados:', error);
+                document.getElementById('blockedTable').innerHTML = '<div class="loading">Erro ao carregar IPs bloqueados</div>';
+            }
+        }
+        
+        async function loadWhitelist() {
+            try {
+                const response = await fetch(`/admin/api/whitelist?limit=${limit}&offset=${whitelistOffset}`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    const table = document.getElementById('whitelistTable');
+                    
+                    if (data.data.length === 0) {
+                        table.innerHTML = '<div class="loading">Nenhum IP na whitelist</div>';
+                        return;
+                    }
+                    
+                    const sortedData = sortData(data.data, sortState.whitelist.field, sortState.whitelist.order);
+                    
+                    let html = `
+                        <table>
+                            <thead>
+                                <tr>
+                                    ${createSortableHeader('IP', 'ip', 'whitelist')}
+                                    ${createSortableHeader('Confiança', 'abuse_confidence', 'whitelist')}
+                                    ${createSortableHeader('Reports', 'reports', 'whitelist')}
+                                    ${createSortableHeader('Tentativas', 'request_count', 'whitelist')}
+                                    ${createSortableHeader('Criado em', 'created_at', 'whitelist')}
+                                    ${createSortableHeader('Expira em', 'expires_at', 'whitelist')}
+                                </tr>
+                            </thead>
+                            <tbody>
+                    `;
+                    
+                    sortedData.forEach(ip => {
+                        const createdDate = ip.created_at ? new Date(ip.created_at * 1000).toLocaleString('pt-BR') : 'N/A';
+                        const expiresDate = ip.expires_at ? new Date(ip.expires_at * 1000).toLocaleString('pt-BR') : 'N/A';
+                        
+                        html += `
+                            <tr>
+                                <td><strong>${ip.ip}</strong></td>
+                                <td>${ip.abuse_confidence !== null ? ip.abuse_confidence + '%' : 'N/A'}</td>
+                                <td>${ip.reports || 0}</td>
+                                <td>${ip.request_count || 0}</td>
+                                <td>${createdDate}</td>
+                                <td>${expiresDate}</td>
+                            </tr>
+                        `;
+                    });
+                    
+                    html += '</tbody></table>';
+                    
+                    if (data.pagination.total > limit) {
+                        html += `
+                            <div class="pagination">
+                                <button onclick="prevWhitelist()" ${whitelistOffset === 0 ? 'disabled' : ''}>Anterior</button>
+                                <span>Página ${Math.floor(whitelistOffset / limit) + 1} de ${Math.ceil(data.pagination.total / limit)} (Total: ${data.pagination.total})</span>
+                                <button onclick="nextWhitelist()" ${!data.pagination.hasMore ? 'disabled' : ''}>Próxima</button>
+                            </div>
+                        `;
+                    }
+                    
+                    table.innerHTML = html;
+                }
+            } catch (error) {
+                console.error('Erro ao carregar whitelist:', error);
+                document.getElementById('whitelistTable').innerHTML = '<div class="loading">Erro ao carregar whitelist</div>';
+            }
+        }
+        
+        async function loadYellowlist() {
+            try {
+                const response = await fetch(`/admin/api/yellowlist?limit=${limit}&offset=${yellowlistOffset}`);
+                const data = await response.json();
+                
+                if (data.success) {
+                    const table = document.getElementById('yellowlistTable');
+                    
+                    if (data.data.length === 0) {
+                        table.innerHTML = '<div class="loading">Nenhum IP na yellowlist</div>';
+                        return;
+                    }
+                    
+                    const sortedData = sortData(data.data, sortState.yellowlist.field, sortState.yellowlist.order);
+                    
+                    let html = `
+                        <table>
+                            <thead>
+                                <tr>
+                                    ${createSortableHeader('IP', 'ip', 'yellowlist')}
+                                    ${createSortableHeader('Confiança', 'abuse_confidence', 'yellowlist')}
+                                    ${createSortableHeader('Reports', 'reports', 'yellowlist')}
+                                    ${createSortableHeader('Tentativas', 'request_count', 'yellowlist')}
+                                    ${createSortableHeader('Criado em', 'created_at', 'yellowlist')}
+                                    ${createSortableHeader('Expira em', 'expires_at', 'yellowlist')}
+                                </tr>
+                            </thead>
+                            <tbody>
+                    `;
+                    
+                    sortedData.forEach(ip => {
+                        const createdDate = ip.created_at ? new Date(ip.created_at * 1000).toLocaleString('pt-BR') : 'N/A';
+                        const expiresDate = ip.expires_at ? new Date(ip.expires_at * 1000).toLocaleString('pt-BR') : 'N/A';
+                        
+                        html += `
+                            <tr>
+                                <td><strong>${ip.ip}</strong></td>
+                                <td>${ip.abuse_confidence !== null ? ip.abuse_confidence + '%' : 'N/A'}</td>
+                                <td>${ip.reports || 0}</td>
+                                <td>${ip.request_count || 0}</td>
+                                <td>${createdDate}</td>
+                                <td>${expiresDate}</td>
+                            </tr>
+                        `;
+                    });
+                    
+                    html += '</tbody></table>';
+                    
+                    if (data.pagination.total > limit) {
+                        html += `
+                            <div class="pagination">
+                                <button onclick="prevYellowlist()" ${yellowlistOffset === 0 ? 'disabled' : ''}>Anterior</button>
+                                <span>Página ${Math.floor(yellowlistOffset / limit) + 1} de ${Math.ceil(data.pagination.total / limit)} (Total: ${data.pagination.total})</span>
+                                <button onclick="nextYellowlist()" ${!data.pagination.hasMore ? 'disabled' : ''}>Próxima</button>
+                            </div>
+                        `;
+                    }
+                    
+                    table.innerHTML = html;
+                }
+            } catch (error) {
+                console.error('Erro ao carregar yellowlist:', error);
+                document.getElementById('yellowlistTable').innerHTML = '<div class="loading">Erro ao carregar yellowlist</div>';
+            }
+        }
+        
+        function prevMigrations() {
+            migrationsOffset = Math.max(0, migrationsOffset - limit);
+            loadMigrations();
+        }
+        
+        function nextMigrations() {
+            migrationsOffset += limit;
+            loadMigrations();
+        }
+        
+        function prevBlocked() {
+            blockedOffset = Math.max(0, blockedOffset - limit);
+            loadBlocked();
+        }
+        
+        function nextBlocked() {
+            blockedOffset += limit;
+            loadBlocked();
+        }
+        
+        function prevWhitelist() {
+            whitelistOffset = Math.max(0, whitelistOffset - limit);
+            loadWhitelist();
+        }
+        
+        function nextWhitelist() {
+            whitelistOffset += limit;
+            loadWhitelist();
+        }
+        
+        function prevYellowlist() {
+            yellowlistOffset = Math.max(0, yellowlistOffset - limit);
+            loadYellowlist();
+        }
+        
+        function nextYellowlist() {
+            yellowlistOffset += limit;
+            loadYellowlist();
+        }
+        
+        async function logout() {
+            try {
+                await fetch('/admin/logout', { method: 'POST' });
+                window.location.href = '/admin';
+            } catch (error) {
+                console.error('Erro ao fazer logout:', error);
+            }
+        }
+        
+        // Carrega dados ao iniciar
+        loadStats();
+        loadMigrations();
+        loadBlocked();
+        loadWhitelist();
+        loadYellowlist();
+        
+        // Atualiza estatísticas a cada 30 segundos
+        setInterval(loadStats, 30000);
+    </script>
+</body>
+</html>
+

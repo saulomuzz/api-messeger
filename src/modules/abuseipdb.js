@@ -21,12 +21,19 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
   const ABUSEIPDB_API_URL = 'https://api.abuseipdb.com/api/v2/check';
   
   // Configurações de listas (valores padrão)
-  const WHITELIST_MAX_CONFIDENCE = parseFloat(process.env.ABUSEIPDB_WHITELIST_MAX_CONFIDENCE || '50');
-  const WHITELIST_TTL_DAYS = parseInt(process.env.ABUSEIPDB_WHITELIST_TTL_DAYS || '15', 10);
-  const YELLOWLIST_MIN_CONFIDENCE = parseFloat(process.env.ABUSEIPDB_YELLOWLIST_MIN_CONFIDENCE || '50');
-  const YELLOWLIST_MAX_CONFIDENCE = parseFloat(process.env.ABUSEIPDB_YELLOWLIST_MAX_CONFIDENCE || '80');
-  const YELLOWLIST_TTL_DAYS = parseInt(process.env.ABUSEIPDB_YELLOWLIST_TTL_DAYS || '7', 10);
-  const BLACKLIST_MIN_CONFIDENCE = parseFloat(process.env.ABUSEIPDB_BLACKLIST_MIN_CONFIDENCE || '80');
+  // IMPORTANTE: Os intervalos devem ser contíguos sem sobreposição
+  // WHITELIST: < WHITELIST_MAX_CONFIDENCE
+  // YELLOWLIST: >= WHITELIST_MAX_CONFIDENCE && < YELLOWLIST_MAX_CONFIDENCE
+  // BLACKLIST: >= BLACKLIST_MIN_CONFIDENCE
+  const WHITELIST_MAX_CONFIDENCE = parseFloat(process.env.ABUSEIPDB_WHITELIST_MAX_CONFIDENCE || '30');
+  const WHITELIST_TTL_DAYS = parseInt(process.env.ABUSEIPDB_WHITELIST_TTL_DAYS || '7', 10);
+  const YELLOWLIST_MAX_CONFIDENCE = parseFloat(process.env.ABUSEIPDB_YELLOWLIST_MAX_CONFIDENCE || '70');
+  const YELLOWLIST_TTL_DAYS = parseInt(process.env.ABUSEIPDB_YELLOWLIST_TTL_DAYS || '3', 10);
+  const BLACKLIST_MIN_CONFIDENCE = parseFloat(process.env.ABUSEIPDB_BLACKLIST_MIN_CONFIDENCE || '70');
+  
+  // YELLOWLIST_MIN_CONFIDENCE não é mais necessário (usa WHITELIST_MAX_CONFIDENCE)
+  // Mantido apenas para compatibilidade com logs/documentação
+  const YELLOWLIST_MIN_CONFIDENCE = WHITELIST_MAX_CONFIDENCE;
   
   // Cache de verificações (evita verificar o mesmo IP múltiplas vezes)
   const checkCache = new Map();
@@ -35,11 +42,23 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
   // Lock de verificações em andamento (evita múltiplas consultas simultâneas do mesmo IP)
   const pendingChecks = new Map(); // Map<ip, Promise<result>>
   
+  // Validação das configurações
+  if (WHITELIST_MAX_CONFIDENCE >= YELLOWLIST_MAX_CONFIDENCE) {
+    warn(`[ABUSEIPDB] ⚠️ Configuração inválida: WHITELIST_MAX_CONFIDENCE (${WHITELIST_MAX_CONFIDENCE}%) >= YELLOWLIST_MAX_CONFIDENCE (${YELLOWLIST_MAX_CONFIDENCE}%)`);
+    warn(`[ABUSEIPDB] Ajustando YELLOWLIST_MAX_CONFIDENCE para ${WHITELIST_MAX_CONFIDENCE + 1}%`);
+    // Não altera a variável, apenas avisa - o usuário deve corrigir no .env
+  }
+  
+  if (YELLOWLIST_MAX_CONFIDENCE > BLACKLIST_MIN_CONFIDENCE) {
+    warn(`[ABUSEIPDB] ⚠️ Configuração inválida: YELLOWLIST_MAX_CONFIDENCE (${YELLOWLIST_MAX_CONFIDENCE}%) > BLACKLIST_MIN_CONFIDENCE (${BLACKLIST_MIN_CONFIDENCE}%)`);
+    warn(`[ABUSEIPDB] Recomendado: YELLOWLIST_MAX_CONFIDENCE <= BLACKLIST_MIN_CONFIDENCE para evitar sobreposição`);
+  }
+  
   // Log das configurações
   if (ABUSEIPDB_ENABLED && ABUSEIPDB_API_KEY) {
     log(`[ABUSEIPDB] Configurações de listas:`);
     log(`[ABUSEIPDB]   Whitelist: < ${WHITELIST_MAX_CONFIDENCE}% confiança, válido por ${WHITELIST_TTL_DAYS} dias`);
-    log(`[ABUSEIPDB]   Yellowlist: ${YELLOWLIST_MIN_CONFIDENCE}-${YELLOWLIST_MAX_CONFIDENCE}% confiança, válido por ${YELLOWLIST_TTL_DAYS} dias`);
+    log(`[ABUSEIPDB]   Yellowlist: >= ${WHITELIST_MAX_CONFIDENCE}% e < ${YELLOWLIST_MAX_CONFIDENCE}% confiança, válido por ${YELLOWLIST_TTL_DAYS} dias`);
     log(`[ABUSEIPDB]   Blacklist: >= ${BLACKLIST_MIN_CONFIDENCE}% confiança, permanente`);
   }
   
@@ -74,26 +93,40 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
       // Verifica whitelist (< 50% confiança, válido por 15 dias)
       const whitelistCheck = await ipBlocker.isInWhitelist(normalizedIp);
       if (whitelistCheck.inWhitelist) {
+        // Registra tentativa de acesso
+        if (ipBlocker.recordWhitelistAttempt) {
+          ipBlocker.recordWhitelistAttempt(normalizedIp).catch(err => {
+            dbg(`[ABUSEIPDB] Erro ao registrar tentativa na whitelist:`, err.message);
+          });
+        }
         dbg(`[ABUSEIPDB] IP ${normalizedIp} encontrado na whitelist (${whitelistCheck.abuseConfidence}% confiança, válido até ${new Date(whitelistCheck.expiresAt * 1000).toISOString()})`);
         return {
           isAbusive: false,
           abuseConfidence: whitelistCheck.abuseConfidence,
           usageType: 'unknown',
           reports: 0,
-          fromCache: 'whitelist'
+          fromCache: 'whitelist',
+          listType: 'whitelist'
         };
       }
       
       // Verifica yellowlist (50-80% confiança, válido por 7 dias)
       const yellowlistCheck = await ipBlocker.isInYellowlist(normalizedIp);
       if (yellowlistCheck.inYellowlist) {
+        // Registra tentativa de acesso
+        if (ipBlocker.recordYellowlistAttempt) {
+          ipBlocker.recordYellowlistAttempt(normalizedIp).catch(err => {
+            dbg(`[ABUSEIPDB] Erro ao registrar tentativa na yellowlist:`, err.message);
+          });
+        }
         dbg(`[ABUSEIPDB] IP ${normalizedIp} encontrado na yellowlist (${yellowlistCheck.abuseConfidence}% confiança, válido até ${new Date(yellowlistCheck.expiresAt * 1000).toISOString()})`);
         return {
           isAbusive: false, // Não bloqueia, mas monitora
           abuseConfidence: yellowlistCheck.abuseConfidence,
           usageType: 'unknown',
           reports: 0,
-          fromCache: 'yellowlist'
+          fromCache: 'yellowlist',
+          listType: 'yellowlist'
         };
       }
     }
@@ -159,12 +192,79 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
         timeout: 5000 // 5 segundos de timeout
       });
       
+      // Log da resposta completa para debug (apenas se houver problema)
       const data = response.data?.data || {};
-      const abuseConfidence = data.abuseConfidencePercentage || 0;
+      
+      // A API do AbuseIPDB retorna "abuseConfidenceScore" (não "abuseConfidencePercentage")
+      // Verifica múltiplos formatos possíveis da resposta para compatibilidade
+      let abuseConfidence = null; // null indica que não foi encontrado
+      if (data.abuseConfidenceScore !== undefined && data.abuseConfidenceScore !== null) {
+        // Campo correto da API v2
+        abuseConfidence = parseFloat(data.abuseConfidenceScore);
+      } else if (data.abuseConfidencePercentage !== undefined && data.abuseConfidencePercentage !== null) {
+        // Campo alternativo (caso mude no futuro)
+        abuseConfidence = parseFloat(data.abuseConfidencePercentage);
+      } else if (data.abuseConfidence !== undefined && data.abuseConfidence !== null) {
+        // Campo alternativo
+        abuseConfidence = parseFloat(data.abuseConfidence);
+      } else if (data.confidence !== undefined && data.confidence !== null) {
+        // Campo alternativo
+        abuseConfidence = parseFloat(data.confidence);
+      }
+      
       const usageType = data.usageType || 'unknown';
-      const reports = data.totalReports || 0;
+      // Parse reports com validação
+      let reports = 0;
+      if (data.totalReports !== undefined && data.totalReports !== null) {
+        const parsed = parseInt(data.totalReports, 10);
+        reports = isNaN(parsed) ? 0 : parsed;
+      } else if (data.reports !== undefined && data.reports !== null) {
+        const parsed = parseInt(data.reports, 10);
+        reports = isNaN(parsed) ? 0 : parsed;
+      }
+      
+      // Verifica se o IP está na whitelist do AbuseIPDB
+      const isWhitelistedByAbuseIPDB = data.isWhitelisted === true;
+      
+      // Valida se o valor é um número válido
+      if (abuseConfidence === null || isNaN(abuseConfidence) || abuseConfidence < 0 || abuseConfidence > 100) {
+        // Se não encontrou confiança mas tem reports, pode ser um problema na API
+        if (reports > 0) {
+          warn(`[ABUSEIPDB] ⚠️ ERRO: IP ${normalizedIp} tem ${reports} reports mas confiança inválida/ausente`);
+          warn(`[ABUSEIPDB] Resposta completa da API:`, JSON.stringify(response.data, null, 2));
+          // Não adiciona à whitelist - trata como erro
+          throw new Error(`Resposta da API inválida: confiança não encontrada mas há ${reports} reports`);
+        }
+        // Se não tem reports e não tem confiança, assume 0 (IP limpo)
+        abuseConfidence = 0;
+      }
+      
+      // Se o IP está na whitelist do AbuseIPDB, trata como confiável mesmo com reports
+      // AbuseIPDB pode ter IPs na whitelist que têm reports mas confiança 0%
+      if (isWhitelistedByAbuseIPDB) {
+        dbg(`[ABUSEIPDB] IP ${normalizedIp} está na whitelist do AbuseIPDB (isWhitelisted: true) - tratando como confiável`);
+        // Força confiança 0 e classifica como whitelist (mesmo com reports)
+        abuseConfidence = 0;
+        // Não valida inconsistência se está na whitelist do AbuseIPDB
+      } else {
+        // Validação de segurança: se tem muitos reports mas confiança 0, pode ser erro na API
+        if (reports > 50 && abuseConfidence === 0) {
+          warn(`[ABUSEIPDB] ⚠️ ATENÇÃO: IP ${normalizedIp} tem ${reports} reports mas confiança 0% - possível erro na API`);
+          warn(`[ABUSEIPDB] Resposta completa da API:`, JSON.stringify(response.data, null, 2));
+          // Não adiciona à whitelist - trata como erro
+          throw new Error(`Dados inconsistentes: ${reports} reports mas confiança 0%`);
+        }
+      }
+      
+      // Log detalhado para debug
+      const whitelistNote = isWhitelistedByAbuseIPDB ? ' (whitelist AbuseIPDB)' : '';
+      log(`[ABUSEIPDB] Resposta da API para ${normalizedIp}: confiança=${abuseConfidence}%, reports=${reports}, usageType=${usageType}${whitelistNote}`);
       
       // Classifica baseado na confiança (usando valores configuráveis)
+      // Lógica: intervalos contíguos sem sobreposição
+      // WHITELIST: < WHITELIST_MAX_CONFIDENCE
+      // YELLOWLIST: >= WHITELIST_MAX_CONFIDENCE && < YELLOWLIST_MAX_CONFIDENCE
+      // BLACKLIST: >= BLACKLIST_MIN_CONFIDENCE
       let isAbusive = false;
       let listType = null;
       
@@ -172,8 +272,8 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
         // >= BLACKLIST_MIN_CONFIDENCE%: Blacklist (permanente)
         isAbusive = true;
         listType = 'blacklist';
-      } else if (abuseConfidence >= YELLOWLIST_MIN_CONFIDENCE && abuseConfidence < YELLOWLIST_MAX_CONFIDENCE) {
-        // YELLOWLIST_MIN_CONFIDENCE% - YELLOWLIST_MAX_CONFIDENCE%: Yellowlist
+      } else if (abuseConfidence >= WHITELIST_MAX_CONFIDENCE && abuseConfidence < YELLOWLIST_MAX_CONFIDENCE) {
+        // >= WHITELIST_MAX_CONFIDENCE% && < YELLOWLIST_MAX_CONFIDENCE%: Yellowlist
         isAbusive = false; // Não bloqueia, mas monitora
         listType = 'yellowlist';
       } else if (abuseConfidence < WHITELIST_MAX_CONFIDENCE) {
@@ -181,10 +281,11 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
         isAbusive = false;
         listType = 'whitelist';
       } else {
-        // Caso edge (entre whitelist e yellowlist ou yellowlist e blacklist)
-        // Por padrão, trata como yellowlist se estiver no intervalo
+        // Caso edge: se >= YELLOWLIST_MAX_CONFIDENCE mas < BLACKLIST_MIN_CONFIDENCE
+        // Trata como yellowlist (zona de transição)
         isAbusive = false;
         listType = 'yellowlist';
+        warn(`[ABUSEIPDB] IP ${normalizedIp} em zona de transição: ${abuseConfidence}% (entre yellowlist max e blacklist min)`);
       }
       
       const result = {
@@ -194,24 +295,36 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
         reports,
         ipAddress: normalizedIp,
         isPublic: data.isPublic || false,
-        isWhitelisted: data.isWhitelisted || false,
+        isWhitelisted: isWhitelistedByAbuseIPDB,
         countryCode: data.countryCode || '',
         lastReportedAt: data.lastReportedAt || null,
         listType
       };
       
       // Salva no banco de dados baseado na classificação
+      // IMPORTANTE: Só adiciona à whitelist/yellowlist se a confiança for válida
       if (ipBlocker && listType) {
         try {
           if (listType === 'whitelist') {
             await ipBlocker.addToWhitelist(normalizedIp, abuseConfidence, reports, WHITELIST_TTL_DAYS);
+            // Registra tentativa na whitelist
+            if (ipBlocker.recordWhitelistAttempt) {
+              await ipBlocker.recordWhitelistAttempt(normalizedIp);
+            }
           } else if (listType === 'yellowlist') {
             await ipBlocker.addToYellowlist(normalizedIp, abuseConfidence, reports, YELLOWLIST_TTL_DAYS);
+            // Registra tentativa na yellowlist
+            if (ipBlocker.recordYellowlistAttempt) {
+              await ipBlocker.recordYellowlistAttempt(normalizedIp);
+            }
           }
           // Blacklist é gerenciada pelo blockIP() separadamente
         } catch (listError) {
           warn(`[ABUSEIPDB] Erro ao adicionar IP à lista:`, listError.message);
         }
+      } else if (ipBlocker && ipBlocker.recordIPAttempt) {
+        // Se o IP já está em alguma lista, registra a tentativa
+        await ipBlocker.recordIPAttempt(normalizedIp);
       }
       
       // Salva no cache em memória também
@@ -220,12 +333,19 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
         timestamp: Date.now()
       });
       
+      // Log detalhado da classificação
       if (isAbusive) {
         warn(`[ABUSEIPDB] IP ${normalizedIp} reportado como abusivo: ${abuseConfidence}% confiança, ${reports} report(s) → BLACKLIST`);
       } else if (listType === 'yellowlist') {
-        dbg(`[ABUSEIPDB] IP ${normalizedIp} verificado: ${abuseConfidence}% confiança, ${reports} report(s) → YELLOWLIST (monitorado)`);
+        log(`[ABUSEIPDB] IP ${normalizedIp} verificado: ${abuseConfidence}% confiança, ${reports} report(s) → YELLOWLIST (monitorado)`);
+      } else if (listType === 'whitelist') {
+        // Se tem muitos reports mas confiança baixa, pode ser um problema
+        if (reports > 100 && abuseConfidence < 10) {
+          warn(`[ABUSEIPDB] ⚠️ ATENÇÃO: IP ${normalizedIp} tem ${reports} reports mas confiança ${abuseConfidence}% - possível erro na API`);
+        }
+        log(`[ABUSEIPDB] IP ${normalizedIp} verificado: ${abuseConfidence}% confiança, ${reports} report(s) → WHITELIST`);
       } else {
-        dbg(`[ABUSEIPDB] IP ${normalizedIp} verificado: ${abuseConfidence}% confiança, ${reports} report(s) → WHITELIST`);
+        warn(`[ABUSEIPDB] IP ${normalizedIp} não foi classificado corretamente: confiança=${abuseConfidence}%, reports=${reports}`);
       }
       
       return result;
@@ -237,10 +357,21 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
         err(`[ABUSEIPDB] API key inválida ou expirada`);
       } else {
         warn(`[ABUSEIPDB] Erro ao verificar IP ${normalizedIp}:`, error.message);
+        // Log da resposta de erro se disponível
+        if (error.response?.data) {
+          dbg(`[ABUSEIPDB] Resposta de erro da API:`, JSON.stringify(error.response.data, null, 2));
+        }
       }
       
-      // Retorna resultado neutro em caso de erro
-      return { isAbusive: false, abuseConfidence: 0, usageType: 'unknown', reports: 0, error: error.message };
+      // Retorna resultado neutro em caso de erro (mas não adiciona à whitelist!)
+      return { 
+        isAbusive: false, 
+        abuseConfidence: 0, 
+        usageType: 'unknown', 
+        reports: 0, 
+        error: error.message,
+        listType: null // Não classifica em caso de erro
+      };
     }
   }
   
@@ -353,10 +484,124 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
   // Limpa cache a cada hora
   setInterval(cleanCache, 60 * 60 * 1000);
   
+  /**
+   * Recategoriza todos os IPs nas listas (whitelist e yellowlist)
+   * Força reanálise com a API para corrigir classificações incorretas
+   * @param {Object} blockerModule - Módulo de bloqueio de IPs (opcional, usa ipBlocker se não fornecido)
+   * @returns {Promise<{recategorized: number, errors: number, results: Array}>}
+   */
+  async function recategorizeAllIPs(blockerModule = null) {
+    const blocker = blockerModule || ipBlocker;
+    if (!blocker) {
+      throw new Error('Módulo ipBlocker não disponível');
+    }
+    
+    if (!ABUSEIPDB_ENABLED || !ABUSEIPDB_API_KEY) {
+      warn(`[ABUSEIPDB] Recategorização desabilitada: API não configurada`);
+      return { recategorized: 0, errors: 0, results: [] };
+    }
+    
+    log(`[ABUSEIPDB] Iniciando recategorização de todos os IPs...`);
+    
+    const results = [];
+    let recategorized = 0;
+    let errors = 0;
+    
+    try {
+      // Busca todos os IPs da whitelist
+      const whitelistIPs = await blocker.listWhitelistIPs(1000, 0);
+      log(`[ABUSEIPDB] Encontrados ${whitelistIPs.length} IP(s) na whitelist para recategorizar`);
+      
+      // Busca todos os IPs da yellowlist
+      const yellowlistIPs = await blocker.listYellowlistIPs(1000, 0);
+      log(`[ABUSEIPDB] Encontrados ${yellowlistIPs.length} IP(s) na yellowlist para recategorizar`);
+      
+      const allIPs = [
+        ...whitelistIPs.map(ip => ({ ip: ip.ip, currentList: 'whitelist', abuseConfidence: ip.abuse_confidence, reports: ip.reports })),
+        ...yellowlistIPs.map(ip => ({ ip: ip.ip, currentList: 'yellowlist', abuseConfidence: ip.abuse_confidence, reports: ip.reports }))
+      ];
+      
+      log(`[ABUSEIPDB] Total de ${allIPs.length} IP(s) para recategorizar`);
+      
+      // Processa cada IP com um pequeno delay para não sobrecarregar a API
+      for (let i = 0; i < allIPs.length; i++) {
+        const ipData = allIPs[i];
+        const normalizedIp = normalizeIp(ipData.ip);
+        
+        try {
+          // Força verificação na API (ignora cache e listas)
+          const checkResult = await checkIP(normalizedIp, 90, true);
+          
+          const newConfidence = checkResult.abuseConfidence || 0;
+          const newReports = checkResult.reports || 0;
+          const newListType = checkResult.listType;
+          
+          // Compara com a classificação anterior
+          const changed = 
+            (ipData.currentList === 'whitelist' && newListType !== 'whitelist') ||
+            (ipData.currentList === 'yellowlist' && newListType !== 'yellowlist') ||
+            (Math.abs(newConfidence - (ipData.abuseConfidence || 0)) > 5); // Mudança significativa
+          
+          if (changed) {
+            log(`[ABUSEIPDB] IP ${normalizedIp} recategorizado: ${ipData.currentList} → ${newListType || 'nenhuma'} (${ipData.abuseConfidence || 0}% → ${newConfidence}%)`);
+            
+            // Remove da lista atual (já feito automaticamente ao adicionar à nova)
+            // Adiciona à lista correta baseado na nova classificação
+            if (newListType === 'blacklist' && checkResult.isAbusive) {
+              await blocker.blockIP(normalizedIp, `Recategorizado: ${newConfidence}% confiança, ${newReports} report(s)`);
+            } else if (newListType === 'yellowlist') {
+              await blocker.addToYellowlist(normalizedIp, newConfidence, newReports, YELLOWLIST_TTL_DAYS);
+            } else if (newListType === 'whitelist') {
+              await blocker.addToWhitelist(normalizedIp, newConfidence, newReports, WHITELIST_TTL_DAYS);
+            }
+            
+            recategorized++;
+          }
+          
+          results.push({
+            ip: normalizedIp,
+            previousList: ipData.currentList,
+            previousConfidence: ipData.abuseConfidence || 0,
+            newList: newListType,
+            newConfidence,
+            newReports,
+            changed
+          });
+          
+          // Delay de 1 segundo entre verificações para não exceder rate limit
+          if (i < allIPs.length - 1) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+          }
+        } catch (error) {
+          errors++;
+          err(`[ABUSEIPDB] Erro ao recategorizar IP ${normalizedIp}:`, error.message);
+          results.push({
+            ip: normalizedIp,
+            previousList: ipData.currentList,
+            error: error.message,
+            changed: false
+          });
+        }
+      }
+      
+      log(`[ABUSEIPDB] Recategorização concluída: ${recategorized} IP(s) recategorizado(s), ${errors} erro(s)`);
+      
+      return {
+        recategorized,
+        errors,
+        results
+      };
+    } catch (error) {
+      err(`[ABUSEIPDB] Erro geral na recategorização:`, error.message);
+      throw error;
+    }
+  }
+  
   return {
     checkIP,
     checkAndBlockIP,
-    normalizeIp
+    normalizeIp,
+    recategorizeAllIPs
   };
 }
 
