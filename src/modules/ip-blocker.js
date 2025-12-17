@@ -1,11 +1,111 @@
 /**
  * Módulo de Bloqueio de IPs
- * Gerencia bloqueio de IPs usando SQLite
+ * Gerencia bloqueio de IPs usando SQLite com cache em memória
  */
 
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
 const fs = require('fs');
+
+/**
+ * Classe de Cache com TTL (Time-To-Live)
+ * Cache em memória para melhorar performance de consultas frequentes
+ */
+class IPCache {
+  constructor(ttlMs = 60000, maxSize = 10000) {
+    this.cache = new Map();
+    this.ttlMs = ttlMs; // Tempo de vida padrão: 60 segundos
+    this.maxSize = maxSize; // Tamanho máximo do cache
+    this.stats = { hits: 0, misses: 0 };
+  }
+  
+  /**
+   * Obtém valor do cache
+   * @param {string} key - Chave do cache
+   * @returns {*} Valor ou undefined se expirado/não existir
+   */
+  get(key) {
+    const entry = this.cache.get(key);
+    if (!entry) {
+      this.stats.misses++;
+      return undefined;
+    }
+    
+    if (Date.now() > entry.expiresAt) {
+      this.cache.delete(key);
+      this.stats.misses++;
+      return undefined;
+    }
+    
+    this.stats.hits++;
+    return entry.value;
+  }
+  
+  /**
+   * Define valor no cache
+   * @param {string} key - Chave
+   * @param {*} value - Valor
+   * @param {number} [ttlMs] - TTL específico (opcional)
+   */
+  set(key, value, ttlMs = this.ttlMs) {
+    // Limpa entradas antigas se o cache estiver cheio
+    if (this.cache.size >= this.maxSize) {
+      this.evictExpired();
+      // Se ainda estiver cheio, remove as mais antigas
+      if (this.cache.size >= this.maxSize) {
+        const keysToDelete = Array.from(this.cache.keys()).slice(0, Math.floor(this.maxSize * 0.1));
+        keysToDelete.forEach(k => this.cache.delete(k));
+      }
+    }
+    
+    this.cache.set(key, {
+      value,
+      expiresAt: Date.now() + ttlMs
+    });
+  }
+  
+  /**
+   * Remove entrada do cache
+   * @param {string} key - Chave
+   */
+  delete(key) {
+    this.cache.delete(key);
+  }
+  
+  /**
+   * Limpa todo o cache
+   */
+  clear() {
+    this.cache.clear();
+    this.stats = { hits: 0, misses: 0 };
+  }
+  
+  /**
+   * Remove entradas expiradas
+   */
+  evictExpired() {
+    const now = Date.now();
+    for (const [key, entry] of this.cache.entries()) {
+      if (now > entry.expiresAt) {
+        this.cache.delete(key);
+      }
+    }
+  }
+  
+  /**
+   * Obtém estatísticas do cache
+   * @returns {Object} Estatísticas
+   */
+  getStats() {
+    return {
+      ...this.stats,
+      size: this.cache.size,
+      hitRate: this.stats.hits + this.stats.misses > 0 
+        ? (this.stats.hits / (this.stats.hits + this.stats.misses) * 100).toFixed(2) + '%'
+        : '0%'
+    };
+  }
+}
 
 /**
  * Inicializa o módulo de bloqueio de IPs
@@ -33,6 +133,21 @@ function initIPBlockerModule({ appRoot, logger }) {
     
     const DB_PATH = path.join(appRoot, 'blocked_ips.db');
     let db = null;
+    
+    // Cache de IPs em memória (TTL: 60 segundos, max: 10000 IPs)
+    const CACHE_TTL_MS = parseInt(process.env.IP_CACHE_TTL_MS || '60000', 10);
+    const CACHE_MAX_SIZE = parseInt(process.env.IP_CACHE_MAX_SIZE || '10000', 10);
+    const blockedCache = new IPCache(CACHE_TTL_MS, CACHE_MAX_SIZE);
+    const whitelistCache = new IPCache(CACHE_TTL_MS, CACHE_MAX_SIZE);
+    const yellowlistCache = new IPCache(CACHE_TTL_MS, CACHE_MAX_SIZE);
+    
+    // Intervalo de limpeza automática do cache (a cada 5 minutos)
+    setInterval(() => {
+      blockedCache.evictExpired();
+      whitelistCache.evictExpired();
+      yellowlistCache.evictExpired();
+      dbg(`[IP-BLOCKER] Cache limpo. Stats: blocked=${JSON.stringify(blockedCache.getStats())}`);
+    }, 5 * 60 * 1000);
     
   // Flag para indicar se o banco está pronto (definido ANTES das funções para estar no escopo)
   let dbReady = false;
@@ -131,6 +246,134 @@ function initIPBlockerModule({ appRoot, logger }) {
                 // Ignora erro se coluna já existe
               });
               
+              // Adiciona colunas para dados do AbuseIPDB (migração v2)
+              const abuseColumns = [
+                { table: 'ip_whitelist', column: 'country_code', type: 'TEXT DEFAULT ""' },
+                { table: 'ip_whitelist', column: 'isp', type: 'TEXT DEFAULT ""' },
+                { table: 'ip_whitelist', column: 'domain', type: 'TEXT DEFAULT ""' },
+                { table: 'ip_whitelist', column: 'usage_type', type: 'TEXT DEFAULT ""' },
+                { table: 'ip_whitelist', column: 'is_tor', type: 'INTEGER DEFAULT 0' },
+                { table: 'ip_whitelist', column: 'num_distinct_users', type: 'INTEGER DEFAULT 0' },
+                { table: 'ip_yellowlist', column: 'country_code', type: 'TEXT DEFAULT ""' },
+                { table: 'ip_yellowlist', column: 'isp', type: 'TEXT DEFAULT ""' },
+                { table: 'ip_yellowlist', column: 'domain', type: 'TEXT DEFAULT ""' },
+                { table: 'ip_yellowlist', column: 'usage_type', type: 'TEXT DEFAULT ""' },
+                { table: 'ip_yellowlist', column: 'is_tor', type: 'INTEGER DEFAULT 0' },
+                { table: 'ip_yellowlist', column: 'num_distinct_users', type: 'INTEGER DEFAULT 0' },
+                // Campos para padronizar blocked_ips com as outras listas
+                { table: 'blocked_ips', column: 'abuse_confidence', type: 'REAL DEFAULT 0' },
+                { table: 'blocked_ips', column: 'reports', type: 'INTEGER DEFAULT 0' },
+                { table: 'blocked_ips', column: 'country_code', type: 'TEXT DEFAULT ""' },
+                { table: 'blocked_ips', column: 'isp', type: 'TEXT DEFAULT ""' },
+                { table: 'blocked_ips', column: 'domain', type: 'TEXT DEFAULT ""' },
+                { table: 'blocked_ips', column: 'usage_type', type: 'TEXT DEFAULT ""' },
+                { table: 'blocked_ips', column: 'is_tor', type: 'INTEGER DEFAULT 0' },
+                { table: 'blocked_ips', column: 'num_distinct_users', type: 'INTEGER DEFAULT 0' }
+              ];
+              
+              abuseColumns.forEach(({ table, column, type }) => {
+                db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`, () => {
+                  // Ignora erro se coluna já existe
+                });
+              });
+              
+              // Cria tabela de log de acesso (IP + Rota)
+              db.run(`
+                CREATE TABLE IF NOT EXISTS access_log (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ip TEXT NOT NULL,
+                  route TEXT NOT NULL,
+                  method TEXT NOT NULL,
+                  status_code INTEGER,
+                  response_time_ms INTEGER,
+                  user_agent TEXT,
+                  created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                )
+              `, () => {});
+              
+              db.run(`CREATE INDEX IF NOT EXISTS idx_access_log_ip ON access_log(ip)`, () => {});
+              db.run(`CREATE INDEX IF NOT EXISTS idx_access_log_route ON access_log(route)`, () => {});
+              db.run(`CREATE INDEX IF NOT EXISTS idx_access_log_created ON access_log(created_at)`, () => {});
+              
+              // Cria tabela de eventos Tuya
+              db.run(`
+                CREATE TABLE IF NOT EXISTS tuya_events (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  device_id TEXT NOT NULL,
+                  device_name TEXT,
+                  event_type TEXT NOT NULL,
+                  old_value TEXT,
+                  new_value TEXT,
+                  source TEXT,
+                  created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                )
+              `, () => {});
+              
+              db.run(`CREATE INDEX IF NOT EXISTS idx_tuya_events_device ON tuya_events(device_id)`, () => {});
+              db.run(`CREATE INDEX IF NOT EXISTS idx_tuya_events_created ON tuya_events(created_at)`, () => {});
+              
+              // Cria tabela de sessões admin (persistentes)
+              db.run(`
+                CREATE TABLE IF NOT EXISTS admin_sessions (
+                  session_id TEXT PRIMARY KEY,
+                  phone TEXT NOT NULL,
+                  device_fingerprint TEXT,
+                  device_name TEXT,
+                  ip_address TEXT,
+                  user_agent TEXT,
+                  trusted_until INTEGER,
+                  created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                  expires_at INTEGER NOT NULL,
+                  last_used_at INTEGER
+                )
+              `, () => {});
+              
+              db.run(`CREATE INDEX IF NOT EXISTS idx_admin_sessions_phone ON admin_sessions(phone)`, () => {});
+              db.run(`CREATE INDEX IF NOT EXISTS idx_admin_sessions_fingerprint ON admin_sessions(device_fingerprint)`, () => {});
+              db.run(`CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at)`, () => {});
+              
+              // Cria tabela de leituras de energia Tuya
+              db.run(`
+                CREATE TABLE IF NOT EXISTS tuya_energy_readings (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  device_id TEXT NOT NULL,
+                  device_name TEXT,
+                  voltage REAL,
+                  current_a REAL,
+                  power_w REAL,
+                  energy_kwh REAL,
+                  power_factor REAL,
+                  frequency REAL,
+                  phases_data TEXT,
+                  created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                )
+              `, () => {});
+              
+              db.run(`CREATE INDEX IF NOT EXISTS idx_tuya_energy_device ON tuya_energy_readings(device_id)`, () => {});
+              db.run(`CREATE INDEX IF NOT EXISTS idx_tuya_energy_created ON tuya_energy_readings(created_at)`, () => {});
+              
+              // Migração: adiciona coluna phases_data se não existir
+              db.run(`ALTER TABLE tuya_energy_readings ADD COLUMN phases_data TEXT`, (err) => {
+                if (err && !err.message.includes('duplicate column')) {
+                  // Ignora erro se coluna já existe
+                }
+              });
+              
+              // Cria tabela de dispositivos ESP32 (HTTP polling)
+              db.run(`
+                CREATE TABLE IF NOT EXISTS esp32_devices (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  ip TEXT NOT NULL UNIQUE,
+                  device_name TEXT,
+                  last_seen INTEGER NOT NULL,
+                  first_seen INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                  request_count INTEGER DEFAULT 1
+                )
+              `, () => {});
+              
+              db.run(`CREATE INDEX IF NOT EXISTS idx_esp32_devices_ip ON esp32_devices(ip)`, () => {});
+              db.run(`CREATE INDEX IF NOT EXISTS idx_esp32_devices_last_seen ON esp32_devices(last_seen)`, () => {});
+              
               // Cria tabela de log de migrações entre listas
               db.run(`
                 CREATE TABLE IF NOT EXISTS ip_migration_log (
@@ -202,7 +445,49 @@ function initIPBlockerModule({ appRoot, logger }) {
                         if (error) {
                           warn(`[IP-BLOCKER] Erro ao criar índices:`, error.message);
                         }
-                        resolve();
+                        
+                        // Cria tabela de ranges IP confiáveis (para Meta, Cloudflare, ESP32, etc.)
+                        db.run(`
+                          CREATE TABLE IF NOT EXISTS trusted_ip_ranges (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            cidr TEXT NOT NULL,
+                            category TEXT NOT NULL,
+                            description TEXT,
+                            enabled INTEGER DEFAULT 1,
+                            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                          )
+                        `, (error) => {
+                          if (error) {
+                            warn(`[IP-BLOCKER] Erro ao criar tabela trusted_ip_ranges:`, error.message);
+                          }
+                          
+                          // Cria índice para busca por categoria
+                          db.run(`
+                            CREATE INDEX IF NOT EXISTS idx_trusted_ip_ranges_category ON trusted_ip_ranges(category);
+                            CREATE INDEX IF NOT EXISTS idx_trusted_ip_ranges_enabled ON trusted_ip_ranges(enabled)
+                          `, (error) => {
+                            if (error) {
+                              warn(`[IP-BLOCKER] Erro ao criar índices de trusted_ip_ranges:`, error.message);
+                            }
+                            
+                            // Cria tabela de controle de rate limit da API AbuseIPDB
+                            db.run(`
+                              CREATE TABLE IF NOT EXISTS abuseipdb_rate_limit (
+                                endpoint TEXT PRIMARY KEY,
+                                daily_limit INTEGER NOT NULL,
+                                daily_used INTEGER DEFAULT 0,
+                                last_reset INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                              )
+                            `, (error) => {
+                              if (error) {
+                                warn(`[IP-BLOCKER] Erro ao criar tabela abuseipdb_rate_limit:`, error.message);
+                              }
+                              resolve();
+                            });
+                          });
+                        });
                       });
                     });
                   });
@@ -216,7 +501,7 @@ function initIPBlockerModule({ appRoot, logger }) {
   }
   
   /**
-   * Verifica se um IP está bloqueado
+   * Verifica se um IP está bloqueado (com cache)
    * @param {string} ip - Endereço IP
    * @returns {Promise<boolean>} true se estiver bloqueado
    */
@@ -227,6 +512,13 @@ function initIPBlockerModule({ appRoot, logger }) {
         return;
       }
       
+      // Verifica cache primeiro
+      const cached = blockedCache.get(`blocked:${ip}`);
+      if (cached !== undefined) {
+        resolve(cached);
+        return;
+      }
+      
       db.get('SELECT ip FROM blocked_ips WHERE ip = ?', [ip], (error, row) => {
         if (error) {
           err(`[IP-BLOCKER] Erro ao verificar IP:`, error.message);
@@ -234,7 +526,10 @@ function initIPBlockerModule({ appRoot, logger }) {
           return;
         }
         
-        resolve(!!row);
+        const isBlocked = !!row;
+        // Armazena no cache
+        blockedCache.set(`blocked:${ip}`, isBlocked);
+        resolve(isBlocked);
       });
     });
   }
@@ -330,6 +625,11 @@ function initIPBlockerModule({ appRoot, logger }) {
             return;
           }
           
+          // Invalida caches para este IP
+          blockedCache.delete(`blocked:${ip}`);
+          whitelistCache.delete(`whitelist:${ip}`);
+          yellowlistCache.delete(`yellowlist:${ip}`);
+          
           log(`[IP-BLOCKER] IP bloqueado: ${ip} (motivo: ${reason})`);
           resolve(true);
         });
@@ -357,6 +657,9 @@ function initIPBlockerModule({ appRoot, logger }) {
           reject(error);
           return;
         }
+        
+        // Invalida cache
+        blockedCache.delete(`blocked:${ip}`);
         
         if (this.changes > 0) {
           log(`[IP-BLOCKER] IP desbloqueado: ${ip}`);
@@ -538,7 +841,8 @@ function initIPBlockerModule({ appRoot, logger }) {
       }
       
       const sql = `
-        SELECT ip, reason, blocked_at, last_seen, request_count, created_at
+        SELECT ip, reason, blocked_at, last_seen, request_count, created_at,
+               abuse_confidence, reports, country_code, isp, domain, usage_type, is_tor, num_distinct_users
         FROM blocked_ips
         ORDER BY blocked_at DESC
         LIMIT ? OFFSET ?
@@ -647,7 +951,8 @@ function initIPBlockerModule({ appRoot, logger }) {
       
       const now = Math.floor(Date.now() / 1000);
       const sql = `
-        SELECT ip, abuse_confidence, reports, request_count, last_seen, created_at, expires_at
+        SELECT ip, abuse_confidence, reports, request_count, last_seen, created_at, expires_at,
+               country_code, isp, domain, usage_type, is_tor, num_distinct_users
         FROM ip_whitelist
         WHERE expires_at > ?
         ORDER BY created_at DESC
@@ -723,7 +1028,8 @@ function initIPBlockerModule({ appRoot, logger }) {
       
       const now = Math.floor(Date.now() / 1000);
       const sql = `
-        SELECT ip, abuse_confidence, reports, request_count, last_seen, created_at, expires_at
+        SELECT ip, abuse_confidence, reports, request_count, last_seen, created_at, expires_at,
+               country_code, isp, domain, usage_type, is_tor, num_distinct_users
         FROM ip_yellowlist
         WHERE expires_at > ?
         ORDER BY created_at DESC
@@ -1006,9 +1312,10 @@ function initIPBlockerModule({ appRoot, logger }) {
    * @param {number} abuseConfidence - Confiança de abuso (0-100)
    * @param {number} reports - Número de reports
    * @param {number} ttlDays - Tempo de vida em dias (padrão: 15)
+   * @param {Object} extraData - Dados extras do AbuseIPDB (opcional)
    * @returns {Promise<boolean>} true se adicionado com sucesso
    */
-  function addToWhitelist(ip, abuseConfidence, reports = 0, ttlDays = 15) {
+  function addToWhitelist(ip, abuseConfidence, reports = 0, ttlDays = 15, extraData = {}) {
     return new Promise(async (resolve, reject) => {
       if (!db) {
         reject(new Error('Banco de dados não inicializado'));
@@ -1055,18 +1362,32 @@ function initIPBlockerModule({ appRoot, logger }) {
         const now = Math.floor(Date.now() / 1000);
         const expiresAt = now + (ttlDays * 24 * 60 * 60);
         
+        // Extrai dados extras
+        const countryCode = extraData.countryCode || '';
+        const isp = extraData.isp || '';
+        const domain = extraData.domain || '';
+        const usageType = extraData.usageType || '';
+        const isTor = extraData.isTor ? 1 : 0;
+        const numDistinctUsers = extraData.numDistinctUsers || 0;
+        
         // Se o IP já existe, mantém request_count e last_seen, apenas atualiza outros campos
         // Se não existe, cria com request_count=1 e last_seen=now
         db.run(`
-          INSERT INTO ip_whitelist (ip, abuse_confidence, reports, request_count, last_seen, created_at, expires_at)
-          VALUES (?, ?, ?, 1, ?, ?, ?)
+          INSERT INTO ip_whitelist (ip, abuse_confidence, reports, request_count, last_seen, created_at, expires_at, country_code, isp, domain, usage_type, is_tor, num_distinct_users)
+          VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(ip) DO UPDATE SET
             abuse_confidence = excluded.abuse_confidence,
             reports = excluded.reports,
             expires_at = excluded.expires_at,
             last_seen = excluded.last_seen,
-            request_count = request_count + 1
-        `, [ip, abuseConfidence, reports, now, now, expiresAt], function(error) {
+            request_count = request_count + 1,
+            country_code = excluded.country_code,
+            isp = excluded.isp,
+            domain = excluded.domain,
+            usage_type = excluded.usage_type,
+            is_tor = excluded.is_tor,
+            num_distinct_users = excluded.num_distinct_users
+        `, [ip, abuseConfidence, reports, now, now, expiresAt, countryCode, isp, domain, usageType, isTor, numDistinctUsers], function(error) {
           if (error) {
             err(`[IP-BLOCKER] Erro ao adicionar à whitelist:`, error.message);
             reject(error);
@@ -1078,7 +1399,12 @@ function initIPBlockerModule({ appRoot, logger }) {
             logMigration(ip, fromList, 'whitelist', oldConfidence, abuseConfidence, oldReports, reports, 'Classificação automática pelo AbuseIPDB');
           }
           
-          dbg(`[IP-BLOCKER] IP adicionado à whitelist: ${ip} (${abuseConfidence}% confiança, válido até ${new Date(expiresAt * 1000).toISOString()})`);
+          // Invalida caches para este IP
+          blockedCache.delete(`blocked:${ip}`);
+          whitelistCache.delete(`whitelist:${ip}`);
+          yellowlistCache.delete(`yellowlist:${ip}`);
+          
+          dbg(`[IP-BLOCKER] IP adicionado à whitelist: ${ip} (${abuseConfidence}% confiança, ${countryCode || 'país desconhecido'}, válido até ${new Date(expiresAt * 1000).toISOString()})`);
           resolve(true);
         });
       } catch (e) {
@@ -1094,9 +1420,10 @@ function initIPBlockerModule({ appRoot, logger }) {
    * @param {number} abuseConfidence - Confiança de abuso (0-100)
    * @param {number} reports - Número de reports
    * @param {number} ttlDays - Tempo de vida em dias (padrão: 7)
+   * @param {Object} extraData - Dados extras do AbuseIPDB (opcional)
    * @returns {Promise<boolean>} true se adicionado com sucesso
    */
-  function addToYellowlist(ip, abuseConfidence, reports = 0, ttlDays = 7) {
+  function addToYellowlist(ip, abuseConfidence, reports = 0, ttlDays = 7, extraData = {}) {
     return new Promise(async (resolve, reject) => {
       if (!db) {
         reject(new Error('Banco de dados não inicializado'));
@@ -1143,18 +1470,32 @@ function initIPBlockerModule({ appRoot, logger }) {
         const now = Math.floor(Date.now() / 1000);
         const expiresAt = now + (ttlDays * 24 * 60 * 60);
         
+        // Extrai dados extras
+        const countryCode = extraData.countryCode || '';
+        const isp = extraData.isp || '';
+        const domain = extraData.domain || '';
+        const usageType = extraData.usageType || '';
+        const isTor = extraData.isTor ? 1 : 0;
+        const numDistinctUsers = extraData.numDistinctUsers || 0;
+        
         // Se o IP já existe, mantém request_count e last_seen, apenas atualiza outros campos
         // Se não existe, cria com request_count=1 e last_seen=now
         db.run(`
-          INSERT INTO ip_yellowlist (ip, abuse_confidence, reports, request_count, last_seen, created_at, expires_at)
-          VALUES (?, ?, ?, 1, ?, ?, ?)
+          INSERT INTO ip_yellowlist (ip, abuse_confidence, reports, request_count, last_seen, created_at, expires_at, country_code, isp, domain, usage_type, is_tor, num_distinct_users)
+          VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(ip) DO UPDATE SET
             abuse_confidence = excluded.abuse_confidence,
             reports = excluded.reports,
             expires_at = excluded.expires_at,
             last_seen = excluded.last_seen,
-            request_count = request_count + 1
-        `, [ip, abuseConfidence, reports, now, now, expiresAt], function(error) {
+            request_count = request_count + 1,
+            country_code = excluded.country_code,
+            isp = excluded.isp,
+            domain = excluded.domain,
+            usage_type = excluded.usage_type,
+            is_tor = excluded.is_tor,
+            num_distinct_users = excluded.num_distinct_users
+        `, [ip, abuseConfidence, reports, now, now, expiresAt, countryCode, isp, domain, usageType, isTor, numDistinctUsers], function(error) {
           if (error) {
             err(`[IP-BLOCKER] Erro ao adicionar à yellowlist:`, error.message);
             reject(error);
@@ -1166,6 +1507,11 @@ function initIPBlockerModule({ appRoot, logger }) {
             logMigration(ip, fromList, 'yellowlist', oldConfidence, abuseConfidence, oldReports, reports, 'Classificação automática pelo AbuseIPDB');
           }
           
+          // Invalida caches para este IP
+          blockedCache.delete(`blocked:${ip}`);
+          whitelistCache.delete(`whitelist:${ip}`);
+          yellowlistCache.delete(`yellowlist:${ip}`);
+          
           dbg(`[IP-BLOCKER] IP adicionado à yellowlist: ${ip} (${abuseConfidence}% confiança, válido até ${new Date(expiresAt * 1000).toISOString()})`);
           resolve(true);
         });
@@ -1176,7 +1522,7 @@ function initIPBlockerModule({ appRoot, logger }) {
   }
   
   /**
-   * Verifica se IP está na whitelist e ainda válido
+   * Verifica se IP está na whitelist e ainda válido (com cache)
    * @param {string} ip - Endereço IP
    * @returns {Promise<{inWhitelist: boolean, abuseConfidence: number, expiresAt: number}>}
    */
@@ -1184,6 +1530,13 @@ function initIPBlockerModule({ appRoot, logger }) {
     return new Promise((resolve) => {
       if (!db) {
         resolve({ inWhitelist: false });
+        return;
+      }
+      
+      // Verifica cache primeiro
+      const cached = whitelistCache.get(`whitelist:${ip}`);
+      if (cached !== undefined) {
+        resolve(cached);
         return;
       }
       
@@ -1202,20 +1555,24 @@ function initIPBlockerModule({ appRoot, logger }) {
         
         if (row) {
           dbg(`[IP-BLOCKER] IP ${ip} encontrado na whitelist: expires_at=${row.expires_at}, now=${now}, válido=${row.expires_at > now}`);
-          resolve({
+          const result = {
             inWhitelist: true,
             abuseConfidence: row.abuse_confidence,
             expiresAt: row.expires_at,
             requestCount: row.request_count || 0,
             lastSeen: row.last_seen
-          });
+          };
+          whitelistCache.set(`whitelist:${ip}`, result);
+          resolve(result);
         } else {
           // Verifica se o IP existe mas está expirado
-          db.get(`SELECT ip, expires_at FROM ip_whitelist WHERE ip = ?`, [ip], (err, expiredRow) => {
+          db.get(`SELECT ip, expires_at FROM ip_whitelist WHERE ip = ?`, [ip], (checkError, expiredRow) => {
             if (expiredRow) {
               dbg(`[IP-BLOCKER] IP ${ip} existe na whitelist mas está EXPIRADO: expires_at=${expiredRow.expires_at}, now=${now}`);
             }
-            resolve({ inWhitelist: false });
+            const result = { inWhitelist: false };
+            whitelistCache.set(`whitelist:${ip}`, result);
+            resolve(result);
           });
         }
       });
@@ -1223,7 +1580,7 @@ function initIPBlockerModule({ appRoot, logger }) {
   }
   
   /**
-   * Verifica se IP está na yellowlist e ainda válido
+   * Verifica se IP está na yellowlist e ainda válido (com cache)
    * @param {string} ip - Endereço IP
    * @returns {Promise<{inYellowlist: boolean, abuseConfidence: number, expiresAt: number}>}
    */
@@ -1231,6 +1588,13 @@ function initIPBlockerModule({ appRoot, logger }) {
     return new Promise((resolve) => {
       if (!db) {
         resolve({ inYellowlist: false });
+        return;
+      }
+      
+      // Verifica cache primeiro
+      const cached = yellowlistCache.get(`yellowlist:${ip}`);
+      if (cached !== undefined) {
+        resolve(cached);
         return;
       }
       
@@ -1248,15 +1612,19 @@ function initIPBlockerModule({ appRoot, logger }) {
         }
         
         if (row) {
-          resolve({
+          const result = {
             inYellowlist: true,
             abuseConfidence: row.abuse_confidence,
             expiresAt: row.expires_at,
             requestCount: row.request_count || 0,
             lastSeen: row.last_seen
-          });
+          };
+          yellowlistCache.set(`yellowlist:${ip}`, result);
+          resolve(result);
         } else {
-          resolve({ inYellowlist: false });
+          const result = { inYellowlist: false };
+          yellowlistCache.set(`yellowlist:${ip}`, result);
+          resolve(result);
         }
       });
     });
@@ -1280,6 +1648,9 @@ function initIPBlockerModule({ appRoot, logger }) {
           reject(error);
           return;
         }
+        
+        // Invalida cache
+        whitelistCache.delete(`whitelist:${ip}`);
         
         if (this.changes > 0) {
           log(`[IP-BLOCKER] IP ${ip} removido da whitelist`);
@@ -1310,6 +1681,9 @@ function initIPBlockerModule({ appRoot, logger }) {
           reject(error);
           return;
         }
+        
+        // Invalida cache
+        yellowlistCache.delete(`yellowlist:${ip}`);
         
         if (this.changes > 0) {
           log(`[IP-BLOCKER] IP ${ip} removido da yellowlist`);
@@ -1447,6 +1821,714 @@ function initIPBlockerModule({ appRoot, logger }) {
         log(`[IP-BLOCKER] ✅ Resultado: row=${JSON.stringify(row)}, count=${count}`);
         log(`[IP-BLOCKER] ✅ Total de migration logs: ${count}`);
         resolve(count);
+      });
+    });
+  }
+  
+  // ===== ADMIN SESSIONS =====
+  
+  /**
+   * Salva uma sessão admin no banco
+   */
+  function saveAdminSession(sessionId, data) {
+    return new Promise((resolve, reject) => {
+      if (!db || !dbReady) {
+        reject(new Error('Database not ready'));
+        return;
+      }
+      
+      db.run(`
+        INSERT OR REPLACE INTO admin_sessions 
+        (session_id, phone, device_fingerprint, device_name, ip_address, user_agent, trusted_until, created_at, expires_at, last_used_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        sessionId,
+        data.phone,
+        data.deviceFingerprint || null,
+        data.deviceName || null,
+        data.ipAddress || null,
+        data.userAgent || null,
+        data.trustedUntil || null,
+        data.createdAt || Math.floor(Date.now() / 1000),
+        data.expiresAt,
+        data.lastUsedAt || Math.floor(Date.now() / 1000)
+      ], (error) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao salvar sessão admin:`, error.message);
+          reject(error);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+  
+  /**
+   * Busca uma sessão admin pelo ID
+   */
+  function getAdminSession(sessionId) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve(null);
+        return;
+      }
+      
+      db.get(`SELECT * FROM admin_sessions WHERE session_id = ?`, [sessionId], (error, row) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao buscar sessão admin:`, error.message);
+          resolve(null);
+        } else {
+          resolve(row || null);
+        }
+      });
+    });
+  }
+  
+  /**
+   * Busca sessão por fingerprint de dispositivo confiável
+   */
+  function getAdminSessionByFingerprint(fingerprint) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve(null);
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      db.get(`
+        SELECT * FROM admin_sessions 
+        WHERE device_fingerprint = ? AND trusted_until > ?
+        ORDER BY last_used_at DESC LIMIT 1
+      `, [fingerprint, now], (error, row) => {
+        if (error) {
+          resolve(null);
+        } else {
+          resolve(row || null);
+        }
+      });
+    });
+  }
+  
+  /**
+   * Atualiza último uso da sessão
+   */
+  function updateAdminSessionLastUsed(sessionId) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve();
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      db.run(`UPDATE admin_sessions SET last_used_at = ? WHERE session_id = ?`, [now, sessionId], () => resolve());
+    });
+  }
+  
+  /**
+   * Remove uma sessão admin
+   */
+  function deleteAdminSession(sessionId) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve();
+        return;
+      }
+      
+      db.run(`DELETE FROM admin_sessions WHERE session_id = ?`, [sessionId], () => resolve());
+    });
+  }
+  
+  /**
+   * Remove sessões expiradas
+   */
+  function cleanExpiredAdminSessions() {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve(0);
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      db.run(`DELETE FROM admin_sessions WHERE expires_at < ? AND (trusted_until IS NULL OR trusted_until < ?)`, 
+        [now, now], function(error) {
+          resolve(this?.changes || 0);
+        });
+    });
+  }
+  
+  /**
+   * Lista dispositivos confiáveis de um telefone
+   */
+  function listTrustedDevices(phone) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve([]);
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      db.all(`
+        SELECT session_id, device_name, ip_address, trusted_until, created_at, last_used_at
+        FROM admin_sessions 
+        WHERE phone = ? AND trusted_until > ?
+        ORDER BY last_used_at DESC
+      `, [phone, now], (error, rows) => {
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  /**
+   * Revoga confiança de um dispositivo
+   */
+  function revokeTrustedDevice(sessionId) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve();
+        return;
+      }
+      
+      db.run(`UPDATE admin_sessions SET trusted_until = NULL WHERE session_id = ?`, [sessionId], () => resolve());
+    });
+  }
+  
+  // ===== ESP32 DEVICES =====
+  
+  /**
+   * Registra/atualiza dispositivo ESP32
+   */
+  function updateESP32Device(ip, deviceName = null) {
+    return new Promise(async (resolve) => {
+      // Aguarda banco estar pronto
+      if (!dbReady) {
+        try {
+          await dbReadyPromise;
+        } catch (e) {
+          dbg(`[IP-BLOCKER] updateESP32Device: erro ao aguardar banco para IP ${ip}:`, e.message);
+          resolve();
+          return;
+        }
+      }
+      
+      if (!db) {
+        dbg(`[IP-BLOCKER] updateESP32Device: banco não inicializado para IP ${ip}`);
+        resolve();
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      db.run(`
+        INSERT INTO esp32_devices (ip, device_name, last_seen, first_seen, request_count)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(ip) DO UPDATE SET 
+          last_seen = ?,
+          device_name = COALESCE(?, device_name),
+          request_count = request_count + 1
+      `, [ip, deviceName, now, now, now, deviceName], function(error) {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao atualizar ESP32 device ${ip}:`, error.message);
+        } else {
+          log(`[IP-BLOCKER] ESP32 device ${ip} atualizado: last_seen=${now}, request_count=${this.changes > 0 ? 'incrementado' : 'novo'}`);
+        }
+        resolve();
+      });
+    });
+  }
+  
+  /**
+   * Lista dispositivos ESP32 online (visto nos últimos X segundos)
+   */
+  function listESP32Devices(onlineThresholdSeconds = 120) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve([]);
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      const threshold = now - onlineThresholdSeconds;
+      
+      db.all(`
+        SELECT ip, device_name, last_seen, first_seen, request_count,
+               CASE WHEN last_seen >= ? THEN 1 ELSE 0 END as is_online
+        FROM esp32_devices
+        ORDER BY last_seen DESC
+      `, [threshold], (error, rows) => {
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  // ===== TUYA ENERGY READINGS =====
+  
+  /**
+   * Salva leitura de energia
+   */
+  function saveTuyaEnergyReading(deviceId, deviceName, data) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve();
+        return;
+      }
+      
+      // Prepara dados de fases (se disponível)
+      const phasesData = data.phases ? JSON.stringify(data.phases) : null;
+      
+      // Calcula valores totais/gerais se não fornecidos
+      const totalVoltage = data.voltage || (data.phases && data.phases.A && data.phases.A.voltage) || null;
+      const totalCurrent = data.current || (data.phases && Object.values(data.phases).reduce((sum, p) => sum + (p.current || 0), 0)) || null;
+      const totalPower = data.power || (data.phases && Object.values(data.phases).reduce((sum, p) => sum + (p.power || 0), 0)) || null;
+      const totalEnergy = data.energy || (data.phases && Object.values(data.phases).reduce((sum, p) => sum + (p.energy || 0), 0)) || null;
+      const avgPowerFactor = data.powerFactor || (data.phases && Object.values(data.phases).filter(p => p.powerFactor).reduce((sum, p, i, arr) => sum + (p.powerFactor || 0) / arr.length, 0)) || null;
+      
+      db.run(`
+        INSERT INTO tuya_energy_readings (device_id, device_name, voltage, current_a, power_w, energy_kwh, power_factor, frequency, phases_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        deviceId,
+        deviceName,
+        totalVoltage,
+        totalCurrent,
+        totalPower,
+        totalEnergy,
+        avgPowerFactor,
+        data.frequency || null,
+        phasesData
+      ], () => resolve());
+    });
+  }
+  
+  /**
+   * Lista leituras de energia de um dispositivo
+   */
+  function listTuyaEnergyReadings(deviceId, limit = 100, offset = 0) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve([]);
+        return;
+      }
+      
+      let query = `SELECT * FROM tuya_energy_readings`;
+      const params = [];
+      
+      if (deviceId) {
+        query += ` WHERE device_id = ?`;
+        params.push(deviceId);
+      }
+      
+      query += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+      params.push(limit, offset);
+      
+      db.all(query, params, (error, rows) => {
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  /**
+   * Obtém estatísticas de energia por período
+   */
+  function getTuyaEnergyStats(deviceId, periodHours = 24) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve(null);
+        return;
+      }
+      
+      const since = Math.floor(Date.now() / 1000) - (periodHours * 3600);
+      
+      db.get(`
+        SELECT 
+          device_id,
+          COUNT(*) as readings_count,
+          AVG(voltage) as avg_voltage,
+          AVG(current_a) as avg_current,
+          AVG(power_w) as avg_power,
+          MAX(power_w) as max_power,
+          MIN(power_w) as min_power,
+          MAX(energy_kwh) - MIN(energy_kwh) as energy_consumed,
+          AVG(power_factor) as avg_power_factor
+        FROM tuya_energy_readings
+        WHERE device_id = ? AND created_at >= ?
+        GROUP BY device_id
+      `, [deviceId, since], (error, row) => {
+        resolve(row || null);
+      });
+    });
+  }
+  
+  /**
+   * Obtém leituras agrupadas por hora para gráfico
+   */
+  function getTuyaEnergyByHour(deviceId, periodHours = 24) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve([]);
+        return;
+      }
+      
+      const since = Math.floor(Date.now() / 1000) - (periodHours * 3600);
+      
+      // Primeiro busca todas as leituras para processar fases
+      db.all(`
+        SELECT 
+          created_at,
+          power_w,
+          voltage,
+          current_a,
+          phases_data
+        FROM tuya_energy_readings
+        WHERE device_id = ? AND created_at >= ?
+        ORDER BY created_at ASC
+      `, [deviceId, since], (error, allRows) => {
+        if (error) {
+          resolve([]);
+          return;
+        }
+        
+        // Agrupa por hora e processa fases
+        const hourlyMap = new Map();
+        
+        (allRows || []).forEach(row => {
+          const hour = new Date(row.created_at * 1000).toISOString().substring(0, 13) + ':00';
+          
+          if (!hourlyMap.has(hour)) {
+            hourlyMap.set(hour, {
+              hour,
+              powers: [],
+              maxPower: 0,
+              voltages: [],
+              currents: [],
+              phasesData: []
+            });
+          }
+          
+          const hourData = hourlyMap.get(hour);
+          if (row.power_w) hourData.powers.push(row.power_w);
+          if (row.voltage) hourData.voltages.push(row.voltage);
+          if (row.current_a) hourData.currents.push(row.current_a);
+          if (row.power_w > hourData.maxPower) hourData.maxPower = row.power_w;
+          if (row.phases_data) hourData.phasesData.push(row.phases_data);
+        });
+        
+        // Processa cada hora
+        const processedRows = Array.from(hourlyMap.values()).map(hourData => {
+          const result = {
+            hour: hourData.hour,
+            avg_power: hourData.powers.length > 0 ? hourData.powers.reduce((a, b) => a + b, 0) / hourData.powers.length : 0,
+            max_power: hourData.maxPower,
+            avg_voltage: hourData.voltages.length > 0 ? hourData.voltages.reduce((a, b) => a + b, 0) / hourData.voltages.length : 0,
+            avg_current: hourData.currents.length > 0 ? hourData.currents.reduce((a, b) => a + b, 0) / hourData.currents.length : 0,
+            readings: hourData.powers.length
+          };
+          
+          // Processa dados de fases (média das leituras da hora)
+          if (hourData.phasesData.length > 0) {
+            const phasesAccum = { A: { power: [], voltage: [], current: [], energy: [] }, 
+                                  B: { power: [], voltage: [], current: [], energy: [] }, 
+                                  C: { power: [], voltage: [], current: [], energy: [] } };
+            
+            hourData.phasesData.forEach(phasesJson => {
+              try {
+                const phases = JSON.parse(phasesJson);
+                ['A', 'B', 'C'].forEach(phase => {
+                  if (phases[phase]) {
+                    if (phases[phase].power !== undefined) phasesAccum[phase].power.push(phases[phase].power);
+                    if (phases[phase].voltage !== undefined) phasesAccum[phase].voltage.push(phases[phase].voltage);
+                    if (phases[phase].current !== undefined) phasesAccum[phase].current.push(phases[phase].current);
+                    if (phases[phase].energy !== undefined) phasesAccum[phase].energy.push(phases[phase].energy);
+                  }
+                });
+              } catch (e) {
+                // Ignora erro de parsing
+              }
+            });
+            
+            result.phases = {};
+            ['A', 'B', 'C'].forEach(phase => {
+              if (phasesAccum[phase].power.length > 0) {
+                result.phases[phase] = {
+                  power: phasesAccum[phase].power.reduce((a, b) => a + b, 0) / phasesAccum[phase].power.length,
+                  voltage: phasesAccum[phase].voltage.length > 0 ? phasesAccum[phase].voltage.reduce((a, b) => a + b, 0) / phasesAccum[phase].voltage.length : null,
+                  current: phasesAccum[phase].current.length > 0 ? phasesAccum[phase].current.reduce((a, b) => a + b, 0) / phasesAccum[phase].current.length : null,
+                  energy: phasesAccum[phase].energy.length > 0 ? phasesAccum[phase].energy[phasesAccum[phase].energy.length - 1] : null // Última leitura
+                };
+              }
+            });
+            
+            // Remove fases vazias
+            Object.keys(result.phases).forEach(phase => {
+              if (!result.phases[phase].power) delete result.phases[phase];
+            });
+            if (Object.keys(result.phases).length === 0) delete result.phases;
+          }
+          
+          return result;
+        });
+        
+        resolve(processedRows);
+      });
+    });
+  }
+  
+  // ===== ACCESS LOG =====
+  
+  /**
+   * Registra um acesso no log
+   * @param {string} ip - IP do cliente
+   * @param {string} route - Rota acessada
+   * @param {string} method - Método HTTP
+   * @param {number} statusCode - Código de resposta
+   * @param {number} responseTimeMs - Tempo de resposta em ms
+   * @param {string} userAgent - User-Agent do cliente
+   */
+  function logAccessRequest(ip, route, method, statusCode = 0, responseTimeMs = 0, userAgent = '') {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve();
+        return;
+      }
+      
+      db.run(`
+        INSERT INTO access_log (ip, route, method, status_code, response_time_ms, user_agent)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `, [ip, route, method, statusCode, responseTimeMs, userAgent], (error) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao registrar acesso:`, error.message);
+        }
+        resolve();
+      });
+    });
+  }
+  
+  /**
+   * Lista logs de acesso
+   * @param {number} limit - Limite de resultados
+   * @param {number} offset - Offset para paginação
+   * @param {Object} filters - Filtros opcionais (ip, route, method)
+   */
+  function listAccessLogs(limit = 100, offset = 0, filters = {}) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve([]);
+        return;
+      }
+      
+      let query = 'SELECT * FROM access_log WHERE 1=1';
+      const params = [];
+      
+      if (filters.ip) {
+        query += ' AND ip LIKE ?';
+        params.push(`%${filters.ip}%`);
+      }
+      if (filters.route) {
+        query += ' AND route LIKE ?';
+        params.push(`%${filters.route}%`);
+      }
+      if (filters.method) {
+        query += ' AND method = ?';
+        params.push(filters.method);
+      }
+      
+      query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+      params.push(limit, offset);
+      
+      db.all(query, params, (error, rows) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao listar access logs:`, error.message);
+          resolve([]);
+          return;
+        }
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  /**
+   * Conta logs de acesso
+   */
+  function countAccessLogs(filters = {}) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve(0);
+        return;
+      }
+      
+      let query = 'SELECT COUNT(*) as count FROM access_log WHERE 1=1';
+      const params = [];
+      
+      if (filters.ip) {
+        query += ' AND ip LIKE ?';
+        params.push(`%${filters.ip}%`);
+      }
+      if (filters.route) {
+        query += ' AND route LIKE ?';
+        params.push(`%${filters.route}%`);
+      }
+      
+      db.get(query, params, (error, row) => {
+        if (error) {
+          resolve(0);
+          return;
+        }
+        resolve(row?.count || 0);
+      });
+    });
+  }
+  
+  /**
+   * Obtém estatísticas de acesso por rota
+   */
+  function getAccessStatsByRoute(limit = 20) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve([]);
+        return;
+      }
+      
+      db.all(`
+        SELECT route, method, COUNT(*) as count, 
+               AVG(response_time_ms) as avg_response_time,
+               MAX(created_at) as last_access
+        FROM access_log 
+        GROUP BY route, method 
+        ORDER BY count DESC 
+        LIMIT ?
+      `, [limit], (error, rows) => {
+        if (error) {
+          resolve([]);
+          return;
+        }
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  /**
+   * Obtém estatísticas de acesso por IP
+   */
+  function getAccessStatsByIP(limit = 20) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve([]);
+        return;
+      }
+      
+      db.all(`
+        SELECT ip, COUNT(*) as count, 
+               COUNT(DISTINCT route) as unique_routes,
+               MAX(created_at) as last_access
+        FROM access_log 
+        GROUP BY ip 
+        ORDER BY count DESC 
+        LIMIT ?
+      `, [limit], (error, rows) => {
+        if (error) {
+          resolve([]);
+          return;
+        }
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  // ===== TUYA EVENTS =====
+  
+  /**
+   * Registra um evento Tuya
+   * @param {string} deviceId - ID do dispositivo
+   * @param {string} deviceName - Nome do dispositivo
+   * @param {string} eventType - Tipo do evento (power_change, online_change, command)
+   * @param {string} oldValue - Valor anterior
+   * @param {string} newValue - Novo valor
+   * @param {string} source - Fonte do evento (monitor, admin, whatsapp, api)
+   */
+  function logTuyaEvent(deviceId, deviceName, eventType, oldValue, newValue, source = 'system') {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve();
+        return;
+      }
+      
+      db.run(`
+        INSERT INTO tuya_events (device_id, device_name, event_type, old_value, new_value, source)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `, [deviceId, deviceName, eventType, oldValue, newValue, source], (error) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao registrar evento Tuya:`, error.message);
+        }
+        resolve();
+      });
+    });
+  }
+  
+  /**
+   * Lista eventos Tuya
+   * @param {number} limit - Limite de resultados
+   * @param {number} offset - Offset para paginação
+   * @param {Object} filters - Filtros opcionais (deviceId, eventType)
+   */
+  function listTuyaEvents(limit = 100, offset = 0, filters = {}) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve([]);
+        return;
+      }
+      
+      let query = 'SELECT * FROM tuya_events WHERE 1=1';
+      const params = [];
+      
+      if (filters.deviceId) {
+        query += ' AND device_id = ?';
+        params.push(filters.deviceId);
+      }
+      if (filters.eventType) {
+        query += ' AND event_type = ?';
+        params.push(filters.eventType);
+      }
+      
+      query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+      params.push(limit, offset);
+      
+      db.all(query, params, (error, rows) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao listar eventos Tuya:`, error.message);
+          resolve([]);
+          return;
+        }
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  /**
+   * Conta eventos Tuya
+   */
+  function countTuyaEvents(filters = {}) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve(0);
+        return;
+      }
+      
+      let query = 'SELECT COUNT(*) as count FROM tuya_events WHERE 1=1';
+      const params = [];
+      
+      if (filters.deviceId) {
+        query += ' AND device_id = ?';
+        params.push(filters.deviceId);
+      }
+      if (filters.eventType) {
+        query += ' AND event_type = ?';
+        params.push(filters.eventType);
+      }
+      
+      db.get(query, params, (error, row) => {
+        if (error) {
+          resolve(0);
+          return;
+        }
+        resolve(row?.count || 0);
       });
     });
   }
@@ -1829,6 +2911,465 @@ function initIPBlockerModule({ appRoot, logger }) {
     });
   }
   
+  // ===== TRUSTED IP RANGES =====
+  
+  // Cache para ranges confiáveis (atualizado a cada 5 minutos)
+  let trustedRangesCache = null;
+  let trustedRangesCacheTime = 0;
+  const TRUSTED_RANGES_CACHE_TTL = 5 * 60 * 1000; // 5 minutos
+  
+  /**
+   * Adiciona um range de IP confiável
+   * @param {string} cidr - Range CIDR (ex: 157.240.0.0/16)
+   * @param {string} category - Categoria (ex: 'meta', 'cloudflare', 'esp32')
+   * @param {string} description - Descrição opcional
+   * @returns {Promise<{success: boolean, id: number}>}
+   */
+  function addTrustedRange(cidr, category, description = '') {
+    return new Promise((resolve, reject) => {
+      if (!db) {
+        reject(new Error('Banco de dados não inicializado'));
+        return;
+      }
+      
+      // Valida formato CIDR básico
+      const cidrRegex = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
+      if (!cidrRegex.test(cidr)) {
+        reject(new Error(`Formato CIDR inválido: ${cidr}`));
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      
+      db.run(`
+        INSERT INTO trusted_ip_ranges (cidr, category, description, enabled, created_at, updated_at)
+        VALUES (?, ?, ?, 1, ?, ?)
+      `, [cidr, category.toLowerCase(), description, now, now], function(error) {
+        if (error) {
+          err(`[IP-BLOCKER] Erro ao adicionar range confiável:`, error.message);
+          reject(error);
+          return;
+        }
+        
+        // Invalida cache
+        trustedRangesCache = null;
+        
+        log(`[IP-BLOCKER] Range confiável adicionado: ${cidr} (${category})`);
+        resolve({ success: true, id: this.lastID });
+      });
+    });
+  }
+  
+  /**
+   * Remove um range de IP confiável
+   * @param {number} id - ID do range
+   * @returns {Promise<boolean>}
+   */
+  function removeTrustedRange(id) {
+    return new Promise((resolve, reject) => {
+      if (!db) {
+        reject(new Error('Banco de dados não inicializado'));
+        return;
+      }
+      
+      db.run('DELETE FROM trusted_ip_ranges WHERE id = ?', [id], function(error) {
+        if (error) {
+          err(`[IP-BLOCKER] Erro ao remover range confiável:`, error.message);
+          reject(error);
+          return;
+        }
+        
+        // Invalida cache
+        trustedRangesCache = null;
+        
+        if (this.changes > 0) {
+          log(`[IP-BLOCKER] Range confiável removido: ID ${id}`);
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      });
+    });
+  }
+  
+  /**
+   * Habilita/desabilita um range de IP confiável
+   * @param {number} id - ID do range
+   * @param {boolean} enabled - Se deve estar habilitado
+   * @returns {Promise<boolean>}
+   */
+  function toggleTrustedRange(id, enabled) {
+    return new Promise((resolve, reject) => {
+      if (!db) {
+        reject(new Error('Banco de dados não inicializado'));
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      
+      db.run(`
+        UPDATE trusted_ip_ranges 
+        SET enabled = ?, updated_at = ?
+        WHERE id = ?
+      `, [enabled ? 1 : 0, now, id], function(error) {
+        if (error) {
+          err(`[IP-BLOCKER] Erro ao atualizar range confiável:`, error.message);
+          reject(error);
+          return;
+        }
+        
+        // Invalida cache
+        trustedRangesCache = null;
+        
+        if (this.changes > 0) {
+          log(`[IP-BLOCKER] Range confiável ${enabled ? 'habilitado' : 'desabilitado'}: ID ${id}`);
+          resolve(true);
+        } else {
+          resolve(false);
+        }
+      });
+    });
+  }
+  
+  /**
+   * Lista ranges de IP confiáveis
+   * @param {string} category - Categoria para filtrar (opcional)
+   * @param {boolean} enabledOnly - Se deve listar apenas habilitados (padrão: false)
+   * @returns {Promise<Array>}
+   */
+  function listTrustedRanges(category = null, enabledOnly = false) {
+    return new Promise((resolve, reject) => {
+      if (!db) {
+        resolve([]);
+        return;
+      }
+      
+      let query = 'SELECT * FROM trusted_ip_ranges WHERE 1=1';
+      const params = [];
+      
+      if (category) {
+        query += ' AND category = ?';
+        params.push(category.toLowerCase());
+      }
+      
+      if (enabledOnly) {
+        query += ' AND enabled = 1';
+      }
+      
+      query += ' ORDER BY category, cidr';
+      
+      db.all(query, params, (error, rows) => {
+        if (error) {
+          err(`[IP-BLOCKER] Erro ao listar ranges confiáveis:`, error.message);
+          resolve([]);
+          return;
+        }
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  /**
+   * Obtém todos os ranges habilitados (com cache)
+   * @returns {Promise<Array>}
+   */
+  async function getEnabledTrustedRanges() {
+    const now = Date.now();
+    
+    // Retorna cache se ainda válido
+    if (trustedRangesCache && (now - trustedRangesCacheTime) < TRUSTED_RANGES_CACHE_TTL) {
+      return trustedRangesCache;
+    }
+    
+    const ranges = await listTrustedRanges(null, true);
+    trustedRangesCache = ranges;
+    trustedRangesCacheTime = now;
+    
+    return ranges;
+  }
+  
+  /**
+   * Obtém ranges por categoria (com cache)
+   * @param {string} category - Categoria
+   * @returns {Promise<string[]>} Array de CIDRs
+   */
+  async function getTrustedRangesByCategory(category) {
+    const ranges = await getEnabledTrustedRanges();
+    return ranges
+      .filter(r => r.category === category.toLowerCase())
+      .map(r => r.cidr);
+  }
+  
+  /**
+   * Conta ranges por categoria
+   * @returns {Promise<Object>} Contagem por categoria
+   */
+  function countTrustedRangesByCategory() {
+    return new Promise((resolve) => {
+      if (!db) {
+        resolve({});
+        return;
+      }
+      
+      db.all(`
+        SELECT category, 
+               COUNT(*) as total,
+               SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) as enabled
+        FROM trusted_ip_ranges
+        GROUP BY category
+      `, [], (error, rows) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao contar ranges:`, error.message);
+          resolve({});
+          return;
+        }
+        
+        const result = {};
+        (rows || []).forEach(row => {
+          result[row.category] = {
+            total: row.total,
+            enabled: row.enabled
+          };
+        });
+        resolve(result);
+      });
+    });
+  }
+  
+  /**
+   * Importa ranges do Meta para a tabela (migração inicial)
+   * @returns {Promise<{imported: number, skipped: number}>}
+   */
+  async function importMetaRanges() {
+    const META_RANGES = [
+      '173.252.64.0/18',
+      '173.252.88.0/21',
+      '66.220.144.0/20',
+      '69.63.176.0/20',
+      '69.171.224.0/19',
+      '74.119.76.0/22',
+      '103.4.96.0/22',
+      '157.240.0.0/16',
+      '179.60.192.0/22',
+      '185.60.216.0/22',
+      '204.15.20.0/22',
+      '31.13.24.0/21',
+      '31.13.64.0/18'
+    ];
+    
+    let imported = 0;
+    let skipped = 0;
+    
+    for (const cidr of META_RANGES) {
+      try {
+        // Verifica se já existe
+        const existing = await new Promise((resolve) => {
+          db.get('SELECT id FROM trusted_ip_ranges WHERE cidr = ? AND category = ?', 
+            [cidr, 'meta'], (err, row) => resolve(row));
+        });
+        
+        if (existing) {
+          skipped++;
+          continue;
+        }
+        
+        await addTrustedRange(cidr, 'meta', 'Facebook/Meta IP range para webhooks');
+        imported++;
+      } catch (e) {
+        warn(`[IP-BLOCKER] Erro ao importar range ${cidr}:`, e.message);
+        skipped++;
+      }
+    }
+    
+    log(`[IP-BLOCKER] Importação Meta concluída: ${imported} importados, ${skipped} ignorados`);
+    return { imported, skipped };
+  }
+  
+  // ===== ABUSEIPDB RATE LIMIT =====
+  
+  /**
+   * Inicializa/atualiza limites da API AbuseIPDB
+   * @param {Object} limits - Limites por endpoint
+   */
+  function initAbuseIPDBLimits(limits = {}) {
+    const defaultLimits = {
+      'check': 1000,
+      'check-block': 100,
+      'report': 1000,
+      'reports': 100,
+      'blacklist': 5,
+      'bulk-report': 5,
+      'clear-address': 5
+    };
+    
+    const finalLimits = { ...defaultLimits, ...limits };
+    
+    return new Promise((resolve) => {
+      if (!db) {
+        resolve();
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const todayTimestamp = Math.floor(today.getTime() / 1000);
+      
+      const promises = Object.entries(finalLimits).map(([endpoint, limit]) => {
+        return new Promise((res) => {
+          db.run(`
+            INSERT OR REPLACE INTO abuseipdb_rate_limit (endpoint, daily_limit, daily_used, last_reset, updated_at)
+            VALUES (?, ?, 
+              COALESCE((SELECT CASE WHEN last_reset < ? THEN 0 ELSE daily_used END FROM abuseipdb_rate_limit WHERE endpoint = ?), 0),
+              ?, ?)
+          `, [endpoint, limit, todayTimestamp, endpoint, todayTimestamp, now], res);
+        });
+      });
+      
+      Promise.all(promises).then(() => {
+        dbg(`[IP-BLOCKER] Limites AbuseIPDB inicializados`);
+        resolve();
+      });
+    });
+  }
+  
+  /**
+   * Verifica se pode fazer requisição para um endpoint
+   * @param {string} endpoint - Nome do endpoint
+   * @returns {Promise<{canUse: boolean, remaining: number, limit: number}>}
+   */
+  function canUseAbuseIPDBEndpoint(endpoint) {
+    return new Promise((resolve) => {
+      if (!db) {
+        resolve({ canUse: true, remaining: 999, limit: 1000 });
+        return;
+      }
+      
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const todayTimestamp = Math.floor(today.getTime() / 1000);
+      
+      db.get(`
+        SELECT daily_limit, daily_used, last_reset
+        FROM abuseipdb_rate_limit
+        WHERE endpoint = ?
+      `, [endpoint], (error, row) => {
+        if (error || !row) {
+          resolve({ canUse: true, remaining: 999, limit: 1000 });
+          return;
+        }
+        
+        // Se passou da meia-noite, reseta contador
+        let used = row.daily_used;
+        if (row.last_reset < todayTimestamp) {
+          used = 0;
+        }
+        
+        const remaining = row.daily_limit - used;
+        resolve({
+          canUse: remaining > 0,
+          remaining: Math.max(0, remaining),
+          limit: row.daily_limit
+        });
+      });
+    });
+  }
+  
+  /**
+   * Registra uso de um endpoint da API AbuseIPDB
+   * @param {string} endpoint - Nome do endpoint
+   * @returns {Promise<void>}
+   */
+  function recordAbuseIPDBUsage(endpoint) {
+    return new Promise((resolve) => {
+      if (!db) {
+        resolve();
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const todayTimestamp = Math.floor(today.getTime() / 1000);
+      
+      db.run(`
+        UPDATE abuseipdb_rate_limit
+        SET daily_used = CASE WHEN last_reset < ? THEN 1 ELSE daily_used + 1 END,
+            last_reset = CASE WHEN last_reset < ? THEN ? ELSE last_reset END,
+            updated_at = ?
+        WHERE endpoint = ?
+      `, [todayTimestamp, todayTimestamp, todayTimestamp, now, endpoint], (error) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao registrar uso AbuseIPDB:`, error.message);
+        }
+        resolve();
+      });
+    });
+  }
+  
+  /**
+   * Obtém estatísticas de uso da API AbuseIPDB
+   * @returns {Promise<Object>}
+   */
+  function getAbuseIPDBStats() {
+    return new Promise((resolve) => {
+      if (!db) {
+        resolve({});
+        return;
+      }
+      
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const todayTimestamp = Math.floor(today.getTime() / 1000);
+      
+      db.all(`
+        SELECT endpoint, daily_limit, 
+               CASE WHEN last_reset < ? THEN 0 ELSE daily_used END as daily_used,
+               last_reset
+        FROM abuseipdb_rate_limit
+      `, [todayTimestamp], (error, rows) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao obter stats AbuseIPDB:`, error.message);
+          resolve({});
+          return;
+        }
+        
+        const result = {};
+        (rows || []).forEach(row => {
+          result[row.endpoint] = {
+            limit: row.daily_limit,
+            used: row.daily_used,
+            remaining: row.daily_limit - row.daily_used,
+            utilizationRate: ((row.daily_used / row.daily_limit) * 100).toFixed(1) + '%'
+          };
+        });
+        resolve(result);
+      });
+    });
+  }
+  
+  /**
+   * Obtém estatísticas dos caches em memória
+   * @returns {Object} Estatísticas dos caches
+   */
+  function getCacheStats() {
+    return {
+      blocked: blockedCache.getStats(),
+      whitelist: whitelistCache.getStats(),
+      yellowlist: yellowlistCache.getStats()
+    };
+  }
+  
+  /**
+   * Limpa todos os caches em memória
+   */
+  function clearAllCaches() {
+    blockedCache.clear();
+    whitelistCache.clear();
+    yellowlistCache.clear();
+    log(`[IP-BLOCKER] Todos os caches em memória foram limpos`);
+  }
+  
   // Cria o objeto API (será retornado após inicialização)
   const createModuleAPI = () => {
     return {
@@ -1856,7 +3397,37 @@ function initIPBlockerModule({ appRoot, logger }) {
       countMigrationLogs,
       checkAndFixDuplicates,
       cleanExpiredEntries,
+      // Access Log
+      logAccessRequest,
+      listAccessLogs,
+      countAccessLogs,
+      getAccessStatsByRoute,
+      getAccessStatsByIP,
+      // Tuya Events
+      logTuyaEvent,
+      listTuyaEvents,
+      countTuyaEvents,
+      // Admin Sessions
+      saveAdminSession,
+      getAdminSession,
+      getAdminSessionByFingerprint,
+      updateAdminSessionLastUsed,
+      deleteAdminSession,
+      cleanExpiredAdminSessions,
+      listTrustedDevices,
+      revokeTrustedDevice,
+      // ESP32 Devices
+      updateESP32Device,
+      listESP32Devices,
+      // Tuya Energy
+      saveTuyaEnergyReading,
+      listTuyaEnergyReadings,
+      getTuyaEnergyStats,
+      getTuyaEnergyByHour,
       close,
+      // Cache
+      getCacheStats,
+      clearAllCaches,
       // Estatísticas
       saveStatistic,
       loadStatistic,
@@ -1866,6 +3437,20 @@ function initIPBlockerModule({ appRoot, logger }) {
       getAllIPs,
       getTopRoutes,
       getTopIPs,
+      // Trusted IP Ranges
+      addTrustedRange,
+      removeTrustedRange,
+      toggleTrustedRange,
+      listTrustedRanges,
+      getEnabledTrustedRanges,
+      getTrustedRangesByCategory,
+      countTrustedRangesByCategory,
+      importMetaRanges,
+      // AbuseIPDB Rate Limit
+      initAbuseIPDBLimits,
+      canUseAbuseIPDBEndpoint,
+      recordAbuseIPDBUsage,
+      getAbuseIPDBStats,
       // Expõe promise para permitir aguardar banco estar pronto
       get _promise() { return dbReadyPromise; },
       _ready: () => dbReady
@@ -2073,6 +3658,33 @@ function initIPBlockerModule({ appRoot, logger }) {
       countMigrationLogs: () => Promise.resolve(0),
       checkAndFixDuplicates: () => Promise.resolve({ removed: 0, duplicates: [] }),
       cleanExpiredEntries: () => Promise.resolve({ whitelist: 0, yellowlist: 0 }),
+      // Access Log fallbacks
+      logAccessRequest: () => Promise.resolve(),
+      listAccessLogs: () => Promise.resolve([]),
+      countAccessLogs: () => Promise.resolve(0),
+      getAccessStatsByRoute: () => Promise.resolve([]),
+      getAccessStatsByIP: () => Promise.resolve([]),
+      // Tuya Events fallbacks
+      logTuyaEvent: () => Promise.resolve(),
+      listTuyaEvents: () => Promise.resolve([]),
+      countTuyaEvents: () => Promise.resolve(0),
+      // Admin Sessions fallbacks
+      saveAdminSession: () => Promise.reject(new Error('Database not ready')),
+      getAdminSession: () => Promise.resolve(null),
+      getAdminSessionByFingerprint: () => Promise.resolve(null),
+      updateAdminSessionLastUsed: () => Promise.resolve(),
+      deleteAdminSession: () => Promise.resolve(),
+      cleanExpiredAdminSessions: () => Promise.resolve(0),
+      listTrustedDevices: () => Promise.resolve([]),
+      revokeTrustedDevice: () => Promise.resolve(),
+      // ESP32 Devices fallbacks
+      updateESP32Device: () => Promise.resolve(),
+      listESP32Devices: () => Promise.resolve([]),
+      // Tuya Energy fallbacks
+      saveTuyaEnergyReading: () => Promise.resolve(),
+      listTuyaEnergyReadings: () => Promise.resolve([]),
+      getTuyaEnergyStats: () => Promise.resolve(null),
+      getTuyaEnergyByHour: () => Promise.resolve([]),
       close: () => Promise.resolve()
     };
   }

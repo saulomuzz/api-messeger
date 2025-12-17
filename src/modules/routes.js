@@ -40,6 +40,7 @@ function initRoutesModule({
   auth,
   verifySignedRequest,
   validateESP32Authorization,
+  getCurrentIpBlocker,
   numbersFile,
   cameraSnapshotUrl,
   authDataPath,
@@ -272,17 +273,16 @@ function initRoutesModule({
   // QR Status (não aplicável para API oficial)
   app.get('/qr/status', async (_req, res) => {
     try {
+      const isReady = getIsReady();
       return res.json({
         ok: true,
         hasQR: false,
-        isReady: getIsReady(),
+        isReady: isReady,
         state: 'CONNECTED', // API oficial sempre está conectada
         authPath: authDataPath,
-        message: hasQR 
-          ? 'QR code disponível. Acesse /qr.png para visualizar.'
-          : (getIsReady() 
-            ? 'Cliente já autenticado. Não é necessário QR code.'
-            : 'QR code ainda não foi gerado. Aguarde alguns segundos.')
+        message: isReady 
+          ? 'Cliente já autenticado. Não é necessário QR code (API Oficial).'
+          : 'Aguardando conexão com a API do WhatsApp Business.'
       });
     } catch (e) {
       err('[QR-STATUS] Erro:', e);
@@ -354,12 +354,147 @@ function initRoutesModule({
     }
   });
   
+  // Send Template Message
+  app.post('/send/template', strictRateLimit || ((req, res, next) => next()), auth, async (req, res) => {
+    const rid = requestId();
+    const clientIp = getClientIp(req);
+    
+    if (!req.body) {
+      warn(`[SECURITY][${rid}] Requisição sem body de ${clientIp}`);
+      return res.status(400).json({ ok: false, error: 'invalid_request', message: 'Corpo da requisição inválido', requestId: rid });
+    }
+    
+    if (!verifySignedRequest(req, '/send/template')) {
+      warn(`[SECURITY][${rid}] Assinatura inválida de ${clientIp}`);
+      return res.status(403).json({ ok: false, error: 'invalid signature', requestId: rid });
+    }
+    
+    if (!getIsReady()) {
+      return res.status(503).json({ ok: false, error: 'whatsapp not ready', requestId: rid });
+    }
+    
+    const { phone, template, language, components } = req.body || {};
+    if (!phone || !template) {
+      warn(`[SECURITY][${rid}] Requisição com campos faltando de ${clientIp}`);
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'phone and template are required', 
+        requestId: rid,
+        example: {
+          phone: '5511999999999',
+          template: 'status',
+          language: 'pt_BR',
+          components: [{ type: 'body', parameters: [{ type: 'text', text: 'SEU_CODIGO' }] }]
+        }
+      });
+    }
+    
+    const rawPhone = String(phone);
+    const normalized = normalizeBR(rawPhone);
+    log(`[SEND-TEMPLATE][${rid}] POST recebido | ip=${ip(req)} | template=${template} | phone=${normalized}`);
+    
+    try {
+      const { id: numberId, tried } = await resolveWhatsAppNumber(normalized);
+      if (!numberId) {
+        warn(`[SEND-TEMPLATE][${rid}] Número não está no WhatsApp | tried=${tried.join(',')}`);
+        return res.status(404).json({ ok: false, error: 'not_on_whatsapp', requestId: rid, tried });
+      }
+      
+      const to = numberId._serialized;
+      
+      if (!whatsapp.sendTemplateMessage) {
+        return res.status(500).json({ ok: false, error: 'Template messages not supported', requestId: rid });
+      }
+      
+      const r = await whatsapp.sendTemplateMessage(to, template, language || 'pt_BR', components || []);
+      log(`[SEND-TEMPLATE OK][${rid}] to=${to} template=${template} id=${r.id?._serialized || 'n/a'}`);
+      return res.json({ ok: true, requestId: rid, to, template, msgId: r.id?._serialized || null, normalized, tried });
+    } catch (e) {
+      err(`[SEND-TEMPLATE][${rid}] ERRO`, e);
+      return res.status(500).json({ ok: false, error: String(e), requestId: rid });
+    }
+  });
+  
+  // Send Status Code (usando template "status")
+  app.post('/send/status-code', strictRateLimit || ((req, res, next) => next()), auth, async (req, res) => {
+    const rid = requestId();
+    const clientIp = getClientIp(req);
+    
+    if (!req.body) {
+      warn(`[SECURITY][${rid}] Requisição sem body de ${clientIp}`);
+      return res.status(400).json({ ok: false, error: 'invalid_request', message: 'Corpo da requisição inválido', requestId: rid });
+    }
+    
+    if (!verifySignedRequest(req, '/send/status-code')) {
+      warn(`[SECURITY][${rid}] Assinatura inválida de ${clientIp}`);
+      return res.status(403).json({ ok: false, error: 'invalid signature', requestId: rid });
+    }
+    
+    if (!getIsReady()) {
+      return res.status(503).json({ ok: false, error: 'whatsapp not ready', requestId: rid });
+    }
+    
+    const { phone, code, language } = req.body || {};
+    if (!phone || !code) {
+      warn(`[SECURITY][${rid}] Requisição com campos faltando de ${clientIp}`);
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'phone and code are required', 
+        requestId: rid,
+        example: {
+          phone: '5511999999999',
+          code: 'ABC123',
+          language: 'pt_BR'
+        }
+      });
+    }
+    
+    const rawPhone = String(phone);
+    const normalized = normalizeBR(rawPhone);
+    log(`[SEND-STATUS-CODE][${rid}] POST recebido | ip=${ip(req)} | code=${code} | phone=${normalized}`);
+    
+    try {
+      const { id: numberId, tried } = await resolveWhatsAppNumber(normalized);
+      if (!numberId) {
+        warn(`[SEND-STATUS-CODE][${rid}] Número não está no WhatsApp | tried=${tried.join(',')}`);
+        return res.status(404).json({ ok: false, error: 'not_on_whatsapp', requestId: rid, tried });
+      }
+      
+      const to = numberId._serialized;
+      
+      if (!whatsapp.sendStatusCode) {
+        return res.status(500).json({ ok: false, error: 'Status code messages not supported', requestId: rid });
+      }
+      
+      const r = await whatsapp.sendStatusCode(to, code, language || 'pt_BR');
+      log(`[SEND-STATUS-CODE OK][${rid}] to=${to} code=${code} id=${r.id?._serialized || 'n/a'}`);
+      return res.json({ ok: true, requestId: rid, to, code, template: 'status', msgId: r.id?._serialized || null, normalized, tried });
+    } catch (e) {
+      err(`[SEND-STATUS-CODE][${rid}] ERRO`, e);
+      return res.status(500).json({ ok: false, error: String(e), requestId: rid });
+    }
+  });
+  
   // ESP32 Validate - compatível com ESP32 (não requer mudanças no código do ESP)
-  app.get('/esp32/validate', (req, res) => {
+  app.get('/esp32/validate', async (req, res) => {
     const validation = validateESP32Authorization(req);
     
     if (validation.authorized) {
       log(`[ESP32-VALIDATE] Autorizado | ip=${validation.ip}`);
+      
+      // Registra dispositivo ESP32 no banco (para aparecer como online)
+      try {
+        const ipBlocker = getCurrentIpBlocker?.();
+        if (ipBlocker && typeof ipBlocker.updateESP32Device === 'function') {
+          await ipBlocker.updateESP32Device(validation.ip);
+          dbg(`[ESP32-VALIDATE] Dispositivo ${validation.ip} registrado no banco`);
+        } else {
+          dbg(`[ESP32-VALIDATE] IP Blocker não disponível para registrar dispositivo`);
+        }
+      } catch (e) {
+        warn(`[ESP32-VALIDATE] Erro ao registrar dispositivo no banco:`, e.message);
+      }
+      
       // Garante formato exato esperado pelo ESP32
       const response = {
         ok: true,

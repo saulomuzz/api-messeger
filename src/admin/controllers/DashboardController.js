@@ -60,7 +60,7 @@ class DashboardController {
         phoneNumber: this.whatsappOfficial?.getPhoneNumber?.() || null
       };
       
-      // Dispositivos ESP32 conectados
+      // Dispositivos ESP32 conectados (WebSocket)
       let esp32Devices = [];
       if (this.websocketESP32) {
         if (typeof this.websocketESP32.getConnectedDevices === 'function') {
@@ -71,6 +71,36 @@ class DashboardController {
         }
       }
       
+      // Dispositivos ESP32 via HTTP (do banco de dados)
+      let esp32HttpDevices = [];
+      if (this.ipBlocker && typeof this.ipBlocker.listESP32Devices === 'function') {
+        try {
+          esp32HttpDevices = await this.ipBlocker.listESP32Devices(120); // Online se visto nos últimos 2 min
+        } catch (e) {
+          console.error('Erro ao buscar ESP32 HTTP:', e.message);
+        }
+      }
+      
+      // Combina dispositivos WebSocket e HTTP (evita duplicatas por IP)
+      const allDevices = [...esp32Devices];
+      const wsIPs = new Set(esp32Devices.map(d => d.ip));
+      
+      for (const httpDevice of esp32HttpDevices) {
+        if (!wsIPs.has(httpDevice.ip)) {
+          // is_online pode vir como 1, '1', ou true da query SQL
+          const isOnline = httpDevice.is_online === 1 || httpDevice.is_online === '1' || httpDevice.is_online === true;
+          allDevices.push({
+            ip: httpDevice.ip,
+            connectedAt: httpDevice.first_seen * 1000,
+            lastPing: httpDevice.last_seen * 1000,
+            connectionType: 'http',
+            isOnline: isOnline,
+            requestCount: httpDevice.request_count,
+            deviceName: httpDevice.device_name
+          });
+        }
+      }
+      
       const result = {
         success: true,
         stats: {
@@ -78,8 +108,14 @@ class DashboardController {
           ips: ipStats,
           whatsapp: whatsappStatus,
           esp32: {
-            connected: esp32Devices.length,
-            devices: esp32Devices
+            connected: allDevices.filter(d => d.connectionType === 'websocket' || d.isOnline).length,
+            devices: allDevices
+          },
+          // Mantém compatibilidade com dashboard antigo
+          devices: {
+            total: allDevices.length,
+            online: allDevices.filter(d => d.connectionType === 'websocket' || d.isOnline).length,
+            list: allDevices
           }
         }
       };

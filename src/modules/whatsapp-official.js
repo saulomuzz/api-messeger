@@ -5,6 +5,8 @@
 
 const axios = require('axios');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 /**
  * Inicializa o módulo WhatsApp Business API Oficial
@@ -490,6 +492,147 @@ function initWhatsAppOfficialModule({
   }
   
   /**
+   * Envia mensagem usando template aprovado pelo Meta
+   * @param {string} to - Número de destino
+   * @param {string} templateName - Nome do template (ex: "status")
+   * @param {string} languageCode - Código do idioma (ex: "pt_BR")
+   * @param {Array} components - Componentes/variáveis do template
+   * @returns {Promise<Object>} Resposta da API
+   */
+  async function sendTemplateMessage(to, templateName, languageCode = 'pt_BR', components = []) {
+    try {
+      const normalized = normalizeBR(to);
+      const toNumber = normalized.replace(/^\+/, '');
+      
+      log(`[WHATSAPP-API] Enviando template "${templateName}" para ${toNumber}...`);
+      
+      const payload = {
+        messaging_product: 'whatsapp',
+        recipient_type: 'individual',
+        to: toNumber,
+        type: 'template',
+        template: {
+          name: templateName,
+          language: { code: languageCode }
+        }
+      };
+      
+      // Adiciona components apenas se fornecidos
+      if (components && components.length > 0) {
+        payload.template.components = components;
+      }
+      
+      const response = await axios.post(
+        `${BASE_URL}/${PHONE_NUMBER_ID}/messages`,
+        payload,
+        {
+          headers: {
+            'Authorization': `Bearer ${ACCESS_TOKEN}`,
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+      
+      const messageId = response.data.messages?.[0]?.id || 'unknown';
+      log(`[WHATSAPP-API] ✅ Template "${templateName}" enviado para ${toNumber}: ${messageId}`);
+      
+      // Incrementa estatística de mensagem enviada
+      if (global.statisticsModel) {
+        global.statisticsModel.incrementSent();
+      }
+      
+      return {
+        id: {
+          _serialized: messageId
+        },
+        ...response.data
+      };
+    } catch (error) {
+      // Incrementa estatística de mensagem falhada
+      if (global.statisticsModel) {
+        global.statisticsModel.incrementFailed();
+      }
+      
+      if (error.response?.data) {
+        const errorData = error.response.data;
+        err(`[WHATSAPP-API] ❌ Erro ao enviar template "${templateName}" para ${to}:`, errorData);
+        
+        if (errorData.error) {
+          const errorCode = errorData.error.code;
+          const errorMessage = errorData.error.message;
+          
+          if (errorCode === 132001) {
+            err(`[WHATSAPP-API] ⚠️ Template "${templateName}" não encontrado ou não aprovado`);
+          } else if (errorCode === 132000) {
+            err(`[WHATSAPP-API] ⚠️ Número de parâmetros incorreto para o template`);
+          } else if (errorCode === 131047) {
+            err(`[WHATSAPP-API] ⚠️ Número não está no WhatsApp ou formato inválido`);
+          }
+          
+          dbg(`[WHATSAPP-API] Código de erro: ${errorCode}, Mensagem: ${errorMessage}`);
+        }
+      } else {
+        err(`[WHATSAPP-API] ❌ Erro ao enviar template "${templateName}":`, error.message);
+      }
+      throw error;
+    }
+  }
+  
+  /**
+   * Envia código/status usando o template "status"
+   * Função auxiliar para facilitar o envio de códigos
+   * @param {string} to - Número de destino
+   * @param {string} code - O código/status a ser enviado
+   * @param {string} languageCode - Código do idioma (padrão: "pt_BR")
+   * @param {string} paramLocation - Onde colocar o parâmetro: 'body', 'header', 'none' (padrão: tenta sem parâmetros primeiro)
+   * @returns {Promise<Object>} Resposta da API
+   */
+  async function sendStatusCode(to, code, languageCode = 'pt_BR', paramLocation = 'auto') {
+    // Se paramLocation é 'auto', tenta enviar sem parâmetros primeiro
+    // (o template pode não ter variáveis, apenas texto fixo)
+    if (paramLocation === 'auto' || paramLocation === 'none') {
+      try {
+        // Primeiro tenta sem parâmetros
+        return await sendTemplateMessage(to, 'status', languageCode, []);
+      } catch (error) {
+        // Se falhar com erro de parâmetros, tenta com parâmetros no header
+        if (error.response?.data?.error?.code === 132000) {
+          dbg(`[WHATSAPP-API] Template sem parâmetros falhou, tentando com header...`);
+          paramLocation = 'header';
+        } else {
+          throw error;
+        }
+      }
+    }
+    
+    let components = [];
+    
+    if (paramLocation === 'header') {
+      // Variável no header
+      components = [
+        {
+          type: 'header',
+          parameters: [
+            { type: 'text', text: String(code) }
+          ]
+        }
+      ];
+    } else if (paramLocation === 'body') {
+      // Variável no body
+      components = [
+        {
+          type: 'body',
+          parameters: [
+            { type: 'text', text: String(code) }
+          ]
+        }
+      ];
+    }
+    
+    return await sendTemplateMessage(to, 'status', languageCode, components);
+  }
+  
+  /**
    * Verifica assinatura do webhook (para validação inicial)
    */
   function verifyWebhook(mode, token, signature) {
@@ -706,6 +849,176 @@ function initWhatsAppOfficialModule({
       } catch (e2) {
         err(`[MENU] Erro no fallback final:`, e2.message);
       }
+    }
+  }
+  
+  /**
+   * Envia histórico de vídeos para o usuário
+   * Função utilitária para evitar duplicação de código
+   * @param {string} to - Número de destino
+   * @returns {Promise<void>}
+   */
+  async function sendVideoHistory(to) {
+    log(`[CMD] Enviando histórico de vídeos para ${to}`);
+    
+    if (!listVideosFunction) {
+      await sendTextMessage(to, '❌ Sistema de histórico não disponível.');
+      return;
+    }
+    
+    try {
+      const videos = listVideosFunction(to);
+      
+      if (videos.length === 0) {
+        await sendTextMessage(to, '📹 *Histórico de Vídeos*\n\nNenhum vídeo disponível no momento.\n\n💡 Vídeos são gravados automaticamente quando a campainha é tocada.');
+        return;
+      }
+      
+      // Limita a 10 vídeos mais recentes para não sobrecarregar
+      const displayVideos = videos.slice(0, 10);
+      const remainingCount = videos.length - displayVideos.length;
+      
+      // Formata lista de vídeos com informações detalhadas
+      let message = `📹 *Histórico de Vídeos*\n\n`;
+      message += `📊 *Total:* ${videos.length} vídeo(s) disponível(is)\n`;
+      message += `⏰ *Válidos por:* 24 horas após gravação\n\n`;
+      message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+      
+      displayVideos.forEach((video, index) => {
+        const date = new Date(video.createdAt);
+        const dateStr = date.toLocaleString('pt-BR', { 
+          day: '2-digit', 
+          month: '2-digit', 
+          year: 'numeric',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit'
+        });
+        
+        // Calcula tempo restante
+        const now = Date.now();
+        const expiresAt = video.expiresAt || (video.createdAt + (24 * 60 * 60 * 1000));
+        const timeRemaining = expiresAt - now;
+        const hoursRemaining = Math.floor(timeRemaining / (60 * 60 * 1000));
+        const minutesRemaining = Math.floor((timeRemaining % (60 * 60 * 1000)) / (60 * 1000));
+        
+        // Obtém tamanho do arquivo
+        let fileSize = 'N/A';
+        if (video.fileExists && video.filePath) {
+          try {
+            const stats = fs.statSync(video.filePath);
+            const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
+            fileSize = `${sizeMB} MB`;
+          } catch (e) {
+            fileSize = 'Erro';
+          }
+        }
+        
+        const status = video.fileExists ? '✅' : '❌';
+        const timeStatus = timeRemaining > 0 ? `⏳ ${hoursRemaining}h ${minutesRemaining}min` : '⏰ Expirado';
+        
+        message += `${index + 1}. ${status} *${dateStr}*\n`;
+        message += `   📁 Tamanho: ${fileSize}\n`;
+        message += `   ${timeStatus} restante\n`;
+        message += `   🆔 ID: \`${video.videoId.substring(0, 20)}...\`\n`;
+        message += `   👁️ Ver: \`!video ${video.videoId}\`\n\n`;
+      });
+      
+      if (remainingCount > 0) {
+        message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+        message += `📋 *E mais ${remainingCount} vídeo(s) disponível(is)*\n`;
+      }
+      
+      message += `\n💡 *Como usar:*\n`;
+      message += `• Digite \`!video <ID>\` para ver um vídeo\n`;
+      message += `• Ou clique no botão "Ver Vídeo" quando receber a notificação\n`;
+      message += `• Vídeos expiram automaticamente após 24 horas`;
+      
+      // Tenta enviar com List Message (permite mais opções que botões)
+      if (displayVideos.length > 0 && sendListMessage) {
+        try {
+          const sections = [{
+            title: 'Vídeos Disponíveis',
+            rows: displayVideos.map((video, index) => {
+              const date = new Date(video.createdAt);
+              const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+              const dateStr = date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
+              
+              // Obtém tamanho do arquivo
+              let fileSize = 'N/A';
+              if (video.fileExists && video.filePath) {
+                try {
+                  const stats = fs.statSync(video.filePath);
+                  const sizeMB = (stats.size / (1024 * 1024)).toFixed(1);
+                  fileSize = `${sizeMB}MB`;
+                } catch (e) {
+                  fileSize = 'N/A';
+                }
+              }
+              
+              return {
+                id: `view_video_${video.videoId}`,
+                title: `🎥 ${dateStr} ${timeStr}`,
+                description: `${fileSize} | ${video.fileExists ? 'Disponível' : 'Indisponível'}`
+              };
+            })
+          }];
+          
+          await sendListMessage(
+            to,
+            '📹 Histórico de Vídeos',
+            'Selecione um vídeo para visualizar:',
+            'Ver Vídeos',
+            sections
+          );
+          log(`[CMD] Histórico enviado como List Message com ${displayVideos.length} opção(ões) para ${to}`);
+          return;
+        } catch (listError) {
+          dbg(`[CMD] Erro ao enviar List Message, tentando botões:`, listError.message);
+          // Continua para botões interativos
+        }
+      }
+      
+      // Fallback: Tenta enviar com botões interativos (máximo 3 por limitação da API)
+      if (displayVideos.length > 0 && sendInteractiveButtons) {
+        try {
+          // Limita a 3 botões por vez (limitação da API do WhatsApp)
+          const maxButtons = Math.min(displayVideos.length, 3);
+          const buttons = displayVideos.slice(0, maxButtons).map((video, index) => {
+            const date = new Date(video.createdAt);
+            const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+            return {
+              id: `view_video_${video.videoId}`,
+              title: `🎥 ${timeStr}`
+            };
+          });
+          
+          // Adiciona botão "Ver Mais" se houver mais vídeos
+          if (videos.length > maxButtons) {
+            buttons.push({
+              id: 'opt_videos_list',
+              title: '📋 Ver Todos'
+            });
+          }
+          
+          await sendInteractiveButtons(
+            to,
+            message,
+            buttons,
+            'Histórico de Vídeos'
+          );
+          log(`[CMD] Histórico enviado com ${buttons.length} botão(ões) interativo(s) para ${to}`);
+          return;
+        } catch (buttonError) {
+          dbg(`[CMD] Erro ao enviar botões, usando texto:`, buttonError.message);
+          // Continua para enviar como texto
+        }
+      }
+      
+      await sendTextMessage(to, message);
+    } catch (e) {
+      err(`[CMD] Erro ao listar histórico:`, e.message);
+      await sendTextMessage(to, `❌ Erro ao listar histórico: ${e.message}`);
     }
   }
   
@@ -1053,7 +1366,7 @@ function initWhatsAppOfficialModule({
           return;
         }
         
-        const fs = require('fs');
+        
         if (!fs.existsSync(result.filePath)) {
           err(`[RECORD] Arquivo não encontrado: ${result.filePath}`);
           await sendTextMessage(to, `❌ Erro: Arquivo de vídeo não encontrado`);
@@ -1227,7 +1540,7 @@ function initWhatsAppOfficialModule({
         }
         
         // Lê o arquivo de vídeo
-        const fs = require('fs');
+        
         if (!fs.existsSync(result.filePath)) {
           await sendTextMessage(from, '❌ Arquivo de vídeo não encontrado.');
           return;
@@ -1304,168 +1617,7 @@ function initWhatsAppOfficialModule({
     
     if (msgLower === '!historico' || msgLower === '!histórico' || msgLower === '!videos' || msgLower === '!hist') {
       log(`[CMD] Comando de histórico recebido de ${from}`);
-      
-      if (!listVideosFunction) {
-        await sendTextMessage(from, '❌ Sistema de histórico não disponível.');
-        return;
-      }
-      
-      try {
-        const videos = listVideosFunction(from);
-        const fs = require('fs');
-        
-        if (videos.length === 0) {
-          await sendTextMessage(from, '📹 *Histórico de Vídeos*\n\nNenhum vídeo disponível no momento.\n\n💡 Vídeos são gravados automaticamente quando a campainha é tocada.');
-          return;
-        }
-        
-        // Limita a 10 vídeos mais recentes para não sobrecarregar
-        const displayVideos = videos.slice(0, 10);
-        const remainingCount = videos.length - displayVideos.length;
-        
-        // Formata lista de vídeos com informações detalhadas
-        let message = `📹 *Histórico de Vídeos*\n\n`;
-        message += `📊 *Total:* ${videos.length} vídeo(s) disponível(is)\n`;
-        message += `⏰ *Válidos por:* 24 horas após gravação\n\n`;
-        message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-        
-        displayVideos.forEach((video, index) => {
-          const date = new Date(video.createdAt);
-          const dateStr = date.toLocaleString('pt-BR', { 
-            day: '2-digit', 
-            month: '2-digit', 
-            year: 'numeric',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit'
-          });
-          
-          // Calcula tempo restante até expirar
-          const now = Date.now();
-          const expiresAt = video.expiresAt || (video.createdAt + (24 * 60 * 60 * 1000));
-          const timeRemaining = expiresAt - now;
-          const hoursRemaining = Math.floor(timeRemaining / (60 * 60 * 1000));
-          const minutesRemaining = Math.floor((timeRemaining % (60 * 60 * 1000)) / (60 * 1000));
-          
-          // Obtém tamanho do arquivo se existir
-          let fileSize = 'N/A';
-          if (video.fileExists && video.filePath) {
-            try {
-              const stats = fs.statSync(video.filePath);
-              const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-              fileSize = `${sizeMB} MB`;
-            } catch (e) {
-              fileSize = 'Erro';
-            }
-          }
-          
-          const status = video.fileExists ? '✅' : '❌';
-          const timeStatus = timeRemaining > 0 ? `⏳ ${hoursRemaining}h ${minutesRemaining}min` : '⏰ Expirado';
-          
-          message += `${index + 1}. ${status} *${dateStr}*\n`;
-          message += `   📁 Tamanho: ${fileSize}\n`;
-          message += `   ${timeStatus} restante\n`;
-          message += `   🆔 ID: \`${video.videoId.substring(0, 20)}...\`\n`;
-          message += `   👁️ Ver: \`!video ${video.videoId}\`\n\n`;
-        });
-        
-        if (remainingCount > 0) {
-          message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-          message += `📋 *E mais ${remainingCount} vídeo(s) disponível(is)*\n`;
-        }
-        
-        message += `\n💡 *Como usar:*\n`;
-        message += `• Digite \`!video <ID>\` para ver um vídeo\n`;
-        message += `• Ou clique no botão "Ver Vídeo" quando receber a notificação\n`;
-        message += `• Vídeos expiram automaticamente após 24 horas`;
-        
-        // Tenta enviar com List Message (permite mais opções que botões)
-        if (displayVideos.length > 0 && sendListMessage) {
-          try {
-            const sections = [{
-              title: 'Vídeos Disponíveis',
-              rows: displayVideos.map((video, index) => {
-                const date = new Date(video.createdAt);
-                const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-                const dateStr = date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-                
-                // Obtém tamanho do arquivo
-                let fileSize = 'N/A';
-                if (video.fileExists && video.filePath) {
-                  try {
-                    const fs = require('fs');
-                    const stats = fs.statSync(video.filePath);
-                    const sizeMB = (stats.size / (1024 * 1024)).toFixed(1);
-                    fileSize = `${sizeMB}MB`;
-                  } catch (e) {
-                    fileSize = 'N/A';
-                  }
-                }
-                
-                return {
-                  id: `view_video_${video.videoId}`,
-                  title: `🎥 ${dateStr} ${timeStr}`,
-                  description: `${fileSize} | ${video.fileExists ? 'Disponível' : 'Indisponível'}`
-                };
-              })
-            }];
-            
-            await sendListMessage(
-              from,
-              '📹 Histórico de Vídeos',
-              'Selecione um vídeo para visualizar:',
-              'Ver Vídeos',
-              sections
-            );
-            log(`[CMD] Histórico enviado como List Message com ${displayVideos.length} opção(ões) para ${from}`);
-            return;
-          } catch (listError) {
-            dbg(`[CMD] Erro ao enviar List Message, tentando botões:`, listError.message);
-            // Continua para botões interativos
-          }
-        }
-        
-        // Fallback: Tenta enviar com botões interativos (máximo 3 por limitação da API)
-        if (displayVideos.length > 0 && sendInteractiveButtons) {
-          try {
-            // Limita a 3 botões por vez (limitação da API do WhatsApp)
-            const maxButtons = Math.min(displayVideos.length, 3);
-            const buttons = displayVideos.slice(0, maxButtons).map((video, index) => {
-              const date = new Date(video.createdAt);
-              const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-              return {
-                id: `view_video_${video.videoId}`,
-                title: `🎥 ${timeStr}`
-              };
-            });
-            
-            // Adiciona botão "Ver Mais" se houver mais vídeos
-            if (videos.length > maxButtons) {
-              buttons.push({
-                id: 'opt_videos_list',
-                title: '📋 Ver Todos'
-              });
-            }
-            
-            await sendInteractiveButtons(
-              from,
-              message,
-              buttons,
-              'Histórico de Vídeos'
-            );
-            log(`[CMD] Histórico enviado com ${buttons.length} botão(ões) interativo(s) para ${from}`);
-            return;
-          } catch (buttonError) {
-            dbg(`[CMD] Erro ao enviar botões, usando texto:`, buttonError.message);
-            // Continua para enviar como texto
-          }
-        }
-        
-        await sendTextMessage(from, message);
-      } catch (e) {
-        err(`[CMD] Erro ao listar histórico:`, e.message);
-        await sendTextMessage(from, `❌ Erro ao listar histórico: ${e.message}`);
-      }
+      await sendVideoHistory(from);
       return;
     }
     
@@ -1909,223 +2061,15 @@ function initWhatsAppOfficialModule({
     
     if (responseId === 'opt_videos') {
       log(`[WHATSAPP-API] Opção "Histórico de Vídeos" selecionada por ${from}`);
-      try {
-        if (listVideosFunction) {
-          const videos = listVideosFunction(from);
-          const fs = require('fs');
-          
-          if (videos.length === 0) {
-            await sendTextMessage(from, '📹 *Histórico de Vídeos*\n\nNenhum vídeo disponível no momento.\n\n💡 Vídeos são gravados automaticamente quando a campainha é tocada.');
-          } else {
-            // Limita a 10 vídeos mais recentes
-            const displayVideos = videos.slice(0, 10);
-            const remainingCount = videos.length - displayVideos.length;
-            
-            let message = `📹 *Histórico de Vídeos*\n\n`;
-            message += `📊 *Total:* ${videos.length} vídeo(s) disponível(is)\n`;
-            message += `⏰ *Válidos por:* 24 horas após gravação\n\n`;
-            message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-            
-            displayVideos.forEach((video, index) => {
-              const date = new Date(video.createdAt);
-              const dateStr = date.toLocaleString('pt-BR', { 
-                day: '2-digit', 
-                month: '2-digit', 
-                year: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit',
-                second: '2-digit'
-              });
-              
-              // Calcula tempo restante
-              const now = Date.now();
-              const expiresAt = video.expiresAt || (video.createdAt + (24 * 60 * 60 * 1000));
-              const timeRemaining = expiresAt - now;
-              const hoursRemaining = Math.floor(timeRemaining / (60 * 60 * 1000));
-              const minutesRemaining = Math.floor((timeRemaining % (60 * 60 * 1000)) / (60 * 1000));
-              
-              // Obtém tamanho do arquivo
-              let fileSize = 'N/A';
-              if (video.fileExists && video.filePath) {
-                try {
-                  const stats = fs.statSync(video.filePath);
-                  const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-                  fileSize = `${sizeMB} MB`;
-                } catch (e) {
-                  fileSize = 'Erro';
-                }
-              }
-              
-              const status = video.fileExists ? '✅' : '❌';
-              const timeStatus = timeRemaining > 0 ? `⏳ ${hoursRemaining}h ${minutesRemaining}min` : '⏰ Expirado';
-              
-              message += `${index + 1}. ${status} *${dateStr}*\n`;
-              message += `   📁 Tamanho: ${fileSize}\n`;
-              message += `   ${timeStatus} restante\n`;
-              message += `   🆔 ID: \`${video.videoId.substring(0, 20)}...\`\n`;
-              message += `   👁️ Ver: \`!video ${video.videoId}\`\n\n`;
-            });
-            
-            if (remainingCount > 0) {
-              message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-              message += `📋 *E mais ${remainingCount} vídeo(s) disponível(is)*\n`;
-            }
-            
-            message += `\n💡 *Como usar:*\n`;
-            message += `• Digite \`!video <ID>\` para ver um vídeo\n`;
-            message += `• Ou clique no botão "Ver Vídeo" quando receber a notificação\n`;
-            message += `• Vídeos expiram automaticamente após 24 horas`;
-            
-            // Tenta enviar com List Message (permite mais opções que botões)
-            if (displayVideos.length > 0 && sendListMessage) {
-              try {
-                const sections = [{
-                  title: 'Vídeos Disponíveis',
-                  rows: displayVideos.map((video, index) => {
-                    const date = new Date(video.createdAt);
-                    const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-                    const dateStr = date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
-                    
-                    // Obtém tamanho do arquivo
-                    let fileSize = 'N/A';
-                    if (video.fileExists && video.filePath) {
-                      try {
-                        const fs = require('fs');
-                        const stats = fs.statSync(video.filePath);
-                        const sizeMB = (stats.size / (1024 * 1024)).toFixed(1);
-                        fileSize = `${sizeMB}MB`;
-                      } catch (e) {
-                        fileSize = 'N/A';
-                      }
-                    }
-                    
-                    return {
-                      id: `view_video_${video.videoId}`,
-                      title: `🎥 ${dateStr} ${timeStr}`,
-                      description: `${fileSize} | ${video.fileExists ? 'Disponível' : 'Indisponível'}`
-                    };
-                  })
-                }];
-                
-                await sendListMessage(
-                  from,
-                  '📹 Histórico de Vídeos',
-                  'Selecione um vídeo para visualizar:',
-                  'Ver Vídeos',
-                  sections
-                );
-                log(`[WHATSAPP-API] Histórico enviado como List Message com ${displayVideos.length} opção(ões) para ${from}`);
-                return;
-              } catch (listError) {
-                dbg(`[WHATSAPP-API] Erro ao enviar List Message, tentando botões:`, listError.message);
-                // Continua para botões interativos
-              }
-            }
-            
-            // Fallback: Tenta enviar com botões interativos (máximo 3 por limitação da API)
-            if (displayVideos.length > 0 && sendInteractiveButtons) {
-              try {
-                // Limita a 3 botões por vez (limitação da API do WhatsApp)
-                const maxButtons = Math.min(displayVideos.length, 3);
-                const buttons = displayVideos.slice(0, maxButtons).map((video, index) => {
-                  const date = new Date(video.createdAt);
-                  const timeStr = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-                  return {
-                    id: `view_video_${video.videoId}`,
-                    title: `🎥 ${timeStr}`
-                  };
-                });
-                
-                // Adiciona botão "Ver Mais" se houver mais vídeos
-                if (videos.length > maxButtons) {
-                  buttons.push({
-                    id: 'opt_videos_list',
-                    title: '📋 Ver Todos'
-                  });
-                }
-                
-                await sendInteractiveButtons(
-                  from,
-                  message,
-                  buttons,
-                  'Histórico de Vídeos'
-                );
-                log(`[WHATSAPP-API] Histórico enviado com ${buttons.length} botão(ões) interativo(s) para ${from}`);
-                return;
-              } catch (buttonError) {
-                dbg(`[WHATSAPP-API] Erro ao enviar botões, usando texto:`, buttonError.message);
-              }
-            }
-            
-            await sendTextMessage(from, message);
-          }
-        } else {
-          await sendTextMessage(from, '❌ Sistema de histórico não disponível.');
-        }
-      } catch (e) {
-        err(`[WHATSAPP-API] Erro ao processar opt_videos:`, e.message);
-        await sendTextMessage(from, `❌ Erro: ${e.message}`);
-      }
+      await sendVideoHistory(from);
       return;
     }
     
     // Processa botão "Ver Todos" do histórico
     if (responseId === 'opt_videos_list') {
       log(`[WHATSAPP-API] Botão "Ver Todos" do histórico clicado por ${from}`);
-      // Reenvia a lista completa (mesma lógica de opt_videos)
-      // Isso permite que o usuário veja todos os vídeos se houver mais de 3
-      try {
-        if (listVideosFunction) {
-          const videos = listVideosFunction(from);
-          if (videos.length > 0) {
-            // Reutiliza a mesma lógica, mas mostra todos os vídeos
-            const fs = require('fs');
-            let message = `📹 *Todos os Vídeos Disponíveis*\n\n`;
-            message += `📊 *Total:* ${videos.length} vídeo(s)\n\n`;
-            message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-            
-            videos.forEach((video, index) => {
-              const date = new Date(video.createdAt);
-              const dateStr = date.toLocaleString('pt-BR', { 
-                day: '2-digit', 
-                month: '2-digit', 
-                year: 'numeric',
-                hour: '2-digit',
-                minute: '2-digit'
-              });
-              
-              const now = Date.now();
-              const expiresAt = video.expiresAt || (video.createdAt + (24 * 60 * 60 * 1000));
-              const timeRemaining = expiresAt - now;
-              const hoursRemaining = Math.floor(timeRemaining / (60 * 60 * 1000));
-              const minutesRemaining = Math.floor((timeRemaining % (60 * 60 * 1000)) / (60 * 1000));
-              
-              let fileSize = 'N/A';
-              if (video.fileExists && video.filePath) {
-                try {
-                  const stats = fs.statSync(video.filePath);
-                  const sizeMB = (stats.size / (1024 * 1024)).toFixed(2);
-                  fileSize = `${sizeMB} MB`;
-                } catch (e) {
-                  fileSize = 'Erro';
-                }
-              }
-              
-              const status = video.fileExists ? '✅' : '❌';
-              const timeStatus = timeRemaining > 0 ? `${hoursRemaining}h ${minutesRemaining}min` : 'Expirado';
-              
-              message += `${index + 1}. ${status} ${dateStr}\n`;
-              message += `   📁 ${fileSize} | ⏳ ${timeStatus}\n`;
-              message += `   \`!video ${video.videoId}\`\n\n`;
-            });
-            
-            await sendTextMessage(from, message);
-          }
-        }
-      } catch (e) {
-        err(`[WHATSAPP-API] Erro ao processar opt_videos_list:`, e.message);
-        await sendTextMessage(from, `❌ Erro: ${e.message}`);
-      }
+      // Reenvia o histórico de vídeos completo
+      await sendVideoHistory(from);
       return;
     }
     
@@ -2195,7 +2139,7 @@ function initWhatsAppOfficialModule({
         }
         
         // Lê o arquivo de vídeo
-        const fs = require('fs');
+        
         if (!fs.existsSync(result.filePath)) {
           err(`[WHATSAPP-API] Arquivo não encontrado: ${result.filePath}`);
           await sendTextMessage(from, '❌ Arquivo de vídeo não encontrado no servidor.');
@@ -2395,6 +2339,10 @@ function initWhatsAppOfficialModule({
     sendMediaFromBase64,
     uploadMedia,
     sendMediaById,
+    
+    // Templates
+    sendTemplateMessage,
+    sendStatusCode,
     
     // Webhook
     verifyWebhook,

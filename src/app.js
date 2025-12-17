@@ -7,6 +7,7 @@ const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const compression = require('compression');
 const rateLimit = require('express-rate-limit');
 const cookieParser = require('cookie-parser');
 // Removidos imports não utilizados diretamente (agora nos módulos)
@@ -21,6 +22,8 @@ const { initIPBlockerModule } = require('./modules/ip-blocker');
 const { initAbuseIPDBModule } = require('./modules/abuseipdb');
 const { initWebSocketESP32Module } = require('./modules/websocket-esp32');
 const { initAdminModule } = require('./modules/admin');
+const { normalizeIp, isLocalIP, isMetaIP, isIPInList, ipInCidr } = require('./modules/ip-utils');
+const { initBackupModule } = require('./modules/backup');
 
 /* ===== env ===== */
 // Detecta APP_ROOT automaticamente baseado no diretório do script
@@ -89,6 +92,10 @@ const VIDEO_GOP = parseInt(process.env.VIDEO_GOP || '60', 10); // GOP size (padr
 const VIDEO_MAX_WIDTH = parseInt(process.env.VIDEO_MAX_WIDTH || '1920', 10); // Largura máxima (padrão: 1920)
 const VIDEO_MAX_HEIGHT = parseInt(process.env.VIDEO_MAX_HEIGHT || '1080', 10); // Altura máxima (padrão: 1080)
 const VIDEO_AUDIO_BITRATE = process.env.VIDEO_AUDIO_BITRATE || '128k'; // Bitrate de áudio (padrão: 128k)
+// Configurações de backup automático
+const BACKUP_ENABLED = /^true$/i.test(process.env.BACKUP_ENABLED || 'true'); // Backup habilitado (padrão: true)
+const BACKUP_INTERVAL_HOURS = parseInt(process.env.BACKUP_INTERVAL_HOURS || '24', 10); // Intervalo em horas (padrão: 24)
+const BACKUP_MAX_COUNT = parseInt(process.env.BACKUP_MAX_COUNT || '7', 10); // Máximo de backups (padrão: 7)
 
 /* ===== logging ===== */
 const logger = initLogger({
@@ -118,11 +125,18 @@ const TUYA_UID = (process.env.TUYA_UID || '').trim(); // UID padrão do usuário
 const TUYA_MONITOR_ENABLED = /^true$/i.test(process.env.TUYA_MONITOR_ENABLED || 'true');
 const TUYA_MONITOR_ALERT_HOURS = parseFloat(process.env.TUYA_MONITOR_ALERT_HOURS || '1', 10);
 const TUYA_MONITOR_CHECK_INTERVAL_MINUTES = parseInt(process.env.TUYA_MONITOR_CHECK_INTERVAL_MINUTES || '5', 10);
+const TUYA_ENERGY_COLLECT_INTERVAL_MINUTES = parseInt(process.env.TUYA_ENERGY_COLLECT_INTERVAL_MINUTES || '60', 10);
 const TUYA_MONITOR_NOTIFICATION_NUMBERS = process.env.TUYA_MONITOR_NOTIFICATION_NUMBERS
   ? process.env.TUYA_MONITOR_NOTIFICATION_NUMBERS.split(',').map(n => n.trim())
   : [];
 
 // Inicializa módulo Tuya
+log(`[INIT] Inicializando módulo Tuya...`);
+log(`[INIT]   TUYA_CLIENT_ID=${TUYA_CLIENT_ID ? 'definido' : 'NÃO DEFINIDO'}`);
+log(`[INIT]   TUYA_CLIENT_SECRET=${TUYA_CLIENT_SECRET ? 'definido' : 'NÃO DEFINIDO'}`);
+log(`[INIT]   TUYA_REGION=${TUYA_REGION || 'não definido'}`);
+log(`[INIT]   TUYA_UID=${TUYA_UID || 'não definido'}`);
+
 const tuya = initTuyaModule({
   clientId: TUYA_CLIENT_ID,
   clientSecret: TUYA_CLIENT_SECRET,
@@ -130,6 +144,11 @@ const tuya = initTuyaModule({
   uid: TUYA_UID,
   logger
 });
+
+log(`[INIT] Módulo Tuya inicializado: ${tuya ? 'disponível' : 'NÃO DISPONÍVEL'}`);
+if (tuya) {
+  log(`[INIT] Módulo Tuya métodos: ${Object.keys(tuya).slice(0, 5).join(', ')}...`);
+}
 
 /* ===== Camera Module ===== */
 // Inicializa módulo Camera
@@ -282,6 +301,20 @@ if (ENABLE_IP_WHITELIST && IP_WHITELIST.length > 0) {
 }
 // Helmet já está configurado dinamicamente acima (linha ~200)
 // Não aplicar novamente para evitar sobrescrever CSP
+
+// Compressão HTTP (gzip/deflate) para melhorar performance
+app.use(compression({
+  level: 6, // Nível de compressão (1-9, 6 é um bom equilíbrio)
+  threshold: 1024, // Só comprime respostas maiores que 1KB
+  filter: (req, res) => {
+    // Não comprime se já estiver comprimido ou for streaming
+    if (req.headers['x-no-compression']) {
+      return false;
+    }
+    return compression.filter(req, res);
+  }
+}));
+
 app.use(cors({
   origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN,
   methods: ['GET','POST'],
@@ -320,6 +353,44 @@ try {
   err(`[FATAL] Stack:`, ipBlockerError.stack);
   ipBlocker = null; // Garante que está null em caso de erro
   // Não encerra a aplicação, mas loga o erro
+}
+
+// Inicializa rate limits da API AbuseIPDB e importa ranges Meta
+if (ipBlocker) {
+  // Aguarda banco estar pronto antes de inicializar
+  const initAbuseIPDBAndMeta = async () => {
+    try {
+      // Aguarda até 5 segundos para o banco estar pronto
+      let attempts = 0;
+      while (!ipBlocker._ready() && attempts < 50) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+        attempts++;
+      }
+      
+      if (ipBlocker._ready()) {
+        // Inicializa limites da API AbuseIPDB
+        if (typeof ipBlocker.initAbuseIPDBLimits === 'function') {
+          await ipBlocker.initAbuseIPDBLimits();
+          log(`[INIT] ✅ Rate limits da API AbuseIPDB inicializados`);
+        }
+        
+        // Importa ranges do Meta para a tabela trusted_ip_ranges
+        if (typeof ipBlocker.importMetaRanges === 'function') {
+          const result = await ipBlocker.importMetaRanges();
+          if (result.imported > 0) {
+            log(`[INIT] ✅ Ranges do Meta importados: ${result.imported} novos, ${result.skipped} já existentes`);
+          } else {
+            dbg(`[INIT] Ranges do Meta: ${result.skipped} já existentes no banco`);
+          }
+        }
+      } else {
+        warn(`[INIT] ⚠️ Banco não ficou pronto após 5s - skipping AbuseIPDB/Meta init`);
+      }
+    } catch (e) {
+      warn(`[INIT] ⚠️ Erro ao inicializar AbuseIPDB/Meta:`, e.message);
+    }
+  };
+  initAbuseIPDBAndMeta();
 }
 
 /* ===== AbuseIPDB Module ===== */
@@ -446,6 +517,37 @@ app.use(async (req, res, next) => {
       dbg(`[ABUSEIPDB] Erro ao iniciar verificação:`, abuseError.message);
     }
   }
+  
+  next();
+});
+
+// Middleware para gravar access logs
+app.use((req, res, next) => {
+  const startTime = Date.now();
+  const clientIp = getClientIp(req);
+  const route = req.path;
+  const method = req.method;
+  const userAgent = req.headers['user-agent'] || '';
+  
+  // Captura quando a resposta termina
+  res.on('finish', () => {
+    const responseTime = Date.now() - startTime;
+    const statusCode = res.statusCode;
+    
+    // Grava no banco de forma assíncrona (não bloqueia)
+    if (ipBlocker && typeof ipBlocker.logAccessRequest === 'function') {
+      ipBlocker.logAccessRequest(
+        clientIp,
+        route,
+        method,
+        statusCode,
+        responseTime,
+        userAgent
+      ).catch(err => {
+        dbg(`[ACCESS-LOG] Erro ao gravar log:`, err.message);
+      });
+    }
+  });
   
   next();
 });
@@ -725,41 +827,7 @@ async function auth(req, res, next) {
 }
 
 /* ===== validação de autorização ESP32 ===== */
-function normalizeIp(ipAddress) {
-  // Remove prefixo IPv6 mapeado para IPv4 (::ffff:)
-  if (ipAddress && ipAddress.startsWith('::ffff:')) {
-    return ipAddress.substring(7);
-  }
-  return ipAddress;
-}
-
-function ipInCidr(ipAddress, cidr) {
-  const [network, prefixStr] = cidr.split('/');
-  const prefixLength = parseInt(prefixStr, 10);
-  
-  if (isNaN(prefixLength) || prefixLength < 0 || prefixLength > 32) {
-    return false;
-  }
-  
-  const networkParts = network.split('.').map(Number);
-  const ipParts = ipAddress.split('.').map(Number);
-  
-  if (networkParts.length !== 4 || ipParts.length !== 4) {
-    return false;
-  }
-  
-  // Verifica se todos os valores são válidos
-  if (networkParts.some(p => isNaN(p) || p < 0 || p > 255) ||
-      ipParts.some(p => isNaN(p) || p < 0 || p > 255)) {
-    return false;
-  }
-  
-  const mask = (0xFFFFFFFF << (32 - prefixLength)) >>> 0;
-  const networkNum = (networkParts[0] << 24) + (networkParts[1] << 16) + (networkParts[2] << 8) + networkParts[3];
-  const ipNum = (ipParts[0] << 24) + (ipParts[1] << 16) + (ipParts[2] << 8) + ipParts[3];
-  
-  return (networkNum & mask) === (ipNum & mask);
-}
+// NOTA: normalizeIp e ipInCidr são importados de ./modules/ip-utils
 
 function validateESP32Authorization(req) {
   const rawClientIp = ip(req);
@@ -878,6 +946,8 @@ const WHATSAPP_WEBHOOK_VERIFY_TOKEN = (process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN
 const WHATSAPP_API_VERSION = (process.env.WHATSAPP_API_VERSION || 'v21.0').trim();
 const USE_OFFICIAL_API = /^true$/i.test(process.env.USE_WHATSAPP_OFFICIAL_API || 'false');
 const WHATSAPP_WEBHOOK_DOMAIN = (process.env.WHATSAPP_WEBHOOK_DOMAIN || 'seu-dominio.com').trim();
+// Validação de IP do Meta para webhooks (desabilitado por padrão para compatibilidade)
+const VALIDATE_META_WEBHOOK_IP = /^true$/i.test(process.env.VALIDATE_META_WEBHOOK_IP || 'false');
 
 // Debug: mostra o token carregado (apenas os primeiros e últimos caracteres por segurança)
 if (WHATSAPP_WEBHOOK_VERIFY_TOKEN && WHATSAPP_WEBHOOK_VERIFY_TOKEN !== 'my_verify_token') {
@@ -980,6 +1050,7 @@ try {
     auth,
     verifySignedRequest,
     validateESP32Authorization,
+    getCurrentIpBlocker: () => ipBlocker, // Getter para acesso ao ipBlocker
     numbersFile: NUMBERS_FILE,
     cameraSnapshotUrl: CAMERA_SNAPSHOT_URL,
     authDataPath: AUTH_DATA_PATH,
@@ -1046,9 +1117,18 @@ try {
 
 /* ===== Tuya Monitor Module ===== */
 let tuyaMonitor = null;
+
+// Debug: verifica condições de inicialização
+log(`[INIT] Verificando condições para Tuya Monitor:`);
+log(`[INIT]   TUYA_MONITOR_ENABLED=${TUYA_MONITOR_ENABLED}`);
+log(`[INIT]   TUYA_CLIENT_ID=${TUYA_CLIENT_ID ? 'definido' : 'NÃO DEFINIDO'}`);
+log(`[INIT]   TUYA_CLIENT_SECRET=${TUYA_CLIENT_SECRET ? 'definido' : 'NÃO DEFINIDO'}`);
+log(`[INIT]   whatsapp=${whatsapp ? 'disponível' : 'NÃO DISPONÍVEL'}`);
+log(`[INIT]   tuya=${tuya ? 'disponível' : 'NÃO DISPONÍVEL'}`);
+
 if (TUYA_MONITOR_ENABLED && TUYA_CLIENT_ID && TUYA_CLIENT_SECRET && whatsapp) {
   try {
-    log(`[INIT] Inicializando módulo Tuya Monitor...`);
+    log(`[INIT] ✅ Todas as condições atendidas - Inicializando módulo Tuya Monitor...`);
     
     // Obtém números para notificação
     let notificationNumbers = TUYA_MONITOR_NOTIFICATION_NUMBERS;
@@ -1063,39 +1143,51 @@ if (TUYA_MONITOR_ENABLED && TUYA_CLIENT_ID && TUYA_CLIENT_SECRET && whatsapp) {
       }
     }
     
+    const tuyaModuleForMonitor = (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) ? tuya : null;
+    log(`[INIT] Passando módulo tuya para monitor: ${tuyaModuleForMonitor ? 'disponível' : 'null'}`);
+    
     tuyaMonitor = initTuyaMonitorModule({
-      tuya: (TUYA_CLIENT_ID && TUYA_CLIENT_SECRET) ? tuya : null,
+      tuya: tuyaModuleForMonitor,
       whatsapp,
       logger,
       appRoot: APP_ROOT,
       tuyaUid: TUYA_UID,
       alertThresholdHours: TUYA_MONITOR_ALERT_HOURS,
       checkIntervalMinutes: TUYA_MONITOR_CHECK_INTERVAL_MINUTES,
-      notificationNumbers
+      notificationNumbers,
+      getCurrentIpBlocker: () => ipBlocker, // Para salvar leituras de energia
+      energyCollectIntervalMinutes: TUYA_ENERGY_COLLECT_INTERVAL_MINUTES
     });
     
+    log(`[INIT] initTuyaMonitorModule retornou: ${tuyaMonitor ? 'objeto' : 'null'}`);
+    
     if (tuyaMonitor) {
+      // Debug: verifica se collectEnergyReadings está disponível
+      log(`[INIT] Tuya Monitor métodos: ${Object.keys(tuyaMonitor).join(', ')}`);
+      log(`[INIT] collectEnergyReadings disponível? ${typeof tuyaMonitor.collectEnergyReadings === 'function'}`);
+      
       tuyaMonitor.startMonitoring();
-      log(`[INIT] Módulo Tuya Monitor inicializado e iniciado com sucesso`);
+      log(`[INIT] ✅ Módulo Tuya Monitor inicializado e iniciado com sucesso`);
       log(`[INIT] Monitoramento: alerta após ${TUYA_MONITOR_ALERT_HOURS}h, verificação a cada ${TUYA_MONITOR_CHECK_INTERVAL_MINUTES}min`);
       if (notificationNumbers.length > 0) {
         log(`[INIT] Notificações serão enviadas para ${notificationNumbers.length} número(s)`);
       } else {
         warn(`[INIT] Nenhum número configurado para receber notificações`);
       }
+    } else {
+      warn(`[INIT] ⚠️ initTuyaMonitorModule retornou null - Tuya Monitor não disponível`);
     }
   } catch (monitorError) {
-    warn(`[INIT] Erro ao inicializar módulo Tuya Monitor:`, monitorError.message);
+    err(`[INIT] ❌ Erro ao inicializar módulo Tuya Monitor:`, monitorError.message);
+    err(`[INIT] Stack:`, monitorError.stack);
     // Não encerra a aplicação se o monitor falhar
   }
 } else {
-  if (!TUYA_MONITOR_ENABLED) {
-    log(`[INIT] Módulo Tuya Monitor desabilitado (TUYA_MONITOR_ENABLED=false)`);
-  } else if (!TUYA_CLIENT_ID || !TUYA_CLIENT_SECRET) {
-    log(`[INIT] Módulo Tuya Monitor desabilitado (credenciais Tuya não configuradas)`);
-  } else if (!whatsapp) {
-    log(`[INIT] Módulo Tuya Monitor desabilitado (módulo WhatsApp não disponível)`);
-  }
+  warn(`[INIT] ⚠️ Tuya Monitor não será inicializado - condições não atendidas`);
+  if (!TUYA_MONITOR_ENABLED) warn(`[INIT]   - TUYA_MONITOR_ENABLED está desabilitado`);
+  if (!TUYA_CLIENT_ID) warn(`[INIT]   - TUYA_CLIENT_ID não definido`);
+  if (!TUYA_CLIENT_SECRET) warn(`[INIT]   - TUYA_CLIENT_SECRET não definido`);
+  if (!whatsapp) warn(`[INIT]   - whatsapp não disponível`);
 }
 
 /* ===== Webhook para API Oficial do WhatsApp ===== */
@@ -1138,6 +1230,20 @@ if (USE_OFFICIAL_API && WHATSAPP_ACCESS_TOKEN && WHATSAPP_PHONE_NUMBER_ID) {
   // Endpoint para receber mensagens do webhook (POST)
   app.post('/webhook/whatsapp', express.json(), async (req, res) => {
     try {
+      // Validação de IP do Meta (se habilitada)
+      if (VALIDATE_META_WEBHOOK_IP) {
+        const clientIp = getClientIp(req);
+        const normalizedIp = normalizeIp(clientIp);
+        
+        // Permite IPs locais para desenvolvimento
+        if (!isLocalIP(normalizedIp) && !isMetaIP(normalizedIp)) {
+          warn(`[WEBHOOK] ⚠️ IP não autorizado tentou acessar webhook: ${normalizedIp}`);
+          return res.status(403).json({ error: 'IP não autorizado para webhooks' });
+        }
+        
+        dbg(`[WEBHOOK] IP validado: ${normalizedIp} (Meta: ${isMetaIP(normalizedIp)}, Local: ${isLocalIP(normalizedIp)})`);
+      }
+      
       const body = req.body;
       
       // Log detalhado do webhook recebido
@@ -1769,9 +1875,25 @@ server = app.listen(PORT, () => {
       getCurrentIpBlocker: () => ipBlocker, // Função getter para acesso dinâmico
       whatsappOfficial: whatsapp,
       websocketESP32: wsESP32,
-      getClientIp: getClientIp
+      getClientIp: getClientIp,
+      getAbuseIPDB: () => abuseIPDB, // Função getter para acesso ao módulo AbuseIPDB
+      tuya, // Módulo Tuya para controle de dispositivos
+      getCurrentTuyaMonitor: () => tuyaMonitor // Getter para acesso dinâmico ao Tuya Monitor
     });
     log(`[INIT] Módulo Admin inicializado com sucesso`);
+    
+    // Inicializa backup automático
+    const backupModule = initBackupModule({
+      appRoot: APP_ROOT,
+      logger,
+      intervalHours: BACKUP_INTERVAL_HOURS,
+      maxBackups: BACKUP_MAX_COUNT,
+      enabled: BACKUP_ENABLED
+    });
+    log(`[INIT] Módulo Backup inicializado (enabled: ${BACKUP_ENABLED}, intervalo: ${BACKUP_INTERVAL_HOURS}h)`);
+    
+    // Expõe módulo de backup para uso em rotas
+    global.backupModule = backupModule;
   } catch (adminError) {
     warn(`[INIT] Erro ao inicializar módulo Admin:`, adminError.message);
     warn(`[INIT] Stack:`, adminError.stack);
