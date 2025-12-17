@@ -147,11 +147,19 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
     });
     
     try {
-      if (whatsappOfficial?.sendTextMessage) {
-        await whatsappOfficial.sendTextMessage(phone, 
-          `🔐 *Código de Acesso*\n\nCódigo: *${code}*\nExpira em ${ADMIN_CODE_EXPIRY_MINUTES} minutos.`
-        );
-        return { success: true };
+      // Padroniza envio de código via template aprovado (login_web_app)
+      if (whatsappOfficial?.sendLoginWebAppCode) {
+        await whatsappOfficial.sendLoginWebAppCode(phone, code, 'pt_BR');
+        return { success: true, channel: 'whatsapp_template', template: 'login_web_app' };
+      }
+      // Fallback (não recomendado): mantém compatibilidade se o helper não existir
+      if (whatsappOfficial?.sendTemplateMessage) {
+        const components = [
+          { type: 'body', parameters: [{ type: 'text', text: String(code) }] },
+          { type: 'button', sub_type: 'url', index: '0', parameters: [{ type: 'text', text: String(code) }] }
+        ];
+        await whatsappOfficial.sendTemplateMessage(phone, 'login_web_app', 'pt_BR', components);
+        return { success: true, channel: 'whatsapp_template', template: 'login_web_app' };
       }
     } catch (error) {
       err(`[ADMIN] Erro ao enviar código:`, error.message);
@@ -1541,7 +1549,7 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
     }
   });
   
-  // API: Enviar código via template "status" (atalho)
+  // API: Enviar código via template "login_web_app" (atalho)
   app.post('/admin/api/send/status-code', requireAuth, async (req, res) => {
     try {
       const { phone, code, language } = req.body;
@@ -1550,21 +1558,21 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
         return res.status(400).json({ ok: false, error: 'phone e code são obrigatórios' });
       }
       
-      if (!whatsappOfficial || !whatsappOfficial.sendStatusCode) {
+      if (!whatsappOfficial || !whatsappOfficial.sendLoginWebAppCode) {
         return res.status(500).json({ ok: false, error: 'Função de envio de código não disponível' });
       }
       
-      log(`[ADMIN] Enviando código "${code}" para ${phone} via template "status"`);
+      log(`[ADMIN] Enviando código (login_web_app) para ${phone}`);
       
-      const result = await whatsappOfficial.sendStatusCode(phone, code, language || 'pt_BR');
+      const result = await whatsappOfficial.sendLoginWebAppCode(phone, String(code), language || 'pt_BR');
       
       log(`[ADMIN] ✅ Código enviado: ${result.id?._serialized || 'N/A'}`);
       
       res.json({ 
         ok: true, 
         to: phone,
-        code,
-        template: 'status',
+        code: '***',
+        template: 'login_web_app',
         msgId: result.id?._serialized || null
       });
     } catch (error) {

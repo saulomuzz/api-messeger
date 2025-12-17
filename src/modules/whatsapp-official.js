@@ -579,6 +579,38 @@ function initWhatsAppOfficialModule({
   }
   
   /**
+   * Envia código de autenticação usando o template "login_web_app"
+   *
+   * Payload equivalente ao curl fornecido:
+   * - type=template
+   * - template.name=login_web_app
+   * - components:
+   *   - body: 1 parâmetro text (código)
+   *   - button url index 0: 1 parâmetro text (código)
+   *
+   * @param {string} to - Número de destino
+   * @param {string|number} code - Código a inserir no body e no botão URL
+   * @param {string} languageCode - Código do idioma (padrão: pt_BR)
+   * @returns {Promise<Object>}
+   */
+  async function sendLoginWebAppCode(to, code, languageCode = 'pt_BR') {
+    const token = String(code);
+    const components = [
+      {
+        type: 'body',
+        parameters: [{ type: 'text', text: token }]
+      },
+      {
+        type: 'button',
+        sub_type: 'url',
+        index: '0',
+        parameters: [{ type: 'text', text: token }]
+      }
+    ];
+    return await sendTemplateMessage(to, 'login_web_app', languageCode, components);
+  }
+
+  /**
    * Envia código/status usando o template "status"
    * Função auxiliar para facilitar o envio de códigos
    * @param {string} to - Número de destino
@@ -2342,6 +2374,7 @@ function initWhatsAppOfficialModule({
     
     // Templates
     sendTemplateMessage,
+    sendLoginWebAppCode,
     sendStatusCode,
     
     // Webhook
