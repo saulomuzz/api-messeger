@@ -414,8 +414,135 @@ function initRoutesModule({
       return res.status(500).json({ ok: false, error: String(e), requestId: rid });
     }
   });
+
+  // Alias: compatibilidade com clientes antigos (ex.: app-bianca) que chamam /send-template
+  app.post('/send-template', strictRateLimit || ((req, res, next) => next()), auth, async (req, res) => {
+    // Reaproveita a mesma lógica do endpoint oficial /send/template
+    req.url = '/send/template';
+    req.originalUrl = '/send/template';
+    // Chama o handler via redirecionamento interno simples
+    // Nota: Express não reencaminha automaticamente para outro handler; duplicamos chamada localmente
+    // Mantemos implementação idêntica ao /send/template para evitar divergência.
+    const rid = requestId();
+    const clientIp = getClientIp(req);
+    
+    if (!req.body) {
+      warn(`[SECURITY][${rid}] Requisição sem body de ${clientIp}`);
+      return res.status(400).json({ ok: false, error: 'invalid_request', message: 'Corpo da requisição inválido', requestId: rid });
+    }
+    
+    if (!verifySignedRequest(req, '/send-template')) {
+      warn(`[SECURITY][${rid}] Assinatura inválida de ${clientIp}`);
+      return res.status(403).json({ ok: false, error: 'invalid signature', requestId: rid });
+    }
+    
+    if (!getIsReady()) {
+      return res.status(503).json({ ok: false, error: 'whatsapp not ready', requestId: rid });
+    }
+    
+    const { phone, template, language, components } = req.body || {};
+    if (!phone || !template) {
+      warn(`[SECURITY][${rid}] Requisição com campos faltando de ${clientIp}`);
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'phone and template are required', 
+        requestId: rid,
+        example: {
+          phone: '5511999999999',
+          template: 'status',
+          language: 'pt_BR',
+          components: [{ type: 'body', parameters: [{ type: 'text', text: 'SEU_CODIGO' }] }]
+        }
+      });
+    }
+    
+    const rawPhone = String(phone);
+    const normalized = normalizeBR(rawPhone);
+    log(`[SEND-TEMPLATE][${rid}] POST recebido | ip=${ip(req)} | template=${template} | phone=${normalized}`);
+    
+    try {
+      const { id: numberId, tried } = await resolveWhatsAppNumber(normalized);
+      if (!numberId) {
+        warn(`[SEND-TEMPLATE][${rid}] Número não está no WhatsApp | tried=${tried.join(',')}`);
+        return res.status(404).json({ ok: false, error: 'not_on_whatsapp', requestId: rid, tried });
+      }
+      
+      const to = numberId._serialized;
+      
+      if (!whatsapp.sendTemplateMessage) {
+        return res.status(500).json({ ok: false, error: 'Template messages not supported', requestId: rid });
+      }
+      
+      const r = await whatsapp.sendTemplateMessage(to, template, language || 'pt_BR', components || []);
+      log(`[SEND-TEMPLATE OK][${rid}] to=${to} template=${template} id=${r.id?._serialized || 'n/a'}`);
+      return res.json({ ok: true, requestId: rid, to, template, msgId: r.id?._serialized || null, normalized, tried });
+    } catch (e) {
+      err(`[SEND-TEMPLATE][${rid}] ERRO`, e);
+      return res.status(500).json({ ok: false, error: String(e), requestId: rid });
+    }
+  });
+
+  // Send Auth Code via template "login_web_app" (padronizado)
+  app.post('/send/auth-code', strictRateLimit || ((req, res, next) => next()), auth, async (req, res) => {
+    const rid = requestId();
+    const clientIp = getClientIp(req);
+    
+    if (!req.body) {
+      warn(`[SECURITY][${rid}] Requisição sem body de ${clientIp}`);
+      return res.status(400).json({ ok: false, error: 'invalid_request', message: 'Corpo da requisição inválido', requestId: rid });
+    }
+    
+    if (!verifySignedRequest(req, '/send/auth-code')) {
+      warn(`[SECURITY][${rid}] Assinatura inválida de ${clientIp}`);
+      return res.status(403).json({ ok: false, error: 'invalid signature', requestId: rid });
+    }
+    
+    if (!getIsReady()) {
+      return res.status(503).json({ ok: false, error: 'whatsapp not ready', requestId: rid });
+    }
+    
+    const { phone, code, language } = req.body || {};
+    if (!phone || !code) {
+      warn(`[SECURITY][${rid}] Requisição com campos faltando de ${clientIp}`);
+      return res.status(400).json({ 
+        ok: false, 
+        error: 'phone and code are required', 
+        requestId: rid,
+        example: {
+          phone: '5511999999999',
+          code: '123ABC',
+          language: 'pt_BR'
+        }
+      });
+    }
+    
+    const rawPhone = String(phone);
+    const normalized = normalizeBR(rawPhone);
+    log(`[SEND-AUTH-CODE][${rid}] POST recebido | ip=${ip(req)} | code=*** | phone=${normalized}`);
+    
+    try {
+      const { id: numberId, tried } = await resolveWhatsAppNumber(normalized);
+      if (!numberId) {
+        warn(`[SEND-AUTH-CODE][${rid}] Número não está no WhatsApp | tried=${tried.join(',')}`);
+        return res.status(404).json({ ok: false, error: 'not_on_whatsapp', requestId: rid, tried });
+      }
+      
+      const to = numberId._serialized;
+      
+      if (!whatsapp.sendLoginWebAppCode) {
+        return res.status(500).json({ ok: false, error: 'Auth code template not supported', requestId: rid });
+      }
+      
+      const r = await whatsapp.sendLoginWebAppCode(to, String(code), language || 'pt_BR');
+      log(`[SEND-AUTH-CODE OK][${rid}] to=${to} template=login_web_app id=${r.id?._serialized || 'n/a'}`);
+      return res.json({ ok: true, requestId: rid, to, code: '***', template: 'login_web_app', msgId: r.id?._serialized || null, normalized, tried });
+    } catch (e) {
+      err(`[SEND-AUTH-CODE][${rid}] ERRO`, e);
+      return res.status(500).json({ ok: false, error: String(e), requestId: rid });
+    }
+  });
   
-  // Send Status Code (usando template "status")
+  // Send Status Code (padronizado para template "login_web_app")
   app.post('/send/status-code', strictRateLimit || ((req, res, next) => next()), auth, async (req, res) => {
     const rid = requestId();
     const clientIp = getClientIp(req);
@@ -451,7 +578,7 @@ function initRoutesModule({
     
     const rawPhone = String(phone);
     const normalized = normalizeBR(rawPhone);
-    log(`[SEND-STATUS-CODE][${rid}] POST recebido | ip=${ip(req)} | code=${code} | phone=${normalized}`);
+    log(`[SEND-STATUS-CODE][${rid}] POST recebido | ip=${ip(req)} | code=*** | phone=${normalized}`);
     
     try {
       const { id: numberId, tried } = await resolveWhatsAppNumber(normalized);
@@ -462,13 +589,13 @@ function initRoutesModule({
       
       const to = numberId._serialized;
       
-      if (!whatsapp.sendStatusCode) {
-        return res.status(500).json({ ok: false, error: 'Status code messages not supported', requestId: rid });
+      if (!whatsapp.sendLoginWebAppCode) {
+        return res.status(500).json({ ok: false, error: 'Auth code template not supported', requestId: rid });
       }
       
-      const r = await whatsapp.sendStatusCode(to, code, language || 'pt_BR');
-      log(`[SEND-STATUS-CODE OK][${rid}] to=${to} code=${code} id=${r.id?._serialized || 'n/a'}`);
-      return res.json({ ok: true, requestId: rid, to, code, template: 'status', msgId: r.id?._serialized || null, normalized, tried });
+      const r = await whatsapp.sendLoginWebAppCode(to, String(code), language || 'pt_BR');
+      log(`[SEND-STATUS-CODE OK][${rid}] to=${to} template=login_web_app id=${r.id?._serialized || 'n/a'}`);
+      return res.json({ ok: true, requestId: rid, to, code: '***', template: 'login_web_app', msgId: r.id?._serialized || null, normalized, tried });
     } catch (e) {
       err(`[SEND-STATUS-CODE][${rid}] ERRO`, e);
       return res.status(500).json({ ok: false, error: String(e), requestId: rid });
