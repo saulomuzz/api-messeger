@@ -41,15 +41,30 @@ function initTuyaMonitorModule({
   }
   
   const DEVICES_STATE_FILE = path.join(appRoot, 'tuya_devices_state.json');
-  const ALERT_THRESHOLD_MS = alertThresholdHours * 60 * 60 * 1000; // Converter horas para ms
-  const CHECK_INTERVAL_MS = checkIntervalMinutes * 60 * 1000; // Converter minutos para ms
-  const ENERGY_COLLECT_INTERVAL_MS = energyCollectIntervalMinutes * 60 * 1000;
+
+  const toPositiveInt = (value, fallback) => {
+    const n = Number.parseInt(String(value), 10);
+    if (!Number.isFinite(n) || Number.isNaN(n)) return fallback;
+    if (n <= 0) return fallback;
+    return n;
+  };
+
+  const safeCheckIntervalMinutes = toPositiveInt(checkIntervalMinutes, 5);
+  const safeEnergyCollectIntervalMinutes = toPositiveInt(energyCollectIntervalMinutes, 60);
+
+  const ALERT_THRESHOLD_MS = (Number(alertThresholdHours) || 1) * 60 * 60 * 1000; // Converter horas para ms
+  const CHECK_INTERVAL_MS = safeCheckIntervalMinutes * 60 * 1000; // Converter minutos para ms
+  const ENERGY_COLLECT_INTERVAL_MS = safeEnergyCollectIntervalMinutes * 60 * 1000;
   
   // Estado dos dispositivos: { deviceId: { name, poweredOn, lastChangeTime, lastAlertTime } }
   let devicesState = {};
   let monitoringInterval = null;
-  let energyCollectInterval = null;
+  let energyCollectInterval = null; // mantido por compatibilidade (não usado no novo scheduler)
+  let energyCollectTimeout = null;
   let isMonitoring = false;
+  let isCollectingEnergy = false;
+  let lastEnergyCollectAt = 0;
+  let nextEnergyCollectAt = 0;
   
   /**
    * Carrega estado dos dispositivos do arquivo
@@ -221,6 +236,14 @@ function initTuyaMonitorModule({
    */
   async function collectEnergyReadings() {
     try {
+      // Evita execuções concorrentes (pode acontecer se a coleta demorar mais que o intervalo)
+      if (isCollectingEnergy) {
+        dbg(`[TUYA-MONITOR] Coleta de energia já em andamento, pulando esta execução`);
+        return { success: false, error: 'already_running' };
+      }
+      isCollectingEnergy = true;
+      lastEnergyCollectAt = Date.now();
+
       log(`[TUYA-MONITOR] Iniciando coleta de energia...`);
       const ipBlocker = getCurrentIpBlocker?.();
       if (!ipBlocker || typeof ipBlocker.saveTuyaEnergyReading !== 'function') {
@@ -356,7 +379,32 @@ function initTuyaMonitorModule({
     } catch (e) {
       err(`[TUYA-MONITOR] Erro na coleta de energia:`, e.message);
       return { success: false, error: e.message };
+    } finally {
+      isCollectingEnergy = false;
     }
+  }
+
+  function scheduleEnergyCollection(initialDelayMs) {
+    // Cancela qualquer agenda anterior
+    if (energyCollectTimeout) {
+      clearTimeout(energyCollectTimeout);
+      energyCollectTimeout = null;
+    }
+
+    const delay = Math.max(0, Number(initialDelayMs) || 0);
+    nextEnergyCollectAt = Date.now() + delay;
+
+    energyCollectTimeout = setTimeout(async () => {
+      try {
+        await collectEnergyReadings();
+      } catch (e) {
+        // collectEnergyReadings já loga, aqui só garante que o scheduler segue
+        dbg(`[TUYA-MONITOR] Erro no loop de coleta: ${e?.message || e}`);
+      } finally {
+        // Agenda a próxima execução SEM overlap
+        scheduleEnergyCollection(ENERGY_COLLECT_INTERVAL_MS);
+      }
+    }, delay);
   }
   
   /**
@@ -368,7 +416,10 @@ function initTuyaMonitorModule({
       return;
     }
     
-    log(`[TUYA-MONITOR] Iniciando monitoramento (verificação a cada ${checkIntervalMinutes} min, alerta após ${alertThresholdHours}h)`);
+    // Marca como ativo antes da primeira verificação (senão checkDevicesAndAlert retorna cedo)
+    isMonitoring = true;
+
+    log(`[TUYA-MONITOR] Iniciando monitoramento (verificação a cada ${safeCheckIntervalMinutes} min, alerta após ${alertThresholdHours}h)`);
     
     // Carrega estado salvo
     loadDevicesState();
@@ -382,21 +433,14 @@ function initTuyaMonitorModule({
     }, CHECK_INTERVAL_MS);
     
     // Configura coleta de energia (se ipBlocker disponível)
-    if (getCurrentIpBlocker && energyCollectIntervalMinutes > 0) {
-      log(`[TUYA-MONITOR] Coleta de energia configurada a cada ${energyCollectIntervalMinutes} minuto(s)`);
-      
-      // Coleta inicial após 1 minuto (para dar tempo ao sistema inicializar)
-      setTimeout(() => {
-        collectEnergyReadings();
-      }, 60 * 1000);
-      
-      // Coleta periódica
-      energyCollectInterval = setInterval(() => {
-        collectEnergyReadings();
-      }, ENERGY_COLLECT_INTERVAL_MS);
+    if (typeof getCurrentIpBlocker === 'function' && safeEnergyCollectIntervalMinutes > 0) {
+      log(`[TUYA-MONITOR] Coleta de energia configurada a cada ${safeEnergyCollectIntervalMinutes} minuto(s) (ms=${ENERGY_COLLECT_INTERVAL_MS})`);
+
+      // Coleta inicial após um delay pequeno (mas nunca maior que o próprio intervalo)
+      const firstDelayMs = Math.min(60 * 1000, ENERGY_COLLECT_INTERVAL_MS);
+      log(`[TUYA-MONITOR] Primeira coleta de energia em ~${Math.ceil(firstDelayMs / 1000)}s`);
+      scheduleEnergyCollection(firstDelayMs);
     }
-    
-    isMonitoring = true;
     log(`[TUYA-MONITOR] Monitoramento iniciado`);
   }
   
@@ -416,6 +460,11 @@ function initTuyaMonitorModule({
     if (energyCollectInterval) {
       clearInterval(energyCollectInterval);
       energyCollectInterval = null;
+    }
+
+    if (energyCollectTimeout) {
+      clearTimeout(energyCollectTimeout);
+      energyCollectTimeout = null;
     }
     
     isMonitoring = false;

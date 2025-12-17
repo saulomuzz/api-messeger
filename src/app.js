@@ -124,8 +124,15 @@ const TUYA_UID = (process.env.TUYA_UID || '').trim(); // UID padrão do usuário
 // Tuya Monitor
 const TUYA_MONITOR_ENABLED = /^true$/i.test(process.env.TUYA_MONITOR_ENABLED || 'true');
 const TUYA_MONITOR_ALERT_HOURS = parseFloat(process.env.TUYA_MONITOR_ALERT_HOURS || '1', 10);
-const TUYA_MONITOR_CHECK_INTERVAL_MINUTES = parseInt(process.env.TUYA_MONITOR_CHECK_INTERVAL_MINUTES || '5', 10);
-const TUYA_ENERGY_COLLECT_INTERVAL_MINUTES = parseInt(process.env.TUYA_ENERGY_COLLECT_INTERVAL_MINUTES || '60', 10);
+const parsePositiveIntEnv = (name, fallback) => {
+  const raw = process.env[name];
+  const value = raw === undefined || raw === null || String(raw).trim() === '' ? fallback : raw;
+  const n = Number.parseInt(String(value), 10);
+  if (!Number.isFinite(n) || Number.isNaN(n) || n <= 0) return fallback;
+  return n;
+};
+const TUYA_MONITOR_CHECK_INTERVAL_MINUTES = parsePositiveIntEnv('TUYA_MONITOR_CHECK_INTERVAL_MINUTES', 5);
+const TUYA_ENERGY_COLLECT_INTERVAL_MINUTES = parsePositiveIntEnv('TUYA_ENERGY_COLLECT_INTERVAL_MINUTES', 60);
 const TUYA_MONITOR_NOTIFICATION_NUMBERS = process.env.TUYA_MONITOR_NOTIFICATION_NUMBERS
   ? process.env.TUYA_MONITOR_NOTIFICATION_NUMBERS.split(',').map(n => n.trim())
   : [];
@@ -1125,6 +1132,8 @@ log(`[INIT]   TUYA_CLIENT_ID=${TUYA_CLIENT_ID ? 'definido' : 'NÃO DEFINIDO'}`);
 log(`[INIT]   TUYA_CLIENT_SECRET=${TUYA_CLIENT_SECRET ? 'definido' : 'NÃO DEFINIDO'}`);
 log(`[INIT]   whatsapp=${whatsapp ? 'disponível' : 'NÃO DISPONÍVEL'}`);
 log(`[INIT]   tuya=${tuya ? 'disponível' : 'NÃO DISPONÍVEL'}`);
+log(`[INIT]   TUYA_MONITOR_CHECK_INTERVAL_MINUTES=${TUYA_MONITOR_CHECK_INTERVAL_MINUTES}`);
+log(`[INIT]   TUYA_ENERGY_COLLECT_INTERVAL_MINUTES=${TUYA_ENERGY_COLLECT_INTERVAL_MINUTES}`);
 
 if (TUYA_MONITOR_ENABLED && TUYA_CLIENT_ID && TUYA_CLIENT_SECRET && whatsapp) {
   try {
