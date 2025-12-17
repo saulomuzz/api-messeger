@@ -913,10 +913,10 @@ function initCameraModule({
     
     // Obtém duração do vídeo
     return new Promise((resolve, reject) => {
-      ffmpeg.ffprobe(inputFile, (err, metadata) => {
-        if (err) {
-          err(`[SPLIT] Erro ao obter metadados do vídeo:`, err.message);
-          reject(err);
+      ffmpeg.ffprobe(inputFile, (probeError, metadata) => {
+        if (probeError) {
+          err(`[SPLIT] Erro ao obter metadados do vídeo:`, probeError.message);
+          reject(probeError);
           return;
         }
         

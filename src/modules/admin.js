@@ -6,8 +6,16 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
-function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOfficial, websocketESP32, getClientIp }) {
+function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOfficial, websocketESP32, getClientIp, getAbuseIPDB, tuya, getCurrentTuyaMonitor }) {
   const { log, warn, err, dbg } = logger;
+  
+  // Debug: verifica se tuyaMonitor foi recebido
+  const initialTuyaMonitor = getCurrentTuyaMonitor?.();
+  dbg(`[ADMIN-INIT] tuyaMonitor recebido? ${!!initialTuyaMonitor}`);
+  if (initialTuyaMonitor) {
+    dbg(`[ADMIN-INIT] tuyaMonitor.collectEnergyReadings? ${typeof initialTuyaMonitor.collectEnergyReadings === 'function'}`);
+    dbg(`[ADMIN-INIT] tuyaMonitor métodos disponíveis: ${Object.keys(initialTuyaMonitor).join(', ')}`);
+  }
   
   // Função auxiliar para obter IP do cliente
   const getClientIpAddress = getClientIp || ((req) => {
@@ -58,10 +66,15 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
   const ADMIN_PHONE_NUMBER = process.env.ADMIN_PHONE_NUMBER || '';
   const ADMIN_CODE_EXPIRY_MINUTES = parseInt(process.env.ADMIN_CODE_EXPIRY_MINUTES || '10', 10);
   const ADMIN_SESSION_EXPIRY_HOURS = parseInt(process.env.ADMIN_SESSION_EXPIRY_HOURS || '24', 10);
+  const ADMIN_TRUST_DAYS = parseInt(process.env.ADMIN_TRUST_DAYS || '30', 10);
   
-  // Armazena códigos e sessões
+  // Armazena apenas códigos pendentes em memória (expiram rápido)
+  // Sessões são persistidas no banco de dados
   const pendingCodes = new Map();
-  const activeSessions = new Map();
+  
+  // Cache de sessões em memória (para performance)
+  const sessionCache = new Map();
+  const SESSION_CACHE_TTL = 5 * 60 * 1000; // 5 minutos
   
   // Funções auxiliares
   function generateAccessCode() {
@@ -72,16 +85,53 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
     return crypto.randomBytes(32).toString('hex');
   }
   
-  // Limpeza automática
+  function generateDeviceFingerprint(req) {
+    const userAgent = req.headers['user-agent'] || '';
+    const ip = getClientIpAddress(req);
+    // Fingerprint: hash de user-agent + parte do IP (para ser mais tolerante a mudanças de IP)
+    const ipPrefix = ip.split('.').slice(0, 2).join('.'); // Ex: 192.168
+    const data = `${userAgent}|${ipPrefix}`;
+    return crypto.createHash('sha256').update(data).digest('hex').substring(0, 32);
+  }
+  
+  function getDeviceName(req) {
+    const ua = req.headers['user-agent'] || '';
+    if (ua.includes('Windows')) return 'Windows';
+    if (ua.includes('Mac')) return 'Mac';
+    if (ua.includes('Linux')) return 'Linux';
+    if (ua.includes('Android')) return 'Android';
+    if (ua.includes('iPhone') || ua.includes('iPad')) return 'iOS';
+    return 'Desconhecido';
+  }
+  
+  // Limpeza automática de códigos pendentes e cache
   setInterval(() => {
     const now = Date.now();
     for (const [phone, data] of pendingCodes.entries()) {
       if (data.expiresAt < now) pendingCodes.delete(phone);
     }
-    for (const [sessionId, session] of activeSessions.entries()) {
-      if (session.expiresAt < now) activeSessions.delete(sessionId);
+    // Limpa cache de sessões antigas
+    for (const [sessionId, cacheData] of sessionCache.entries()) {
+      if (cacheData.cachedAt + SESSION_CACHE_TTL < now) {
+        sessionCache.delete(sessionId);
+      }
     }
   }, 60 * 1000);
+  
+  // Limpeza de sessões expiradas no banco (a cada 10 minutos)
+  setInterval(async () => {
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      if (ipBlocker && typeof ipBlocker.cleanExpiredAdminSessions === 'function') {
+        const cleaned = await ipBlocker.cleanExpiredAdminSessions();
+        if (cleaned > 0) {
+          log(`[ADMIN] Limpeza: ${cleaned} sessões expiradas removidas`);
+        }
+      }
+    } catch (e) {
+      dbg(`[ADMIN] Erro na limpeza de sessões:`, e.message);
+    }
+  }, 10 * 60 * 1000);
   
   // Envia código via WhatsApp
   async function sendAccessCode(phone) {
@@ -109,37 +159,119 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
     return { success: false, error: 'WhatsApp not available' };
   }
   
-  // Valida código
-  function validateCode(phone, code) {
+  // Valida código e cria sessão
+  async function validateCode(phone, code, req, trustDevice = false) {
     const codeData = pendingCodes.get(phone);
     if (!codeData || codeData.expiresAt < Date.now() || codeData.code !== code) {
       return { valid: false, error: 'Código inválido ou expirado' };
     }
     
     const sessionId = generateSessionId();
-    activeSessions.set(sessionId, {
+    const now = Math.floor(Date.now() / 1000);
+    const expiresAt = now + (ADMIN_SESSION_EXPIRY_HOURS * 3600);
+    
+    // Dados da sessão
+    const sessionData = {
       phone,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + (ADMIN_SESSION_EXPIRY_HOURS * 60 * 60 * 1000)
+      deviceFingerprint: generateDeviceFingerprint(req),
+      deviceName: getDeviceName(req),
+      ipAddress: getClientIpAddress(req),
+      userAgent: (req.headers['user-agent'] || '').substring(0, 255),
+      trustedUntil: trustDevice ? now + (ADMIN_TRUST_DAYS * 24 * 3600) : null,
+      createdAt: now,
+      expiresAt,
+      lastUsedAt: now
+    };
+    
+    // Salva no banco
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      if (ipBlocker && typeof ipBlocker.saveAdminSession === 'function') {
+        await ipBlocker.saveAdminSession(sessionId, sessionData);
+        log(`[ADMIN] Sessão criada: ${sessionId.substring(0, 8)}... | Dispositivo: ${sessionData.deviceName} | Confiável: ${trustDevice ? ADMIN_TRUST_DAYS + ' dias' : 'não'}`);
+      }
+    } catch (e) {
+      err(`[ADMIN] Erro ao salvar sessão no banco:`, e.message);
+      // Em caso de erro, ainda retorna válido (fallback para memória)
+    }
+    
+    // Adiciona ao cache
+    sessionCache.set(sessionId, {
+      session: { ...sessionData, session_id: sessionId },
+      cachedAt: Date.now()
     });
     
     pendingCodes.delete(phone);
-    return { valid: true, sessionId };
+    return { valid: true, sessionId, trusted: trustDevice };
   }
   
-  // Valida sessão
-  function validateSession(sessionId) {
-    const session = activeSessions.get(sessionId);
-    if (!session || session.expiresAt < Date.now()) {
-      return { valid: false };
+  // Valida sessão (primeiro no cache, depois no banco)
+  async function validateSession(sessionId) {
+    if (!sessionId) return { valid: false };
+    
+    const now = Math.floor(Date.now() / 1000);
+    
+    // Verifica cache primeiro
+    const cached = sessionCache.get(sessionId);
+    if (cached && cached.cachedAt + SESSION_CACHE_TTL > Date.now()) {
+      const session = cached.session;
+      if (session.expires_at > now || (session.trusted_until && session.trusted_until > now)) {
+        return { valid: true, phone: session.phone };
+      }
     }
-    return { valid: true, phone: session.phone };
+    
+    // Busca no banco
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      if (ipBlocker && typeof ipBlocker.getAdminSession === 'function') {
+        const session = await ipBlocker.getAdminSession(sessionId);
+        if (session) {
+          // Verifica se sessão ainda é válida
+          if (session.expires_at > now || (session.trusted_until && session.trusted_until > now)) {
+            // Atualiza cache
+            sessionCache.set(sessionId, { session, cachedAt: Date.now() });
+            // Atualiza último uso (async, não espera)
+            ipBlocker.updateAdminSessionLastUsed(sessionId).catch(() => {});
+            return { valid: true, phone: session.phone };
+          }
+        }
+      }
+    } catch (e) {
+      dbg(`[ADMIN] Erro ao validar sessão:`, e.message);
+    }
+    
+    return { valid: false };
   }
   
-  // Middleware de autenticação
-  function requireAuth(req, res, next) {
+  // Verifica se dispositivo é confiável (para pular código)
+  async function checkTrustedDevice(req) {
+    const fingerprint = generateDeviceFingerprint(req);
+    
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      if (ipBlocker && typeof ipBlocker.getAdminSessionByFingerprint === 'function') {
+        const session = await ipBlocker.getAdminSessionByFingerprint(fingerprint);
+        if (session) {
+          log(`[ADMIN] Dispositivo confiável detectado: ${session.device_name} (${fingerprint.substring(0, 8)}...)`);
+          return { 
+            trusted: true, 
+            phone: session.phone,
+            sessionId: session.session_id,
+            deviceName: session.device_name
+          };
+        }
+      }
+    } catch (e) {
+      dbg(`[ADMIN] Erro ao verificar dispositivo confiável:`, e.message);
+    }
+    
+    return { trusted: false };
+  }
+  
+  // Middleware de autenticação (agora async)
+  async function requireAuth(req, res, next) {
     const sessionId = req.cookies?.admin_session || req.headers['x-admin-session'];
-    const validation = validateSession(sessionId);
+    const validation = await validateSession(sessionId);
     if (!validation.valid) {
       // Sessão inválida ou expirada - apenas retorna 401
       // NÃO bloqueia o IP pois é comportamento normal de usuário não logado
@@ -202,7 +334,53 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
   
   // ===== ROTAS =====
   
-  app.get('/admin', (req, res) => {
+  app.get('/admin', async (req, res) => {
+    // Verifica se já tem sessão válida
+    const sessionId = req.cookies?.admin_session;
+    if (sessionId) {
+      const validation = await validateSession(sessionId);
+      if (validation.valid) {
+        return res.redirect('/admin/dashboard');
+      }
+    }
+    
+    // Verifica se dispositivo é confiável
+    const trusted = await checkTrustedDevice(req);
+    if (trusted.trusted) {
+      // Dispositivo confiável - cria nova sessão automaticamente
+      const newSessionId = generateSessionId();
+      const now = Math.floor(Date.now() / 1000);
+      
+      try {
+        const ipBlocker = getCurrentIpBlocker();
+        if (ipBlocker && typeof ipBlocker.saveAdminSession === 'function') {
+          await ipBlocker.saveAdminSession(newSessionId, {
+            phone: trusted.phone,
+            deviceFingerprint: generateDeviceFingerprint(req),
+            deviceName: getDeviceName(req),
+            ipAddress: getClientIpAddress(req),
+            userAgent: (req.headers['user-agent'] || '').substring(0, 255),
+            trustedUntil: now + (ADMIN_TRUST_DAYS * 24 * 3600),
+            createdAt: now,
+            expiresAt: now + (ADMIN_SESSION_EXPIRY_HOURS * 3600),
+            lastUsedAt: now
+          });
+          
+          res.cookie('admin_session', newSessionId, {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            maxAge: ADMIN_TRUST_DAYS * 24 * 60 * 60 * 1000,
+            sameSite: 'strict'
+          });
+          
+          log(`[ADMIN] Login automático via dispositivo confiável: ${trusted.deviceName}`);
+          return res.redirect('/admin/dashboard');
+        }
+      } catch (e) {
+        err(`[ADMIN] Erro ao criar sessão para dispositivo confiável:`, e.message);
+      }
+    }
+    
     const template = loadTemplate('login');
     res.send(template || 'Erro ao carregar página');
   });
@@ -212,16 +390,22 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
     res.json(result);
   });
   
-  app.post('/admin/validate-code', (req, res) => {
-    const result = validateCode(req.body.phone, req.body.code);
+  app.post('/admin/validate-code', async (req, res) => {
+    const trustDevice = req.body.trustDevice === true || req.body.trustDevice === 'true';
+    const result = await validateCode(req.body.phone, req.body.code, req, trustDevice);
+    
     if (result.valid) {
+      const cookieMaxAge = result.trusted 
+        ? ADMIN_TRUST_DAYS * 24 * 60 * 60 * 1000 
+        : ADMIN_SESSION_EXPIRY_HOURS * 60 * 60 * 1000;
+      
       res.cookie('admin_session', result.sessionId, {
         httpOnly: true,
         secure: process.env.NODE_ENV === 'production',
-        maxAge: ADMIN_SESSION_EXPIRY_HOURS * 60 * 60 * 1000,
+        maxAge: cookieMaxAge,
         sameSite: 'strict'
       });
-      res.json({ success: true });
+      res.json({ success: true, trusted: result.trusted });
     } else {
       res.status(401).json({ success: false, error: result.error });
     }
@@ -498,15 +682,119 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
     }
   });
   
-  app.post('/admin/logout', requireAuth, (req, res) => {
+  app.post('/admin/logout', requireAuth, async (req, res) => {
     const sessionId = req.cookies?.admin_session || req.headers['x-admin-session'];
-    if (sessionId) activeSessions.delete(sessionId);
+    if (sessionId) {
+      // Remove do cache
+      sessionCache.delete(sessionId);
+      // Remove do banco
+      try {
+        const ipBlocker = getCurrentIpBlocker();
+        if (ipBlocker && typeof ipBlocker.deleteAdminSession === 'function') {
+          await ipBlocker.deleteAdminSession(sessionId);
+        }
+      } catch (e) {
+        dbg(`[ADMIN] Erro ao remover sessão do banco:`, e.message);
+      }
+    }
     res.clearCookie('admin_session');
     res.json({ success: true });
   });
   
-  // Endpoint temporário de debug (SEM autenticação - REMOVER EM PRODUÇÃO)
-  app.get('/admin/debug/info', async (req, res) => {
+  // ===== DISPOSITIVOS CONFIÁVEIS =====
+  
+  // Lista dispositivos confiáveis do usuário atual
+  app.get('/admin/api/trusted-devices', requireAuth, async (req, res) => {
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      if (!ipBlocker || typeof ipBlocker.listTrustedDevices !== 'function') {
+        return res.status(503).json({ success: false, error: 'Serviço não disponível' });
+      }
+      
+      const devices = await ipBlocker.listTrustedDevices(req.adminPhone);
+      
+      // Identifica o dispositivo atual
+      const currentFingerprint = generateDeviceFingerprint(req);
+      
+      const formattedDevices = devices.map(d => ({
+        id: d.session_id,
+        name: d.device_name || 'Desconhecido',
+        ip: d.ip_address,
+        trustedUntil: d.trusted_until,
+        createdAt: d.created_at,
+        lastUsedAt: d.last_used_at,
+        isCurrent: d.device_fingerprint === currentFingerprint
+      }));
+      
+      res.json({ success: true, devices: formattedDevices });
+    } catch (error) {
+      err(`[ADMIN] Erro ao listar dispositivos confiáveis:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // Revoga confiança de um dispositivo
+  app.post('/admin/api/trusted-devices/:sessionId/revoke', requireAuth, async (req, res) => {
+    try {
+      const { sessionId } = req.params;
+      
+      const ipBlocker = getCurrentIpBlocker();
+      if (!ipBlocker || typeof ipBlocker.revokeTrustedDevice !== 'function') {
+        return res.status(503).json({ success: false, error: 'Serviço não disponível' });
+      }
+      
+      await ipBlocker.revokeTrustedDevice(sessionId);
+      
+      // Remove do cache
+      sessionCache.delete(sessionId);
+      
+      log(`[ADMIN] Dispositivo revogado: ${sessionId.substring(0, 8)}...`);
+      
+      res.json({ success: true });
+    } catch (error) {
+      err(`[ADMIN] Erro ao revogar dispositivo:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // Revoga todos os dispositivos (exceto o atual)
+  app.post('/admin/api/trusted-devices/revoke-all', requireAuth, async (req, res) => {
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      if (!ipBlocker || typeof ipBlocker.listTrustedDevices !== 'function') {
+        return res.status(503).json({ success: false, error: 'Serviço não disponível' });
+      }
+      
+      const currentSessionId = req.cookies?.admin_session || req.headers['x-admin-session'];
+      const devices = await ipBlocker.listTrustedDevices(req.adminPhone);
+      
+      let revoked = 0;
+      for (const device of devices) {
+        if (device.session_id !== currentSessionId) {
+          await ipBlocker.revokeTrustedDevice(device.session_id);
+          sessionCache.delete(device.session_id);
+          revoked++;
+        }
+      }
+      
+      log(`[ADMIN] ${revoked} dispositivos revogados`);
+      
+      res.json({ success: true, revoked });
+    } catch (error) {
+      err(`[ADMIN] Erro ao revogar dispositivos:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // Endpoint de debug (PROTEGIDO com autenticação)
+  // Em produção, considere desabilitar completamente via variável de ambiente
+  const ENABLE_DEBUG_ENDPOINT = process.env.ENABLE_DEBUG_ENDPOINT === 'true';
+  
+  app.get('/admin/debug/info', requireAuth, async (req, res) => {
+    // Verifica se o endpoint está habilitado
+    if (!ENABLE_DEBUG_ENDPOINT) {
+      return res.status(404).json({ error: 'Endpoint não disponível' });
+    }
     try {
       const fs = require('fs');
       const path = require('path');
@@ -895,6 +1183,1109 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
       });
     } catch (error) {
       err(`[ADMIN] Erro ao obter métricas do servidor:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // ===== TRUSTED IP RANGES =====
+  
+  // API: Listar ranges confiáveis
+  app.get('/admin/api/trusted-ranges', requireAuth, async (req, res) => {
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      const category = req.query.category || null;
+      const enabledOnly = req.query.enabledOnly === 'true';
+      
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.listTrustedRanges !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const ranges = await ipBlocker.listTrustedRanges(category, enabledOnly);
+      const counts = await ipBlocker.countTrustedRangesByCategory();
+      
+      res.json({ 
+        success: true, 
+        ranges,
+        counts,
+        total: ranges.length
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao listar ranges confiáveis:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Adicionar range confiável
+  app.post('/admin/api/trusted-ranges', requireAuth, async (req, res) => {
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      const { cidr, category, description } = req.body;
+      
+      if (!cidr || !category) {
+        return res.status(400).json({ success: false, error: 'CIDR e categoria são obrigatórios' });
+      }
+      
+      // Valida formato CIDR básico
+      const cidrRegex = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
+      if (!cidrRegex.test(cidr)) {
+        return res.status(400).json({ success: false, error: 'Formato CIDR inválido (ex: 192.168.1.0/24)' });
+      }
+      
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.addTrustedRange !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const result = await ipBlocker.addTrustedRange(cidr, category, description || '');
+      
+      log(`[ADMIN] Range confiável adicionado: ${cidr} (${category})`);
+      res.json({ success: true, ...result });
+    } catch (error) {
+      err(`[ADMIN] Erro ao adicionar range confiável:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Remover range confiável
+  app.delete('/admin/api/trusted-ranges/:id', requireAuth, async (req, res) => {
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      const id = parseInt(req.params.id, 10);
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ success: false, error: 'ID inválido' });
+      }
+      
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.removeTrustedRange !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const removed = await ipBlocker.removeTrustedRange(id);
+      
+      if (removed) {
+        log(`[ADMIN] Range confiável removido: ID ${id}`);
+        res.json({ success: true, removed: true });
+      } else {
+        res.status(404).json({ success: false, error: 'Range não encontrado' });
+      }
+    } catch (error) {
+      err(`[ADMIN] Erro ao remover range confiável:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Habilitar/Desabilitar range confiável
+  app.put('/admin/api/trusted-ranges/:id/toggle', requireAuth, async (req, res) => {
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      const id = parseInt(req.params.id, 10);
+      const { enabled } = req.body;
+      
+      if (isNaN(id)) {
+        return res.status(400).json({ success: false, error: 'ID inválido' });
+      }
+      
+      if (typeof enabled !== 'boolean') {
+        return res.status(400).json({ success: false, error: 'Campo "enabled" deve ser boolean' });
+      }
+      
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.toggleTrustedRange !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const updated = await ipBlocker.toggleTrustedRange(id, enabled);
+      
+      if (updated) {
+        log(`[ADMIN] Range confiável ${enabled ? 'habilitado' : 'desabilitado'}: ID ${id}`);
+        res.json({ success: true, enabled });
+      } else {
+        res.status(404).json({ success: false, error: 'Range não encontrado' });
+      }
+    } catch (error) {
+      err(`[ADMIN] Erro ao atualizar range confiável:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Importar ranges do Meta
+  app.post('/admin/api/trusted-ranges/import-meta', requireAuth, async (req, res) => {
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.importMetaRanges !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const result = await ipBlocker.importMetaRanges();
+      
+      log(`[ADMIN] Ranges Meta importados: ${result.imported} novos, ${result.skipped} ignorados`);
+      res.json({ success: true, ...result });
+    } catch (error) {
+      err(`[ADMIN] Erro ao importar ranges Meta:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // ===== ABUSEIPDB STATS =====
+  
+  // API: Estatísticas de uso da API AbuseIPDB
+  app.get('/admin/api/abuseipdb/stats', requireAuth, async (req, res) => {
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.getAbuseIPDBStats !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const stats = await ipBlocker.getAbuseIPDBStats();
+      
+      res.json({ success: true, stats });
+    } catch (error) {
+      err(`[ADMIN] Erro ao obter stats AbuseIPDB:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // ===== IP LOOKUP =====
+  
+  // API: Consultar informações de um IP
+  app.get('/admin/api/ip/lookup', requireAuth, async (req, res) => {
+    try {
+      const { ip, checkAbuse } = req.query;
+      
+      if (!ip) {
+        return res.status(400).json({ success: false, error: 'IP é obrigatório' });
+      }
+      
+      // Valida formato básico do IP
+      const ipRegex = /^(\d{1,3}\.){3}\d{1,3}$/;
+      if (!ipRegex.test(ip)) {
+        return res.status(400).json({ success: false, error: 'Formato de IP inválido' });
+      }
+      
+      const ipBlocker = getCurrentIpBlocker();
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker) {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      // Verifica em qual lista o IP está
+      const [isBlocked, whitelistCheck, yellowlistCheck] = await Promise.all([
+        ipBlocker.isBlocked(ip),
+        ipBlocker.isInWhitelist(ip),
+        ipBlocker.isInYellowlist(ip)
+      ]);
+      
+      // Determina status atual
+      let currentList = 'none';
+      let listDetails = null;
+      
+      if (isBlocked) {
+        currentList = 'blocked';
+      } else if (whitelistCheck.inWhitelist) {
+        currentList = 'whitelist';
+        listDetails = {
+          abuseConfidence: whitelistCheck.abuseConfidence,
+          expiresAt: whitelistCheck.expiresAt
+        };
+      } else if (yellowlistCheck.inYellowlist) {
+        currentList = 'yellowlist';
+        listDetails = {
+          abuseConfidence: yellowlistCheck.abuseConfidence,
+          expiresAt: yellowlistCheck.expiresAt
+        };
+      }
+      
+      // Verifica se é IP confiável (trusted range)
+      let trustedInfo = null;
+      if (typeof ipBlocker.getEnabledTrustedRanges === 'function') {
+        try {
+          const { checkTrustedIP } = require('./ip-utils');
+          const trustedCheck = await checkTrustedIP(ip, ipBlocker);
+          if (trustedCheck.trusted) {
+            trustedInfo = {
+              trusted: true,
+              category: trustedCheck.category
+            };
+          }
+        } catch (e) {
+          dbg(`[ADMIN] Erro ao verificar trusted IP:`, e.message);
+        }
+      }
+      
+      // Busca histórico de migrações
+      let migrations = [];
+      if (typeof ipBlocker.listMigrationLogs === 'function') {
+        try {
+          const allMigrations = await ipBlocker.listMigrationLogs(50);
+          migrations = allMigrations.filter(m => m.ip === ip).slice(0, 10);
+        } catch (e) {
+          dbg(`[ADMIN] Erro ao buscar migrações:`, e.message);
+        }
+      }
+      
+      // Busca no AbuseIPDB se solicitado
+      let abuseData = null;
+      if (checkAbuse === 'true') {
+        const abuseIPDB = getAbuseIPDB ? getAbuseIPDB() : null;
+        if (abuseIPDB && typeof abuseIPDB.checkIP === 'function') {
+          try {
+            abuseData = await abuseIPDB.checkIP(ip, 90, true); // forceCheck = true
+            log(`[ADMIN] Consulta AbuseIPDB para ${ip}: ${abuseData.abuseConfidence}% confiança`);
+          } catch (e) {
+            warn(`[ADMIN] Erro ao consultar AbuseIPDB:`, e.message);
+            abuseData = { error: e.message };
+          }
+        } else {
+          abuseData = { error: 'AbuseIPDB não disponível' };
+        }
+      }
+      
+      res.json({
+        success: true,
+        ip,
+        status: {
+          currentList,
+          listDetails,
+          trusted: trustedInfo
+        },
+        abuse: abuseData,
+        migrations
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao consultar IP:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // ===== ENVIO DE MENSAGENS =====
+  
+  // API: Enviar template
+  app.post('/admin/api/send/template', requireAuth, async (req, res) => {
+    try {
+      const { phone, template, language, components } = req.body;
+      
+      if (!phone || !template) {
+        return res.status(400).json({ ok: false, error: 'phone e template são obrigatórios' });
+      }
+      
+      if (!whatsappOfficial || !whatsappOfficial.sendTemplateMessage) {
+        return res.status(500).json({ ok: false, error: 'Função de envio de template não disponível' });
+      }
+      
+      log(`[ADMIN] Enviando template "${template}" para ${phone}`);
+      
+      const result = await whatsappOfficial.sendTemplateMessage(
+        phone, 
+        template, 
+        language || 'pt_BR', 
+        components || []
+      );
+      
+      log(`[ADMIN] ✅ Template enviado: ${result.id?._serialized || 'N/A'}`);
+      
+      res.json({ 
+        ok: true, 
+        to: phone,
+        template,
+        msgId: result.id?._serialized || null
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao enviar template:`, error.message);
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+  
+  // API: Enviar texto
+  app.post('/admin/api/send/text', requireAuth, async (req, res) => {
+    try {
+      const { phone, subject, message } = req.body;
+      
+      if (!phone || !message) {
+        return res.status(400).json({ ok: false, error: 'phone e message são obrigatórios' });
+      }
+      
+      if (!whatsappOfficial || !whatsappOfficial.sendTextMessage) {
+        return res.status(500).json({ ok: false, error: 'Função de envio de texto não disponível' });
+      }
+      
+      log(`[ADMIN] Enviando mensagem de texto para ${phone}`);
+      
+      // Formata mensagem com assunto se fornecido
+      const formattedMessage = subject ? `*${subject}*\n\n${message}` : message;
+      
+      const result = await whatsappOfficial.sendTextMessage(phone, formattedMessage);
+      
+      log(`[ADMIN] ✅ Mensagem enviada: ${result.id?._serialized || 'N/A'}`);
+      
+      res.json({ 
+        ok: true, 
+        to: phone,
+        msgId: result.id?._serialized || null
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao enviar mensagem:`, error.message);
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+  
+  // API: Enviar código via template "status" (atalho)
+  app.post('/admin/api/send/status-code', requireAuth, async (req, res) => {
+    try {
+      const { phone, code, language } = req.body;
+      
+      if (!phone || !code) {
+        return res.status(400).json({ ok: false, error: 'phone e code são obrigatórios' });
+      }
+      
+      if (!whatsappOfficial || !whatsappOfficial.sendStatusCode) {
+        return res.status(500).json({ ok: false, error: 'Função de envio de código não disponível' });
+      }
+      
+      log(`[ADMIN] Enviando código "${code}" para ${phone} via template "status"`);
+      
+      const result = await whatsappOfficial.sendStatusCode(phone, code, language || 'pt_BR');
+      
+      log(`[ADMIN] ✅ Código enviado: ${result.id?._serialized || 'N/A'}`);
+      
+      res.json({ 
+        ok: true, 
+        to: phone,
+        code,
+        template: 'status',
+        msgId: result.id?._serialized || null
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao enviar código:`, error.message);
+      res.status(500).json({ ok: false, error: error.message });
+    }
+  });
+  
+  // ===== TUYA ENDPOINTS =====
+  
+  // API: Listar dispositivos Tuya com status
+  app.get('/admin/api/tuya/devices', requireAuth, async (req, res) => {
+    try {
+      if (!tuya) {
+        return res.status(503).json({ success: false, error: 'Módulo Tuya não disponível' });
+      }
+      
+      const devices = await tuya.getCachedDevices();
+      
+      // Conta estatísticas
+      const stats = {
+        total: devices.length,
+        online: devices.filter(d => d.online).length,
+        offline: devices.filter(d => !d.online).length,
+        poweredOn: devices.filter(d => d.poweredOn).length,
+        poweredOff: devices.filter(d => !d.poweredOn).length
+      };
+      
+      res.json({ success: true, devices, stats });
+    } catch (error) {
+      err(`[ADMIN] Erro ao listar dispositivos Tuya:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Obter status de um dispositivo específico
+  app.get('/admin/api/tuya/device/:deviceId/status', requireAuth, async (req, res) => {
+    try {
+      const { deviceId } = req.params;
+      
+      if (!tuya) {
+        return res.status(503).json({ success: false, error: 'Módulo Tuya não disponível' });
+      }
+      
+      const status = await tuya.getDeviceStatus(deviceId);
+      
+      res.json({ success: true, deviceId, status });
+    } catch (error) {
+      err(`[ADMIN] Erro ao obter status do dispositivo:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Alternar estado de um dispositivo (toggle)
+  app.post('/admin/api/tuya/device/:deviceId/toggle', requireAuth, async (req, res) => {
+    try {
+      const { deviceId } = req.params;
+      const { switchCode } = req.body; // Opcional: código específico do switch
+      
+      if (!tuya) {
+        return res.status(503).json({ success: false, error: 'Módulo Tuya não disponível' });
+      }
+      
+      // Obtém status atual para saber se está ligado ou desligado
+      const status = await tuya.getDeviceStatus(deviceId);
+      const currentSwitchCode = switchCode || tuya.findSwitchCode(status);
+      
+      if (!currentSwitchCode) {
+        return res.status(400).json({ success: false, error: 'Dispositivo não tem switch controlável' });
+      }
+      
+      // Encontra o valor atual do switch
+      const currentSwitch = status.find(s => s.code === currentSwitchCode);
+      const currentValue = currentSwitch?.value || false;
+      const newValue = !currentValue;
+      
+      // Envia comando para alternar
+      const commands = [{ code: currentSwitchCode, value: newValue }];
+      const result = await tuya.sendCommand(deviceId, commands);
+      
+      // Registra evento no banco
+      const ipBlocker = getCurrentIpBlocker();
+      if (ipBlocker && typeof ipBlocker.logTuyaEvent === 'function') {
+        await ipBlocker.logTuyaEvent(
+          deviceId,
+          null, // deviceName será preenchido depois
+          'power_change',
+          currentValue ? 'ON' : 'OFF',
+          newValue ? 'ON' : 'OFF',
+          'admin'
+        );
+      }
+      
+      log(`[ADMIN] Dispositivo ${deviceId} alternado: ${currentValue ? 'ON' : 'OFF'} → ${newValue ? 'ON' : 'OFF'}`);
+      
+      res.json({ 
+        success: true, 
+        deviceId, 
+        previousState: currentValue,
+        newState: newValue,
+        result 
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao alternar dispositivo:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Ligar dispositivo
+  app.post('/admin/api/tuya/device/:deviceId/on', requireAuth, async (req, res) => {
+    try {
+      const { deviceId } = req.params;
+      const { switchCode } = req.body;
+      
+      if (!tuya) {
+        return res.status(503).json({ success: false, error: 'Módulo Tuya não disponível' });
+      }
+      
+      const status = await tuya.getDeviceStatus(deviceId);
+      const targetCode = switchCode || tuya.findSwitchCode(status);
+      
+      if (!targetCode) {
+        return res.status(400).json({ success: false, error: 'Dispositivo não tem switch controlável' });
+      }
+      
+      const commands = [{ code: targetCode, value: true }];
+      const result = await tuya.sendCommand(deviceId, commands);
+      
+      // Registra evento
+      const ipBlocker = getCurrentIpBlocker();
+      if (ipBlocker && typeof ipBlocker.logTuyaEvent === 'function') {
+        await ipBlocker.logTuyaEvent(deviceId, null, 'power_change', 'OFF', 'ON', 'admin');
+      }
+      
+      log(`[ADMIN] Dispositivo ${deviceId} ligado via admin`);
+      
+      res.json({ success: true, deviceId, state: true, result });
+    } catch (error) {
+      err(`[ADMIN] Erro ao ligar dispositivo:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Desligar dispositivo
+  app.post('/admin/api/tuya/device/:deviceId/off', requireAuth, async (req, res) => {
+    try {
+      const { deviceId } = req.params;
+      const { switchCode } = req.body;
+      
+      if (!tuya) {
+        return res.status(503).json({ success: false, error: 'Módulo Tuya não disponível' });
+      }
+      
+      const status = await tuya.getDeviceStatus(deviceId);
+      const targetCode = switchCode || tuya.findSwitchCode(status);
+      
+      if (!targetCode) {
+        return res.status(400).json({ success: false, error: 'Dispositivo não tem switch controlável' });
+      }
+      
+      const commands = [{ code: targetCode, value: false }];
+      const result = await tuya.sendCommand(deviceId, commands);
+      
+      // Registra evento
+      const ipBlocker = getCurrentIpBlocker();
+      if (ipBlocker && typeof ipBlocker.logTuyaEvent === 'function') {
+        await ipBlocker.logTuyaEvent(deviceId, null, 'power_change', 'ON', 'OFF', 'admin');
+      }
+      
+      log(`[ADMIN] Dispositivo ${deviceId} desligado via admin`);
+      
+      res.json({ success: true, deviceId, state: false, result });
+    } catch (error) {
+      err(`[ADMIN] Erro ao desligar dispositivo:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Listar eventos Tuya
+  app.get('/admin/api/tuya/events', requireAuth, async (req, res) => {
+    try {
+      const { limit = 50, offset = 0, deviceId, eventType } = req.query;
+      
+      const ipBlocker = getCurrentIpBlocker();
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.listTuyaEvents !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const filters = {};
+      if (deviceId) filters.deviceId = deviceId;
+      if (eventType) filters.eventType = eventType;
+      
+      const [events, total] = await Promise.all([
+        ipBlocker.listTuyaEvents(parseInt(limit), parseInt(offset), filters),
+        ipBlocker.countTuyaEvents(filters)
+      ]);
+      
+      res.json({ 
+        success: true, 
+        data: events,
+        pagination: {
+          total,
+          limit: parseInt(limit),
+          offset: parseInt(offset)
+        }
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao listar eventos Tuya:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Estatísticas Tuya
+  app.get('/admin/api/tuya/stats', requireAuth, async (req, res) => {
+    try {
+      if (!tuya) {
+        return res.status(503).json({ success: false, error: 'Módulo Tuya não disponível' });
+      }
+      
+      const devices = await tuya.getCachedDevices();
+      
+      // Agrupa por categoria
+      const byCategory = {};
+      devices.forEach(d => {
+        const cat = d.category || 'other';
+        if (!byCategory[cat]) {
+          byCategory[cat] = { total: 0, online: 0, poweredOn: 0 };
+        }
+        byCategory[cat].total++;
+        if (d.online) byCategory[cat].online++;
+        if (d.poweredOn) byCategory[cat].poweredOn++;
+      });
+      
+      // Conta eventos recentes (últimas 24h)
+      const ipBlocker = getCurrentIpBlocker();
+      let recentEvents = 0;
+      if (ipBlocker && typeof ipBlocker.countTuyaEvents === 'function') {
+        recentEvents = await ipBlocker.countTuyaEvents();
+      }
+      
+      res.json({ 
+        success: true,
+        stats: {
+          total: devices.length,
+          online: devices.filter(d => d.online).length,
+          offline: devices.filter(d => !d.online).length,
+          poweredOn: devices.filter(d => d.poweredOn).length,
+          poweredOff: devices.filter(d => !d.poweredOn).length,
+          byCategory,
+          recentEvents
+        }
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao obter estatísticas Tuya:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Leituras de energia de um dispositivo
+  app.get('/admin/api/tuya/energy/:deviceId', requireAuth, async (req, res) => {
+    try {
+      const { deviceId } = req.params;
+      const { limit = 100, offset = 0 } = req.query;
+      
+      const ipBlocker = getCurrentIpBlocker();
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.listTuyaEnergyReadings !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const readings = await ipBlocker.listTuyaEnergyReadings(deviceId, parseInt(limit), parseInt(offset));
+      
+      res.json({ success: true, data: readings });
+    } catch (error) {
+      err(`[ADMIN] Erro ao listar leituras de energia:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Estatísticas de energia por período
+  app.get('/admin/api/tuya/energy/:deviceId/stats', requireAuth, async (req, res) => {
+    try {
+      const { deviceId } = req.params;
+      const { hours = 24 } = req.query;
+      
+      const ipBlocker = getCurrentIpBlocker();
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.getTuyaEnergyStats !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const stats = await ipBlocker.getTuyaEnergyStats(deviceId, parseInt(hours));
+      
+      res.json({ success: true, data: stats });
+    } catch (error) {
+      err(`[ADMIN] Erro ao obter estatísticas de energia:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Consumo por hora (para gráfico)
+  app.get('/admin/api/tuya/energy/:deviceId/hourly', requireAuth, async (req, res) => {
+    try {
+      const { deviceId } = req.params;
+      const { hours = 24 } = req.query;
+      
+      const ipBlocker = getCurrentIpBlocker();
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.getTuyaEnergyByHour !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const hourlyData = await ipBlocker.getTuyaEnergyByHour(deviceId, parseInt(hours));
+      
+      res.json({ success: true, data: hourlyData });
+    } catch (error) {
+      err(`[ADMIN] Erro ao obter dados por hora:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Forçar coleta manual de energia
+  app.post('/admin/api/tuya/energy/collect-now', requireAuth, async (req, res) => {
+    try {
+      log(`[ADMIN] 🔍 Coleta manual de energia solicitada...`);
+      
+      // Tenta usar tuyaMonitor primeiro (se disponível)
+      const tuyaMonitor = getCurrentTuyaMonitor?.();
+      
+      if (tuyaMonitor && typeof tuyaMonitor === 'object' && typeof tuyaMonitor.collectEnergyReadings === 'function') {
+        log(`[ADMIN] ✅ Usando tuyaMonitor para coleta...`);
+        const result = await tuyaMonitor.collectEnergyReadings();
+        log(`[ADMIN] ✅ Coleta concluída: success=${result.success}, collected=${result.collected || 0}, checked=${result.checked || 0}`);
+        return res.json({ 
+          success: result.success, 
+          collected: result.collected || 0,
+          checked: result.checked || 0,
+          hasEnergyButNoData: result.hasEnergyButNoData || 0,
+          error: result.error
+        });
+      }
+      
+      // Fallback: coleta direta usando Tuya e ipBlocker
+      log(`[ADMIN] ⚠️ tuyaMonitor não disponível, usando coleta direta...`);
+      
+      if (!tuya) {
+        return res.status(503).json({ success: false, error: 'Módulo Tuya não disponível' });
+      }
+      
+      const ipBlocker = getCurrentIpBlocker();
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.saveTuyaEnergyReading !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      // Busca dispositivos
+      const devices = await tuya.getCachedDevices();
+      log(`[ADMIN] Verificando ${devices.length} dispositivo(s) para coleta de energia`);
+      
+      let collected = 0;
+      let checked = 0;
+      let hasEnergyButNoData = 0;
+      
+      for (const device of devices) {
+        try {
+          checked++;
+          const status = await tuya.getDeviceStatus(device.id);
+          if (!status || !Array.isArray(status)) continue;
+          
+          // Detecta se tem dados de energia
+          const hasEnergyData = status.some(s => {
+            const code = (s.code || '').toLowerCase();
+            return code.includes('current') || code.includes('voltage') || 
+                   code.includes('power') || code.includes('energy') ||
+                   code.includes('add_ele') || code.includes('frequency') ||
+                   code.includes('cur_power') || code.includes('cur_current') ||
+                   code.includes('cur_voltage') || code.includes('activepower') ||
+                   code.includes('active_power') || code.includes('power_factor');
+          });
+          
+          if (!hasEnergyData) continue;
+          
+          hasEnergyButNoData++;
+          log(`[ADMIN] Medidor encontrado: ${device.name} (${device.id})`);
+          
+          // Extrai valores de energia organizados por fases
+          const energyData = { phases: {} };
+          const phases = ['A', 'B', 'C'];
+          
+          // Função auxiliar para detectar fase
+          const getPhase = (code) => {
+            const upperCode = code.toUpperCase();
+            if (upperCode.includes('A') && !upperCode.includes('B') && !upperCode.includes('C')) return 'A';
+            if (upperCode.includes('B') && !upperCode.includes('C')) return 'B';
+            if (upperCode.includes('C')) return 'C';
+            return null;
+          };
+          
+          // Processa cada status
+          for (const s of status) {
+            const code = (s.code || '').toLowerCase();
+            const codeOriginal = s.code || '';
+            const value = s.value;
+            
+            if (typeof value !== 'number') continue;
+            
+            const phase = getPhase(codeOriginal);
+            
+            // Processa por tipo de dado
+            if (code.includes('voltage') || code.includes('cur_voltage') || code.includes('curvoltage')) {
+              const voltage = code.includes('cur_voltage') || code.includes('curvoltage') ? value / 10 : value;
+              if (phase) {
+                if (!energyData.phases[phase]) energyData.phases[phase] = {};
+                energyData.phases[phase].voltage = voltage;
+              } else {
+                energyData.voltage = voltage;
+              }
+            } else if ((code.includes('current') && !code.includes('active')) || code.includes('cur_current') || code.includes('curcurrent')) {
+              const current = code.includes('cur_current') || code.includes('curcurrent') ? value / 1000 : value;
+              if (phase) {
+                if (!energyData.phases[phase]) energyData.phases[phase] = {};
+                energyData.phases[phase].current = current;
+              } else {
+                energyData.current = (energyData.current || 0) + current;
+              }
+            } else if (code.includes('activepower') || code.includes('active_power') || code.includes('cur_power') || code.includes('curpower') ||
+                       (code.includes('power') && !code.includes('factor') && !code.includes('reactive'))) {
+              const power = code.includes('cur_power') || code.includes('curpower') ? value / 10 : value;
+              if (phase) {
+                if (!energyData.phases[phase]) energyData.phases[phase] = {};
+                energyData.phases[phase].power = power;
+              } else {
+                energyData.power = (energyData.power || 0) + power;
+              }
+            } else if (code.includes('reactivepower') || code.includes('reactive_power')) {
+              const reactivePower = value;
+              if (phase) {
+                if (!energyData.phases[phase]) energyData.phases[phase] = {};
+                energyData.phases[phase].reactivePower = reactivePower;
+              }
+            } else if (code.includes('energyconsumed') || code.includes('energy_consumed') || code.includes('add_ele') ||
+                       (code.includes('energy') && !code.includes('power'))) {
+              const energy = value / 1000; // Converte Wh para kWh
+              if (phase) {
+                if (!energyData.phases[phase]) energyData.phases[phase] = {};
+                energyData.phases[phase].energy = energy;
+              } else {
+                energyData.energy = (energyData.energy || 0) + energy;
+              }
+            } else if (code.includes('powerfactor') || code.includes('power_factor') || code.includes('factor')) {
+              const powerFactor = value / 100;
+              if (phase) {
+                if (!energyData.phases[phase]) energyData.phases[phase] = {};
+                energyData.phases[phase].powerFactor = powerFactor;
+              } else {
+                // Média dos fatores de potência
+                if (!energyData.powerFactor) energyData.powerFactor = 0;
+                energyData.powerFactor = (energyData.powerFactor + powerFactor) / 2;
+              }
+            } else if (code.includes('frequency')) {
+              energyData.frequency = value / 10;
+            }
+          }
+          
+          // Remove phases vazias
+          Object.keys(energyData.phases).forEach(phase => {
+            if (Object.keys(energyData.phases[phase]).length === 0) {
+              delete energyData.phases[phase];
+            }
+          });
+          
+          // Se não há fases, remove o objeto phases
+          if (Object.keys(energyData.phases).length === 0) {
+            delete energyData.phases;
+          }
+          
+          if (Object.keys(energyData).length > 0 && (energyData.voltage || energyData.current || energyData.power || energyData.energy || energyData.phases)) {
+            await ipBlocker.saveTuyaEnergyReading(device.id, device.name, energyData);
+            collected++;
+            
+            // Log melhorado
+            if (energyData.phases) {
+              const phasesInfo = Object.keys(energyData.phases).map(p => 
+                `Fase ${p}: ${energyData.phases[p].power?.toFixed(1) || 0}W`
+              ).join(', ');
+              log(`[ADMIN] ✅ Energia coletada (múltiplas fases): ${device.name} | ${phasesInfo}`);
+            } else {
+              log(`[ADMIN] ✅ Energia coletada: ${device.name} | V=${energyData.voltage?.toFixed(1) || '-'} | A=${energyData.current?.toFixed(3) || '-'} | W=${energyData.power?.toFixed(1) || '-'}`);
+            }
+          }
+        } catch (e) {
+          err(`[ADMIN] Erro ao coletar energia de ${device.name}:`, e.message);
+        }
+      }
+      
+      log(`[ADMIN] ✅ Coleta concluída: ${collected} dispositivo(s) registrado(s) de ${hasEnergyButNoData} medidor(es) encontrado(s)`);
+      
+      res.json({ 
+        success: true, 
+        collected,
+        checked,
+        hasEnergyButNoData,
+        error: null
+      });
+    } catch (error) {
+      err(`[ADMIN] ❌ Erro ao forçar coleta de energia:`, error.message);
+      err(`[ADMIN] Stack:`, error.stack);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Lista dispositivos com leituras de energia disponíveis
+  app.get('/admin/api/tuya/energy-devices', requireAuth, async (req, res) => {
+    try {
+      const ipBlocker = getCurrentIpBlocker();
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.listTuyaEnergyReadings !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      // Busca todas as leituras recentes para identificar dispositivos com dados
+      const readings = await ipBlocker.listTuyaEnergyReadings(null, 1000, 0);
+      
+      // Agrupa por dispositivo (dos que já têm leituras)
+      const deviceMap = new Map();
+      for (const r of readings) {
+        if (!deviceMap.has(r.device_id)) {
+          deviceMap.set(r.device_id, {
+            deviceId: r.device_id,
+            deviceName: r.device_name,
+            readingsCount: 0,
+            lastReading: r.created_at,
+            latestPower: r.power_w,
+            hasReadings: true
+          });
+        }
+        deviceMap.get(r.device_id).readingsCount++;
+      }
+      
+      // Também busca dispositivos Tuya diretamente para encontrar medidores sem leituras ainda
+      if (tuya) {
+        try {
+          const allDevices = await tuya.getCachedDevices();
+          
+          for (const device of allDevices) {
+            // Se já está no map (tem leituras), pula
+            if (deviceMap.has(device.id)) continue;
+            
+            try {
+              // Verifica se o dispositivo tem códigos de energia
+              const status = await tuya.getDeviceStatus(device.id);
+              if (status && Array.isArray(status)) {
+                const hasEnergyData = status.some(s => {
+                  const code = (s.code || '').toLowerCase();
+                  return code.includes('current') || code.includes('voltage') || 
+                         code.includes('power') || code.includes('energy') ||
+                         code.includes('add_ele') || code.includes('frequency');
+                });
+                
+                if (hasEnergyData) {
+                  deviceMap.set(device.id, {
+                    deviceId: device.id,
+                    deviceName: device.name,
+                    readingsCount: 0,
+                    lastReading: null,
+                    latestPower: null,
+                    hasReadings: false
+                  });
+                }
+              }
+            } catch (e) {
+              dbg(`[ADMIN] Erro ao verificar dispositivo ${device.id}:`, e.message);
+            }
+          }
+        } catch (e) {
+          warn(`[ADMIN] Erro ao buscar dispositivos Tuya:`, e.message);
+        }
+      }
+      
+      res.json({ success: true, data: Array.from(deviceMap.values()) });
+    } catch (error) {
+      err(`[ADMIN] Erro ao listar dispositivos de energia:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // ===== ACCESS LOG ENDPOINTS =====
+  
+  // API: Listar logs de acesso
+  app.get('/admin/api/access-logs', requireAuth, async (req, res) => {
+    try {
+      const { limit = 100, offset = 0, ip, route, method } = req.query;
+      
+      const ipBlocker = getCurrentIpBlocker();
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.listAccessLogs !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const filters = {};
+      if (ip) filters.ip = ip;
+      if (route) filters.route = route;
+      if (method) filters.method = method;
+      
+      const [logs, total] = await Promise.all([
+        ipBlocker.listAccessLogs(parseInt(limit), parseInt(offset), filters),
+        ipBlocker.countAccessLogs(filters)
+      ]);
+      
+      res.json({ 
+        success: true, 
+        data: logs,
+        pagination: {
+          total,
+          limit: parseInt(limit),
+          offset: parseInt(offset)
+        }
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao listar access logs:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Estatísticas de acesso por rota
+  app.get('/admin/api/access-logs/stats/routes', requireAuth, async (req, res) => {
+    try {
+      const { limit = 20 } = req.query;
+      
+      const ipBlocker = getCurrentIpBlocker();
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.getAccessStatsByRoute !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const stats = await ipBlocker.getAccessStatsByRoute(parseInt(limit));
+      
+      res.json({ success: true, data: stats });
+    } catch (error) {
+      err(`[ADMIN] Erro ao obter stats por rota:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // API: Estatísticas de acesso por IP
+  app.get('/admin/api/access-logs/stats/ips', requireAuth, async (req, res) => {
+    try {
+      const { limit = 20 } = req.query;
+      
+      const ipBlocker = getCurrentIpBlocker();
+      await waitForDatabase(ipBlocker);
+      
+      if (!ipBlocker || typeof ipBlocker.getAccessStatsByIP !== 'function') {
+        return res.status(503).json({ success: false, error: 'IP Blocker não disponível' });
+      }
+      
+      const stats = await ipBlocker.getAccessStatsByIP(parseInt(limit));
+      
+      res.json({ success: true, data: stats });
+    } catch (error) {
+      err(`[ADMIN] Erro ao obter stats por IP:`, error.message);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // ===== ROUTES ENDPOINT =====
+  
+  // API: Listar todas as rotas disponíveis
+  app.get('/admin/api/routes', requireAuth, async (req, res) => {
+    try {
+      const routes = [];
+      
+      // Coleta rotas do Express
+      app._router.stack.forEach((middleware) => {
+        if (middleware.route) {
+          // Rotas diretas
+          const methods = Object.keys(middleware.route.methods).map(m => m.toUpperCase());
+          routes.push({
+            path: middleware.route.path,
+            methods,
+            type: 'route'
+          });
+        } else if (middleware.name === 'router') {
+          // Sub-routers
+          middleware.handle.stack.forEach((handler) => {
+            if (handler.route) {
+              const methods = Object.keys(handler.route.methods).map(m => m.toUpperCase());
+              routes.push({
+                path: handler.route.path,
+                methods,
+                type: 'router'
+              });
+            }
+          });
+        }
+      });
+      
+      // Agrupa por categoria
+      const categorized = {
+        admin: routes.filter(r => r.path.startsWith('/admin')),
+        api: routes.filter(r => !r.path.startsWith('/admin') && !r.path.startsWith('/webhook')),
+        webhook: routes.filter(r => r.path.startsWith('/webhook'))
+      };
+      
+      res.json({ 
+        success: true, 
+        total: routes.length,
+        routes,
+        categorized
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao listar rotas:`, error.message);
       res.status(500).json({ success: false, error: error.message });
     }
   });

@@ -155,6 +155,16 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
       return { isAbusive: false, abuseConfidence: 0, usageType: 'unknown', reports: 0 };
     }
     
+    // Verifica rate limit antes de fazer requisição
+    if (ipBlocker && typeof ipBlocker.canUseAbuseIPDBEndpoint === 'function') {
+      const rateLimit = await ipBlocker.canUseAbuseIPDBEndpoint('check');
+      if (!rateLimit.canUse) {
+        warn(`[ABUSEIPDB] ⚠️ Rate limit atingido para endpoint 'check' (${rateLimit.remaining}/${rateLimit.limit})`);
+        return { isAbusive: false, abuseConfidence: 0, usageType: 'unknown', reports: 0, rateLimited: true };
+      }
+      dbg(`[ABUSEIPDB] Rate limit: ${rateLimit.remaining}/${rateLimit.limit} requisições restantes`);
+    }
+    
     // Cria promise para verificação e adiciona ao lock
     const checkPromise = performAPICheck(normalizedIp, maxAgeInDays, cacheKey);
     pendingChecks.set(normalizedIp, checkPromise);
@@ -191,6 +201,13 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
         },
         timeout: 5000 // 5 segundos de timeout
       });
+      
+      // Registra uso do endpoint no rate limit
+      if (ipBlocker && typeof ipBlocker.recordAbuseIPDBUsage === 'function') {
+        ipBlocker.recordAbuseIPDBUsage('check').catch(e => {
+          dbg(`[ABUSEIPDB] Erro ao registrar uso da API:`, e.message);
+        });
+      }
       
       // Log da resposta completa para debug (apenas se houver problema)
       const data = response.data?.data || {};
@@ -298,21 +315,38 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
         isWhitelisted: isWhitelistedByAbuseIPDB,
         countryCode: data.countryCode || '',
         lastReportedAt: data.lastReportedAt || null,
-        listType
+        listType,
+        // Dados adicionais da API
+        isp: data.isp || '',
+        domain: data.domain || '',
+        isTor: data.isTor || false,
+        numDistinctUsers: data.numDistinctUsers || 0,
+        hostnames: data.hostnames || [],
+        ipVersion: data.ipVersion || 4
       };
       
       // Salva no banco de dados baseado na classificação
       // IMPORTANTE: Só adiciona à whitelist/yellowlist se a confiança for válida
       if (ipBlocker && listType) {
         try {
+          // Prepara dados extras para salvar no banco
+          const extraData = {
+            countryCode: result.countryCode,
+            isp: result.isp,
+            domain: result.domain,
+            usageType: result.usageType,
+            isTor: result.isTor,
+            numDistinctUsers: result.numDistinctUsers
+          };
+          
           if (listType === 'whitelist') {
-            await ipBlocker.addToWhitelist(normalizedIp, abuseConfidence, reports, WHITELIST_TTL_DAYS);
+            await ipBlocker.addToWhitelist(normalizedIp, abuseConfidence, reports, WHITELIST_TTL_DAYS, extraData);
             // Registra tentativa na whitelist
             if (ipBlocker.recordWhitelistAttempt) {
               await ipBlocker.recordWhitelistAttempt(normalizedIp);
             }
           } else if (listType === 'yellowlist') {
-            await ipBlocker.addToYellowlist(normalizedIp, abuseConfidence, reports, YELLOWLIST_TTL_DAYS);
+            await ipBlocker.addToYellowlist(normalizedIp, abuseConfidence, reports, YELLOWLIST_TTL_DAYS, extraData);
             // Registra tentativa na yellowlist
             if (ipBlocker.recordYellowlistAttempt) {
               await ipBlocker.recordYellowlistAttempt(normalizedIp);
