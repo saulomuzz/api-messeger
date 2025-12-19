@@ -772,12 +772,23 @@ function initRoutesModule({
     try {
       // Lê números primeiro (mais rápido que baixar snapshot)
       const numbers = readNumbersFromFile(numbersFile);
+      log(`[SNAPSHOT][${rid}] Arquivo: ${numbersFile} (existe: ${fs.existsSync(numbersFile)})`);
+      log(`[SNAPSHOT][${rid}] Números lidos do arquivo: ${numbers.length} número(s)`);
+      if (numbers.length > 0) {
+        dbg(`[SNAPSHOT][${rid}] Números encontrados: ${numbers.join(', ')}`);
+      } else {
+        warn(`[SNAPSHOT][${rid}] ⚠️ Nenhum número encontrado no arquivo ${numbersFile}`);
+        if (fs.existsSync(numbersFile)) {
+          const fileContent = fs.readFileSync(numbersFile, 'utf8');
+          warn(`[SNAPSHOT][${rid}] Conteúdo do arquivo (primeiras 500 chars): ${fileContent.substring(0, 500)}`);
+        }
+      }
       if (numbers.length === 0) {
         warn(`[SNAPSHOT][${rid}] Nenhum número encontrado no arquivo`);
         return res.status(400).json({ ok: false, error: 'no numbers found in file', requestId: rid });
       }
       
-      // Inicia download do snapshot e resolução de números em paralelo para otimizar tempo
+      // Baixa snapshot e resolve números em paralelo (template precisa da imagem no header)
       log(`[SNAPSHOT][${rid}] Baixando snapshot e resolvendo ${numbers.length} número(s) em paralelo...`);
       const [snapshotResult, ...numberResolutions] = await Promise.all([
         camera.downloadSnapshot(cameraSnapshotUrl),
@@ -796,7 +807,6 @@ function initRoutesModule({
       ]);
       
       const { base64, mimeType } = snapshotResult;
-      const message = req.body?.message || '📸 Snapshot da câmera';
       
       const validNumbers = numberResolutions.filter(n => n.numberId !== null);
       const invalidNumbers = numberResolutions.filter(n => n.numberId === null);
@@ -823,19 +833,25 @@ function initRoutesModule({
       
       log(`[SNAPSHOT][${rid}] ${validNumbers.length} número(s) válido(s), ${invalidNumbers.length} inválido(s)`);
       
-      // Para API oficial: faz upload uma vez e reutiliza media ID (mais rápido)
-      let mediaId = null;
+      // Faz upload da imagem para usar no header do template
+      let headerMediaId = null;
       if (whatsapp && whatsapp.uploadMedia) {
         try {
-          log(`[SNAPSHOT][${rid}] Fazendo upload de mídia uma vez para reutilizar...`);
-          mediaId = await whatsapp.uploadMedia(base64, mimeType);
-          log(`[SNAPSHOT][${rid}] Upload concluído, media ID: ${mediaId}`);
+          log(`[SNAPSHOT][${rid}] Fazendo upload de imagem para header do template...`);
+          headerMediaId = await whatsapp.uploadMedia(base64, mimeType);
+          log(`[SNAPSHOT][${rid}] Upload concluído, media ID: ${headerMediaId}`);
         } catch (uploadError) {
-          warn(`[SNAPSHOT][${rid}] Erro no upload, usando método direto:`, uploadError.message);
+          warn(`[SNAPSHOT][${rid}] Erro no upload da imagem:`, uploadError.message);
+          return res.status(500).json({ 
+            ok: false, 
+            error: 'failed_to_upload_image', 
+            message: 'Erro ao fazer upload da imagem para o template',
+            requestId: rid 
+          });
         }
       }
       
-      // Grava vídeo em background (não bloqueia o envio da foto)
+      // Grava vídeo em background (não bloqueia o envio do template)
       let videoIdPromise = Promise.resolve(null);
       if (ENABLE_VIDEO_RECORDING && camera && camera.buildRTSPUrl && camera.recordRTSPVideo) {
         const rtspUrl = camera.buildRTSPUrl();
@@ -925,24 +941,42 @@ function initRoutesModule({
         log(`[SNAPSHOT][${rid}] Gravação de vídeo desabilitada (ENABLE_VIDEO_RECORDING=false)`);
       }
       
-      // Envia para todos os números em paralelo para máxima velocidade
+      // Envia template "alerta_campainha" para todos os números em paralelo
       const sendPromises = validNumbers.map(async ({ normalized, numberId, rawPhone }) => {
         try {
           const to = numberId._serialized;
           let r;
           
-          // Usa API Oficial do WhatsApp
-          if (whatsapp.sendMediaById && mediaId) {
-            // Usa media ID (mais rápido, upload já feito)
-            r = await whatsapp.sendMediaById(to, mediaId, 'image', message);
-          } else if (whatsapp.sendMediaFromBase64) {
-            // Fallback: usa base64 diretamente
-            r = await whatsapp.sendMediaFromBase64(to, base64, mimeType, message);
+          // Usa template "alerta_campainha" com imagem no header
+          if (whatsapp.sendTemplateMessage) {
+            const components = [
+              {
+                type: 'header',
+                parameters: [
+                  {
+                    type: 'image',
+                    image: {
+                      id: headerMediaId
+                    }
+                  }
+                ]
+              },
+              {
+                type: 'body',
+                parameters: [
+                  {
+                    type: 'text',
+                    text: 'tocando'
+                  }
+                ]
+              }
+            ];
+            r = await whatsapp.sendTemplateMessage(to, 'alerta_campainha', 'pt_BR', components);
           } else {
-            throw new Error('API WhatsApp não configurada para envio de mídia');
+            throw new Error('API WhatsApp não configurada para envio de templates');
           }
           
-          log(`[SNAPSHOT OK][${rid}] Enviado para ${to} | id=${r.id?._serialized || r.messages?.[0]?.id || 'n/a'}`);
+          log(`[SNAPSHOT OK][${rid}] Template enviado para ${to} | id=${r.id?._serialized || r.messages?.[0]?.id || 'n/a'}`);
           
           // Envia mensagem perguntando se quer ver o vídeo (aguarda gravação terminar em background)
           // Não bloqueia o retorno da requisição

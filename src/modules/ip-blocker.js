@@ -484,7 +484,27 @@ function initIPBlockerModule({ appRoot, logger }) {
                               if (error) {
                                 warn(`[IP-BLOCKER] Erro ao criar tabela abuseipdb_rate_limit:`, error.message);
                               }
-                              resolve();
+                              
+                              // Cria tabela de opt-in/opt-out do WhatsApp
+                              db.run(`
+                                CREATE TABLE IF NOT EXISTS whatsapp_opt_in (
+                                  phone TEXT PRIMARY KEY,
+                                  opted_in INTEGER NOT NULL DEFAULT 1,
+                                  opted_in_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                                  opted_out_at INTEGER,
+                                  last_message_at INTEGER,
+                                  updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                                )
+                              `, (error) => {
+                                if (error) {
+                                  warn(`[IP-BLOCKER] Erro ao criar tabela whatsapp_opt_in:`, error.message);
+                                }
+                                
+                                db.run(`CREATE INDEX IF NOT EXISTS idx_whatsapp_opt_in_phone ON whatsapp_opt_in(phone)`, () => {});
+                                db.run(`CREATE INDEX IF NOT EXISTS idx_whatsapp_opt_in_status ON whatsapp_opt_in(opted_in)`, () => {});
+                                
+                                resolve();
+                              });
                             });
                           });
                         });
@@ -3370,6 +3390,236 @@ function initIPBlockerModule({ appRoot, logger }) {
     log(`[IP-BLOCKER] Todos os caches em memória foram limpos`);
   }
   
+  /**
+   * Adiciona ou atualiza opt-in de um número de telefone
+   * @param {string} phone - Número de telefone (formato: 5511999999999)
+   * @returns {Promise<{success: boolean, optedIn: boolean, message: string}>}
+   */
+  function addOptIn(phone) {
+    return new Promise((resolve) => {
+      if (!db) {
+        resolve({ success: false, optedIn: false, message: 'Banco de dados não disponível' });
+        return;
+      }
+      
+      const normalizedPhone = phone.replace(/[^0-9]/g, '');
+      if (!normalizedPhone || normalizedPhone.length < 10) {
+        resolve({ success: false, optedIn: false, message: 'Número de telefone inválido' });
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      
+      db.run(`
+        INSERT INTO whatsapp_opt_in (phone, opted_in, opted_in_at, updated_at, last_message_at)
+        VALUES (?, 1, ?, ?, ?)
+        ON CONFLICT(phone) DO UPDATE SET
+          opted_in = 1,
+          opted_in_at = ?,
+          opted_out_at = NULL,
+          updated_at = ?,
+          last_message_at = COALESCE(?, last_message_at)
+      `, [normalizedPhone, now, now, now, now, now, now], (error) => {
+        if (error) {
+          err(`[OPT-IN] Erro ao adicionar opt-in para ${normalizedPhone}:`, error.message);
+          resolve({ success: false, optedIn: false, message: 'Erro ao processar opt-in' });
+          return;
+        }
+        
+        log(`[OPT-IN] ✅ Opt-in adicionado/atualizado para ${normalizedPhone}`);
+        resolve({ success: true, optedIn: true, message: 'Opt-in registrado com sucesso' });
+      });
+    });
+  }
+  
+  /**
+   * Remove opt-in de um número de telefone (opt-out)
+   * @param {string} phone - Número de telefone (formato: 5511999999999)
+   * @returns {Promise<{success: boolean, optedIn: boolean, message: string}>}
+   */
+  function removeOptIn(phone) {
+    return new Promise((resolve) => {
+      if (!db) {
+        resolve({ success: false, optedIn: true, message: 'Banco de dados não disponível' });
+        return;
+      }
+      
+      const normalizedPhone = phone.replace(/[^0-9]/g, '');
+      if (!normalizedPhone || normalizedPhone.length < 10) {
+        resolve({ success: false, optedIn: true, message: 'Número de telefone inválido' });
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      
+      db.run(`
+        INSERT INTO whatsapp_opt_in (phone, opted_in, opted_out_at, updated_at)
+        VALUES (?, 0, ?, ?)
+        ON CONFLICT(phone) DO UPDATE SET
+          opted_in = 0,
+          opted_out_at = ?,
+          updated_at = ?
+      `, [normalizedPhone, now, now, now, now], (error) => {
+        if (error) {
+          err(`[OPT-IN] Erro ao remover opt-in para ${normalizedPhone}:`, error.message);
+          resolve({ success: false, optedIn: true, message: 'Erro ao processar opt-out' });
+          return;
+        }
+        
+        log(`[OPT-IN] ❌ Opt-out registrado para ${normalizedPhone}`);
+        resolve({ success: true, optedIn: false, message: 'Opt-out registrado com sucesso' });
+      });
+    });
+  }
+  
+  /**
+   * Verifica se um número tem opt-in ativo
+   * @param {string} phone - Número de telefone (formato: 5511999999999)
+   * @returns {Promise<{optedIn: boolean, optedInAt: number|null, optedOutAt: number|null}>}
+   */
+  function hasOptIn(phone) {
+    return new Promise((resolve) => {
+      if (!db) {
+        // Por padrão, assume opt-in se banco não disponível (comportamento seguro)
+        resolve({ optedIn: true, optedInAt: null, optedOutAt: null });
+        return;
+      }
+      
+      const normalizedPhone = phone.replace(/[^0-9]/g, '');
+      if (!normalizedPhone || normalizedPhone.length < 10) {
+        resolve({ optedIn: false, optedInAt: null, optedOutAt: null });
+        return;
+      }
+      
+      db.get(`
+        SELECT opted_in, opted_in_at, opted_out_at
+        FROM whatsapp_opt_in
+        WHERE phone = ?
+      `, [normalizedPhone], (error, row) => {
+        if (error) {
+          err(`[OPT-IN] Erro ao verificar opt-in para ${normalizedPhone}:`, error.message);
+          // Em caso de erro, assume opt-in (comportamento seguro)
+          resolve({ optedIn: true, optedInAt: null, optedOutAt: null });
+          return;
+        }
+        
+        if (!row) {
+          // Se não existe registro, assume opt-in (comportamento padrão)
+          resolve({ optedIn: true, optedInAt: null, optedOutAt: null });
+          return;
+        }
+        
+        resolve({
+          optedIn: row.opted_in === 1,
+          optedInAt: row.opted_in_at || null,
+          optedOutAt: row.opted_out_at || null
+        });
+      });
+    });
+  }
+  
+  /**
+   * Atualiza timestamp da última mensagem recebida (auto opt-in)
+   * @param {string} phone - Número de telefone
+   * @returns {Promise<void>}
+   */
+  function updateLastMessageTime(phone) {
+    return new Promise((resolve) => {
+      if (!db) {
+        resolve();
+        return;
+      }
+      
+      const normalizedPhone = phone.replace(/[^0-9]/g, '');
+      if (!normalizedPhone || normalizedPhone.length < 10) {
+        resolve();
+        return;
+      }
+      
+      const now = Math.floor(Date.now() / 1000);
+      
+      // Se não existe registro, cria com opt-in ativo
+      // Se existe, atualiza last_message_at e mantém opt_in se já estiver ativo
+      db.run(`
+        INSERT INTO whatsapp_opt_in (phone, opted_in, opted_in_at, updated_at, last_message_at)
+        VALUES (?, 1, ?, ?, ?)
+        ON CONFLICT(phone) DO UPDATE SET
+          last_message_at = ?,
+          updated_at = ?
+      `, [normalizedPhone, now, now, now, now, now], (error) => {
+        if (error) {
+          dbg(`[OPT-IN] Erro ao atualizar last_message_at para ${normalizedPhone}:`, error.message);
+        }
+        resolve();
+      });
+    });
+  }
+  
+  /**
+   * Lista todos os opt-ins/opt-outs
+   * @param {boolean} optedInOnly - Se true, retorna apenas opt-ins ativos
+   * @param {number} limit - Limite de resultados
+   * @param {number} offset - Offset para paginação
+   * @returns {Promise<Array>}
+   */
+  function listOptIns(optedInOnly = false, limit = 100, offset = 0) {
+    return new Promise((resolve) => {
+      if (!db) {
+        resolve([]);
+        return;
+      }
+      
+      const sql = optedInOnly
+        ? `SELECT phone, opted_in, opted_in_at, opted_out_at, last_message_at, updated_at
+           FROM whatsapp_opt_in
+           WHERE opted_in = 1
+           ORDER BY updated_at DESC
+           LIMIT ? OFFSET ?`
+        : `SELECT phone, opted_in, opted_in_at, opted_out_at, last_message_at, updated_at
+           FROM whatsapp_opt_in
+           ORDER BY updated_at DESC
+           LIMIT ? OFFSET ?`;
+      
+      db.all(sql, [limit, offset], (error, rows) => {
+        if (error) {
+          err(`[OPT-IN] Erro ao listar opt-ins:`, error.message);
+          resolve([]);
+          return;
+        }
+        
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  /**
+   * Conta total de opt-ins/opt-outs
+   * @param {boolean} optedInOnly - Se true, conta apenas opt-ins ativos
+   * @returns {Promise<number>}
+   */
+  function countOptIns(optedInOnly = false) {
+    return new Promise((resolve) => {
+      if (!db) {
+        resolve(0);
+        return;
+      }
+      
+      const sql = optedInOnly
+        ? `SELECT COUNT(*) as count FROM whatsapp_opt_in WHERE opted_in = 1`
+        : `SELECT COUNT(*) as count FROM whatsapp_opt_in`;
+      
+      db.get(sql, [], (error, row) => {
+        if (error) {
+          err(`[OPT-IN] Erro ao contar opt-ins:`, error.message);
+          resolve(0);
+          return;
+        }
+        
+        resolve(row ? row.count : 0);
+      });
+    });
+  }
+  
   // Cria o objeto API (será retornado após inicialização)
   const createModuleAPI = () => {
     return {
@@ -3424,6 +3674,13 @@ function initIPBlockerModule({ appRoot, logger }) {
       listTuyaEnergyReadings,
       getTuyaEnergyStats,
       getTuyaEnergyByHour,
+      // WhatsApp Opt-In/Opt-Out
+      addOptIn,
+      removeOptIn,
+      hasOptIn,
+      updateLastMessageTime,
+      listOptIns,
+      countOptIns,
       close,
       // Cache
       getCacheStats,
