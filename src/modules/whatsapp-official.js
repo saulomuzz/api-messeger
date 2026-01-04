@@ -504,6 +504,30 @@ function initWhatsAppOfficialModule({
       const normalized = normalizeBR(to);
       const toNumber = normalized.replace(/^\+/, '');
       
+      // Lista de templates MARKETING que requerem opt-in
+      const marketingTemplates = ['alerta_campainha'];
+      
+      // Verifica opt-in para templates MARKETING
+      if (marketingTemplates.includes(templateName)) {
+        if (ipBlocker && ipBlocker.hasOptIn) {
+          try {
+            const optInStatus = await ipBlocker.hasOptIn(toNumber);
+            if (!optInStatus.optedIn) {
+              warn(`[WHATSAPP-API] ⚠️ Template MARKETING "${templateName}" não enviado para ${toNumber}: opt-out ativo`);
+              throw new Error(`Usuário ${toNumber} não tem opt-in ativo para receber mensagens MARKETING`);
+            }
+            dbg(`[WHATSAPP-API] ✅ Opt-in verificado para ${toNumber}: ativo`);
+          } catch (optInError) {
+            // Se houver erro ao verificar opt-in, loga mas continua (comportamento seguro)
+            warn(`[WHATSAPP-API] ⚠️ Erro ao verificar opt-in para ${toNumber}:`, optInError.message);
+            // Se o erro for explicitamente de opt-out, não envia
+            if (optInError.message && optInError.message.includes('opt-out')) {
+              throw optInError;
+            }
+          }
+        }
+      }
+      
       log(`[WHATSAPP-API] Enviando template "${templateName}" para ${toNumber}...`);
       
       const payload = {
@@ -694,6 +718,57 @@ function initWhatsAppOfficialModule({
   async function processWebhookMessage(entry) {
     try {
       for (const change of entry.changes || []) {
+        // Processa status de entrega de mensagens
+        if (change.value?.statuses) {
+          for (const status of change.value.statuses) {
+            const messageId = status.id;
+            const recipientId = status.recipient_id;
+            const statusType = status.status; // sent, delivered, read, failed
+            const timestamp = status.timestamp;
+            
+            log(`[WHATSAPP-API] Status de entrega: ${statusType} para ${recipientId} (msgId: ${messageId})`);
+            
+            if (statusType === 'sent') {
+              dbg(`[WHATSAPP-API] ✅ Mensagem ${messageId} enviada para ${recipientId}`);
+            } else if (statusType === 'delivered') {
+              log(`[WHATSAPP-API] ✅ Mensagem ${messageId} entregue para ${recipientId}`);
+            } else if (statusType === 'read') {
+              log(`[WHATSAPP-API] ✅ Mensagem ${messageId} lida por ${recipientId}`);
+            } else if (statusType === 'failed') {
+              const error = status.errors?.[0];
+              const errorCode = error?.code;
+              const errorMessage = error?.message;
+              const errorDetails = error?.error_data;
+              
+              err(`[WHATSAPP-API] ❌ Mensagem ${messageId} falhou para ${recipientId}`);
+              err(`[WHATSAPP-API] Código: ${errorCode}, Mensagem: ${errorMessage}`);
+              
+              if (errorDetails) {
+                err(`[WHATSAPP-API] Detalhes:`, JSON.stringify(errorDetails, null, 2));
+              }
+              
+              // Tratamento específico para erros comuns
+              if (errorCode === 131047) {
+                warn(`[WHATSAPP-API] ⚠️ Número ${recipientId} inválido ou não está no WhatsApp`);
+              } else if (errorCode === 131026) {
+                warn(`[WHATSAPP-API] ⚠️ Número ${recipientId} bloqueou ou não tem opt-in para MARKETING`);
+                // Se for erro de opt-in, registra opt-out automaticamente
+                if (ipBlocker && ipBlocker.removeOptIn) {
+                  try {
+                    await ipBlocker.removeOptIn(recipientId);
+                    log(`[WHATSAPP-API] Opt-out registrado automaticamente para ${recipientId} devido a erro 131026`);
+                  } catch (e) {
+                    dbg(`[WHATSAPP-API] Erro ao registrar opt-out automático:`, e.message);
+                  }
+                }
+              } else if (errorCode === 132012) {
+                warn(`[WHATSAPP-API] ⚠️ Erro de formato do template para ${recipientId}`);
+              }
+            }
+          }
+          continue; // Pula processamento de mensagens se for apenas status
+        }
+        
         if (change.value?.messages) {
           for (const message of change.value.messages) {
             const from = message.from;
@@ -1494,6 +1569,16 @@ function initWhatsAppOfficialModule({
       return;
     }
     
+    // Auto opt-in: quando usuário envia mensagem, registra opt-in automaticamente
+    if (ipBlocker && ipBlocker.updateLastMessageTime) {
+      try {
+        await ipBlocker.updateLastMessageTime(from);
+        dbg(`[OPT-IN] Auto opt-in registrado para ${from}`);
+      } catch (e) {
+        dbg(`[OPT-IN] Erro ao registrar auto opt-in:`, e.message);
+      }
+    }
+    
     const msgLower = text.toLowerCase().trim();
     const msgBody = text.trim();
     
@@ -1505,6 +1590,86 @@ function initWhatsAppOfficialModule({
         await sendMainMenu(from);
       } catch (e) {
         err(`[WHATSAPP-API] Falha ao enviar menu após saudação:`, e.message);
+      }
+      return;
+    }
+    
+    // Processa resposta "Ver Gravação" do template alerta_campainha
+    if (msgLower === 'ver gravação' || msgLower === 'ver gravacao' || msgLower === 'ver gravaçao' || msgLower === 'vergravação' || msgLower === 'vergravacao') {
+      log(`[WHATSAPP-API] Resposta "Ver Gravação" recebida de ${from}`);
+      try {
+        // Busca o vídeo mais recente para este número
+        if (!listVideosFunction) {
+          await sendTextMessage(from, '❌ Sistema de vídeos não disponível.');
+          return;
+        }
+        
+        const videos = listVideosFunction(from);
+        if (videos.length === 0) {
+          await sendTextMessage(from, '❌ Nenhum vídeo disponível no momento.');
+          return;
+        }
+        
+        // Pega o vídeo mais recente
+        const latestVideo = videos[0];
+        const videoId = latestVideo.videoId;
+        
+        log(`[WHATSAPP-API] Enviando vídeo mais recente ${videoId} para ${from}`);
+        
+        if (!tempVideoProcessor) {
+          await sendTextMessage(from, '❌ Sistema de vídeos temporários não disponível.');
+          return;
+        }
+        
+        const result = tempVideoProcessor(videoId, from);
+        
+        if (!result.success) {
+          await sendTextMessage(from, `❌ ${result.error || 'Erro ao processar vídeo'}`);
+          return;
+        }
+        
+        if (!fs.existsSync(result.filePath)) {
+          await sendTextMessage(from, '❌ Arquivo de vídeo não encontrado.');
+          return;
+        }
+        
+        // Divide vídeo em partes se necessário
+        let videoParts;
+        if (camera && camera.splitVideoIfNeeded) {
+          videoParts = await camera.splitVideoIfNeeded(result.filePath);
+          log(`[WHATSAPP-API] Vídeo dividido em ${videoParts.length} parte(s)`);
+        } else {
+          warn(`[WHATSAPP-API] Função splitVideoIfNeeded não disponível, usando arquivo original`);
+          videoParts = [result.filePath];
+        }
+        
+        // Envia cada parte
+        for (let i = 0; i < videoParts.length; i++) {
+          const partFile = videoParts[i];
+          const partBuffer = fs.readFileSync(partFile);
+          const partSizeMB = partBuffer.length / 1024 / 1024;
+          
+          const partNumber = videoParts.length > 1 ? ` (Parte ${i + 1}/${videoParts.length})` : '';
+          const caption = `🎥 Vídeo da campainha${partNumber}`;
+          
+          try {
+            await sendTextMessage(from, `⏳ Enviando vídeo${partNumber}...`);
+            const videoBase64 = partBuffer.toString('base64');
+            await sendMediaFromBase64(from, videoBase64, 'video/mp4', caption);
+            log(`[WHATSAPP-API] Parte ${i + 1}/${videoParts.length} do vídeo ${videoId} enviada para ${from}`);
+            
+            // Aguarda entre envios
+            if (i < videoParts.length - 1) {
+              await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+          } catch (sendError) {
+            err(`[WHATSAPP-API] Erro ao enviar parte ${i + 1}/${videoParts.length}:`, sendError.message);
+            await sendTextMessage(from, `❌ Erro ao enviar parte ${i + 1}/${videoParts.length}: ${sendError.message}`);
+          }
+        }
+      } catch (e) {
+        err(`[WHATSAPP-API] Erro ao processar "Ver Gravação":`, e.message);
+        await sendTextMessage(from, `❌ Erro ao processar vídeo: ${e.message}`);
       }
       return;
     }
@@ -1539,6 +1704,83 @@ function initWhatsAppOfficialModule({
         await sendTextMessage(from, 'pong');
       } catch (e) {
         err(`[WHATSAPP-API] Falha ao responder 'pong':`, e.message);
+      }
+      return;
+    }
+    
+    // Comando !optin - Ativa opt-in para receber mensagens MARKETING
+    if (msgLower === '!optin' || msgLower === 'optin' || msgLower === 'ativar notificações' || msgLower === 'ativar notificacoes') {
+      log(`[WHATSAPP-API] Comando !optin recebido de ${from}`);
+      try {
+        if (!ipBlocker || !ipBlocker.addOptIn) {
+          await sendTextMessage(from, '❌ Sistema de opt-in não disponível.');
+          return;
+        }
+        
+        const result = await ipBlocker.addOptIn(from);
+        if (result.success) {
+          await sendTextMessage(from, '✅ *Opt-in ativado!*\n\nVocê agora receberá notificações de campainha e outras mensagens promocionais.\n\nPara desativar, envie: !optout');
+        } else {
+          await sendTextMessage(from, `❌ Erro ao ativar opt-in: ${result.message}`);
+        }
+      } catch (e) {
+        err(`[WHATSAPP-API] Falha ao processar !optin:`, e.message);
+        await sendTextMessage(from, `❌ Erro: ${e.message}`);
+      }
+      return;
+    }
+    
+    // Comando !optout - Desativa opt-in (opt-out)
+    if (msgLower === '!optout' || msgLower === 'optout' || msgLower === 'desativar notificações' || msgLower === 'desativar notificacoes') {
+      log(`[WHATSAPP-API] Comando !optout recebido de ${from}`);
+      try {
+        if (!ipBlocker || !ipBlocker.removeOptIn) {
+          await sendTextMessage(from, '❌ Sistema de opt-out não disponível.');
+          return;
+        }
+        
+        const result = await ipBlocker.removeOptIn(from);
+        if (result.success) {
+          await sendTextMessage(from, '❌ *Opt-out ativado!*\n\nVocê não receberá mais notificações de campainha e mensagens promocionais.\n\nPara reativar, envie: !optin');
+        } else {
+          await sendTextMessage(from, `❌ Erro ao processar opt-out: ${result.message}`);
+        }
+      } catch (e) {
+        err(`[WHATSAPP-API] Falha ao processar !optout:`, e.message);
+        await sendTextMessage(from, `❌ Erro: ${e.message}`);
+      }
+      return;
+    }
+    
+    // Comando !optstatus - Verifica status de opt-in
+    if (msgLower === '!optstatus' || msgLower === 'optstatus' || msgLower === 'status notificações' || msgLower === 'status notificacoes') {
+      log(`[WHATSAPP-API] Comando !optstatus recebido de ${from}`);
+      try {
+        if (!ipBlocker || !ipBlocker.hasOptIn) {
+          await sendTextMessage(from, '❌ Sistema de opt-in não disponível.');
+          return;
+        }
+        
+        const status = await ipBlocker.hasOptIn(from);
+        const statusText = status.optedIn ? '✅ *ATIVO*' : '❌ *INATIVO*';
+        const optedInDate = status.optedInAt ? new Date(status.optedInAt * 1000).toLocaleString('pt-BR') : 'N/A';
+        const optedOutDate = status.optedOutAt ? new Date(status.optedOutAt * 1000).toLocaleString('pt-BR') : 'N/A';
+        
+        let message = `📊 *Status de Notificações*\n\n`;
+        message += `Status: ${statusText}\n`;
+        if (status.optedIn) {
+          message += `Ativado em: ${optedInDate}\n`;
+        } else {
+          message += `Desativado em: ${optedOutDate}\n`;
+        }
+        message += `\nPara alterar, envie:\n`;
+        message += `• !optin - Ativar notificações\n`;
+        message += `• !optout - Desativar notificações`;
+        
+        await sendTextMessage(from, message);
+      } catch (e) {
+        err(`[WHATSAPP-API] Falha ao processar !optstatus:`, e.message);
+        await sendTextMessage(from, `❌ Erro: ${e.message}`);
       }
       return;
     }

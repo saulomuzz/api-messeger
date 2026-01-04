@@ -1443,16 +1443,19 @@ async function triggerSnapshotForWS(message, clientIp) {
       return { ok: false, error: 'camera not configured' };
     }
     
-    const { base64, mimeType } = await camera.downloadSnapshot(CAMERA_SNAPSHOT_URL);
     const numbers = readNumbersFromFile(NUMBERS_FILE);
-    
+    log(`[WS-ESP32] Números lidos do arquivo ${NUMBERS_FILE}: ${numbers.length} número(s)`);
+    if (numbers.length > 0) {
+      dbg(`[WS-ESP32] Números encontrados: ${numbers.join(', ')}`);
+    }
     if (numbers.length === 0) {
       return { ok: false, error: 'no numbers found' };
     }
     
-    // Resolve números do WhatsApp
-    const numberResolutions = await Promise.all(
-      numbers.map(async (rawPhone) => {
+    // Baixa snapshot e resolve números em paralelo (template precisa da imagem no header)
+    const [snapshotResult, ...numberResolutions] = await Promise.all([
+      camera.downloadSnapshot(CAMERA_SNAPSHOT_URL),
+      ...numbers.map(async (rawPhone) => {
         try {
           const normalized = normalizeBR(rawPhone);
           if (whatsapp.resolveWhatsAppNumber) {
@@ -1464,23 +1467,60 @@ async function triggerSnapshotForWS(message, clientIp) {
           return { normalized: rawPhone, numberId: null, success: false };
         }
       })
-    );
+    ]);
     
+    const { base64, mimeType } = snapshotResult;
     const validNumbers = numberResolutions.filter(n => n.success && n.numberId);
     
     if (validNumbers.length === 0) {
       return { ok: false, error: 'no valid numbers' };
     }
     
-    // Envia snapshot para todos os números válidos
+    // Faz upload da imagem para usar no header do template
+    let headerMediaId = null;
+    if (whatsapp && whatsapp.uploadMedia) {
+      try {
+        log(`[WS-ESP32] Fazendo upload de imagem para header do template...`);
+        headerMediaId = await whatsapp.uploadMedia(base64, mimeType);
+        log(`[WS-ESP32] Upload concluído, media ID: ${headerMediaId}`);
+      } catch (uploadError) {
+        warn(`[WS-ESP32] Erro no upload da imagem:`, uploadError.message);
+        return { ok: false, error: 'failed_to_upload_image', message: uploadError.message };
+      }
+    }
+    
+    // Envia template "alerta_campainha" para todos os números válidos
     const sendPromises = validNumbers.map(async ({ normalized, numberId }) => {
       try {
         // Para API oficial, usa o número normalizado diretamente
         const to = numberId?._serialized || normalized.replace(/^\+/, '') || normalized;
-        if (whatsapp.sendMediaFromBase64) {
-          await whatsapp.sendMediaFromBase64(to, base64, mimeType, message || '📸 Snapshot da câmera');
+        if (whatsapp.sendTemplateMessage) {
+          // Template "alerta_campainha" com imagem no header e parâmetro "tocando" no body
+          const components = [
+            {
+              type: 'header',
+              parameters: [
+                {
+                  type: 'image',
+                  image: {
+                    id: headerMediaId
+                  }
+                }
+              ]
+            },
+            {
+              type: 'body',
+              parameters: [
+                {
+                  type: 'text',
+                  text: 'tocando'
+                }
+              ]
+            }
+          ];
+          await whatsapp.sendTemplateMessage(to, 'alerta_campainha', 'pt_BR', components);
         } else {
-          return { success: false, error: 'send method not available' };
+          return { success: false, error: 'sendTemplateMessage not available' };
         }
         return { success: true, phone: normalized };
       } catch (e) {
