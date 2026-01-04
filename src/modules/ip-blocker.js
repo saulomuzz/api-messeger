@@ -610,6 +610,14 @@ function initIPBlockerModule({ appRoot, logger }) {
       }
       
       try {
+        // NÃO bloqueia IPs privados
+        const { isLocalIP } = require('./ip-utils');
+        if (isLocalIP(ip)) {
+          warn(`[IP-BLOCKER] Tentativa de bloquear IP privado ${ip} ignorada (motivo: ${reason})`);
+          resolve(false); // Retorna false mas não rejeita (comportamento normal)
+          return;
+        }
+        
         // Remove de outras listas primeiro (evita duplicidade)
         await removeFromOtherLists(ip, 'blacklist');
         

@@ -109,6 +109,9 @@ function loadTabData(tabName) {
     case 'migrations': loadMigrations(); break;
     case 'server': loadServerMetrics(); loadAbuseIPDBStats(); loadTrustedDevices(); break;
     case 'send': break; // Formulário manual, não carrega nada
+    case 'comedor': 
+      if (typeof loadComedorTab === 'function') loadComedorTab(); 
+      break;
   }
 }
 

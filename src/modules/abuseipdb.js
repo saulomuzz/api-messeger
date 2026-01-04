@@ -441,6 +441,13 @@ function initAbuseIPDBModule({ apiKey, logger, ipBlocker }) {
       return { blocked: false, reason: 'IP inválido ou localhost' };
     }
     
+    // Não verifica/bloqueia IPs privados
+    const { isLocalIP } = require('./ip-utils');
+    if (isLocalIP(normalizedIp)) {
+      dbg(`[ABUSEIPDB] IP privado ${normalizedIp} ignorado (não será verificado/bloqueado)`);
+      return { blocked: false, reason: 'IP privado - não verificado', abuseConfidence: 0 };
+    }
+    
     // Verifica se já está bloqueado
     if (ipBlocker && ipBlocker.isBlocked) {
       const alreadyBlocked = await ipBlocker.isBlocked(normalizedIp);

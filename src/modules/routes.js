@@ -50,10 +50,43 @@ function initRoutesModule({
   enableVideoRecording = true,
   videoRecordDurationSec = 15,
   minVideoRecordIntervalMs = 60000,
-  strictRateLimit
+  strictRateLimit,
+  comedorMessageTemplate,
+  comedorApiToken
 }) {
   const { log, dbg, warn, err, nowISO } = logger;
   const { requestId, normalizeBR, readNumbersFromFile, getClientIp, isNumberAuthorized } = utils;
+  
+  // Inicializar módulo Comedor Monitor
+  let comedorMonitor = null;
+  try {
+    const { initComedorMonitorModule } = require('./comedor-monitor');
+    comedorMonitor = initComedorMonitorModule({
+      whatsapp,
+      logger,
+      readNumbersFromFile,
+      normalizeBR,
+      numbersFile,
+      messageTemplate: comedorMessageTemplate
+    });
+    log(`[ROUTES] Módulo Comedor Monitor inicializado`);
+  } catch (comedorError) {
+    warn(`[ROUTES] Erro ao inicializar módulo Comedor Monitor:`, comedorError.message);
+  }
+  
+  // Inicializar módulo Comedor Device Status
+  let comedorDeviceStatus = null;
+  try {
+    const { initComedorDeviceStatusModule } = require('./comedor-device-status');
+    const dataDir = path.join(recordingsDir || path.join(__dirname, '..', '..', 'recordings'), '..', 'data');
+    comedorDeviceStatus = initComedorDeviceStatusModule({
+      logger,
+      dataDir
+    });
+    log(`[ROUTES] Módulo Comedor Device Status inicializado`);
+  } catch (deviceStatusError) {
+    warn(`[ROUTES] Erro ao inicializar módulo Comedor Device Status:`, deviceStatusError.message);
+  }
   
   // Sistema de bloqueio para evitar múltiplas gravações simultâneas
   let isRecordingVideo = false;
@@ -125,6 +158,25 @@ function initRoutesModule({
     }
   }
   
+  // Limpeza em background com intervalo fixo (otimização: não bloqueia requisições)
+  const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // A cada 1 hora
+  let lastCleanupTime = 0;
+  
+  function runCleanupIfNeeded() {
+    const now = Date.now();
+    if (now - lastCleanupTime >= CLEANUP_INTERVAL_MS) {
+      lastCleanupTime = now;
+      // Executa em background (não bloqueia)
+      setImmediate(() => {
+        try {
+          cleanupExpiredVideos();
+        } catch (e) {
+          warn(`[TEMP-VIDEOS] Erro na limpeza em background:`, e.message);
+        }
+      });
+    }
+  }
+  
   // Registra vídeo temporário
   function registerTempVideo(filePath, phoneNumbers) {
     const videoId = `video_${Date.now()}_${Math.random().toString(36).substring(7)}`;
@@ -146,14 +198,14 @@ function initRoutesModule({
   
   // Obtém vídeo temporário
   function getTempVideo(videoId) {
-    cleanupExpiredVideos();
+    runCleanupIfNeeded(); // Limpeza em background quando necessário
     const db = loadTempVideosDB();
     return db[videoId] || null;
   }
   
   // Lista todos os vídeos disponíveis (histórico)
   function listVideos(phoneNumber = null) {
-    cleanupExpiredVideos();
+    runCleanupIfNeeded(); // Limpeza em background quando necessário
     const db = loadTempVideosDB();
     const videos = [];
     
@@ -199,13 +251,24 @@ function initRoutesModule({
     return videos;
   }
   
-  // Limpa vídeos expirados periodicamente (a cada hora)
+  // Limpa vídeos expirados periodicamente (a cada hora) - otimizado
   setInterval(() => {
-    cleanupExpiredVideos();
-  }, 60 * 60 * 1000);
+    try {
+      cleanupExpiredVideos();
+    } catch (e) {
+      warn(`[TEMP-VIDEOS] Erro na limpeza periódica:`, e.message);
+    }
+  }, CLEANUP_INTERVAL_MS);
   
-  // Limpa na inicialização
-  cleanupExpiredVideos();
+  // Limpa na inicialização (executa uma vez)
+  setImmediate(() => {
+    try {
+      cleanupExpiredVideos();
+      lastCleanupTime = Date.now();
+    } catch (e) {
+      warn(`[TEMP-VIDEOS] Erro na limpeza inicial:`, e.message);
+    }
+  });
   
   // API oficial não usa client (usa HTTP direto)
   const getLastQR = whatsapp.getLastQR || (() => null);
@@ -1400,8 +1463,8 @@ function initRoutesModule({
   function processTempVideo(videoId, phoneNumber) {
     dbg(`[TEMP-VIDEOS] Processando vídeo ${videoId} para ${phoneNumber}`);
     
-    // Limpa vídeos expirados antes de buscar
-    cleanupExpiredVideos();
+    // Limpeza em background quando necessário (não bloqueia)
+    runCleanupIfNeeded();
     
     const videoData = getTempVideo(videoId);
     
@@ -1466,9 +1529,510 @@ function initRoutesModule({
     };
   }
   
+  // ===== ENDPOINTS COMEDOR =====
+  
+  log(`[ROUTES] Registrando endpoints do comedor...`);
+  
+  // Endpoint para receber notificações do ESP32
+  app.post('/comedor/notification', async (req, res) => {
+    log(`[ROUTES] Endpoint /comedor/notification chamado`);
+    try {
+      if (!comedorMonitor) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Monitor não disponível' 
+        });
+      }
+      
+      const deviceIp = getClientIp(req);
+      const notificationData = req.body || {};
+      
+      // Extrair deviceId (MAC Address) da notificação
+      const deviceId = notificationData.deviceId || notificationData.device_id || null;
+      
+      // Validar token de autenticação (opcional, mas recomendado)
+      const token = req.header('X-API-Token') || req.body?.token || '';
+      
+      // Verifica token no módulo de status primeiro, depois no .env (compatibilidade)
+      // Também verifica se o dispositivo está "adotado" (autorizado sem token)
+      let tokenValid = false;
+      
+      if (comedorDeviceStatus) {
+        // Primeiro verifica se dispositivo está adotado (permite sem token)
+        const device = comedorDeviceStatus.getDeviceStatus(deviceId || deviceIp, deviceId);
+        if (device && device.adopted) {
+          tokenValid = true;
+          log(`[COMEDOR] Dispositivo ${deviceId || deviceIp} (IP: ${deviceIp}) está adotado - permitindo sem token`);
+        } else {
+          // Dispositivo não está adotado, verifica token
+          const configuredToken = comedorDeviceStatus.getToken();
+          if (configuredToken) {
+            tokenValid = (token === configuredToken);
+            if (!tokenValid) {
+              warn(`[COMEDOR] Token inválido de ${deviceId || deviceIp} (IP: ${deviceIp}) - token configurado mas não corresponde`);
+            }
+          } else if (comedorApiToken) {
+            // Fallback para .env se não há token configurado no módulo
+            tokenValid = (token === comedorApiToken);
+            if (!tokenValid) {
+              warn(`[COMEDOR] Token inválido de ${deviceId || deviceIp} (IP: ${deviceIp}) - token do .env não corresponde`);
+            }
+          } else {
+            // Nenhum token configurado e dispositivo não está adotado - REJEITA
+            tokenValid = false;
+            warn(`[COMEDOR] Dispositivo ${deviceId || deviceIp} (IP: ${deviceIp}) não está adotado e nenhum token configurado - rejeitando`);
+          }
+        }
+      } else if (comedorApiToken) {
+        // Fallback se módulo não disponível - usa token do .env
+        tokenValid = (token === comedorApiToken);
+        if (!tokenValid) {
+          warn(`[COMEDOR] Token inválido de ${deviceId || deviceIp} (IP: ${deviceIp}) - módulo não disponível, usando .env`);
+        }
+      } else {
+        // Módulo não disponível e nenhum token no .env - REJEITA por segurança
+        tokenValid = false;
+        warn(`[COMEDOR] Dispositivo ${deviceId || deviceIp} (IP: ${deviceIp}) rejeitado: módulo não disponível e nenhum token configurado`);
+      }
+      
+      // Para notificações do tipo "device_status", sempre registrar mesmo sem token válido
+      const isDeviceStatus = notificationData && notificationData.type === 'device_status';
+      
+      if (!tokenValid && !isDeviceStatus) {
+        // Registra tentativa de conexão mesmo quando autenticação falha
+        // Isso permite que o dispositivo apareça na lista como "não adotado"
+        if (comedorDeviceStatus) {
+          comedorDeviceStatus.registerDeviceAttempt(deviceIp, deviceId);
+        }
+        
+        warn(`[COMEDOR] Tentativa de acesso com token inválido de ${deviceId || deviceIp} (IP: ${deviceIp})`);
+        log(`[COMEDOR] Dica: Você pode "adotar" este dispositivo na interface admin para permitir sem token`);
+        return res.status(401).json({ 
+          success: false, 
+          error: 'Token inválido ou não fornecido',
+          hint: 'Você pode adotar este dispositivo na interface admin para permitir sem token'
+        });
+      }
+      
+      if (!notificationData || !notificationData.type) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Dados de notificação inválidos' 
+        });
+      }
+      
+      log(`[COMEDOR] Notificação recebida: tipo=${notificationData.type} | deviceId=${deviceId || 'N/A'} | ip=${deviceIp}`);
+      
+      // Para device_status (inicializando), sempre registrar mesmo sem token
+      if (isDeviceStatus) {
+        if (comedorDeviceStatus) {
+          comedorDeviceStatus.registerDeviceAttempt(deviceIp, deviceId);
+          comedorDeviceStatus.registerNotification(deviceIp, notificationData);
+        }
+        return res.json({ 
+          success: true, 
+          message: 'Status do dispositivo registrado',
+          hint: isDeviceStatus && !tokenValid ? 'Dispositivo não adotado - você pode adotá-lo na interface admin' : undefined
+        });
+      }
+      
+      // Registra notificação no histórico do dispositivo
+      if (comedorDeviceStatus) {
+        const registered = comedorDeviceStatus.registerNotification(deviceIp, notificationData);
+        if (!registered) {
+          // Clonagem detectada - rejeitar
+          warn(`[COMEDOR] ⚠️ Tentativa de clonagem detectada - dispositivo rejeitado`);
+          return res.status(403).json({ 
+            success: false, 
+            error: 'Tentativa de clonagem detectada',
+            hint: 'DeviceId não corresponde ao dispositivo registrado'
+          });
+        }
+      }
+      
+      const result = await comedorMonitor.processNotification(notificationData);
+      
+      if (result.success) {
+        res.json(result);
+      } else {
+        res.status(500).json(result);
+      }
+    } catch (error) {
+      err(`[COMEDOR] Erro ao processar notificação:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // Endpoint para status do serviço de comedor
+  app.get('/comedor/status', (req, res) => {
+    res.json({
+      ok: true,
+      service: 'comedor-monitor',
+      available: comedorMonitor !== null,
+      timestamp: nowISO()
+    });
+  });
+  
+  // Endpoint para obter configuração (template)
+  app.get('/comedor/config', (req, res) => {
+    if (!comedorMonitor) {
+      return res.status(503).json({ 
+        success: false, 
+        error: 'Comedor Monitor não disponível' 
+      });
+    }
+    
+    res.json({
+      success: true,
+      template: comedorMonitor.getTemplate()
+    });
+  });
+  
+  // Endpoint para atualizar template
+  app.post('/comedor/config', auth, (req, res) => {
+    try {
+      if (!comedorMonitor) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Monitor não disponível' 
+        });
+      }
+      
+      const { template } = req.body;
+      
+      if (!template || typeof template !== 'string') {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Template inválido' 
+        });
+      }
+      
+      const updated = comedorMonitor.setTemplate(template);
+      
+      if (updated) {
+        log(`[COMEDOR] Template atualizado via API`);
+        res.json({ 
+          success: true, 
+          message: 'Template atualizado com sucesso',
+          template: comedorMonitor.getTemplate()
+        });
+      } else {
+        res.status(400).json({ 
+          success: false, 
+          error: 'Falha ao atualizar template' 
+        });
+      }
+    } catch (error) {
+      err(`[COMEDOR] Erro ao atualizar template:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // Endpoint para obter status de um dispositivo específico
+  app.get('/comedor/device/status', auth, (req, res) => {
+    try {
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const deviceIp = req.query.ip || req.query.deviceIp;
+      const deviceId = req.query.deviceId || req.query.device_id;
+      
+      if (!deviceIp && !deviceId) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'IP ou deviceId do dispositivo não fornecido' 
+        });
+      }
+      
+      const status = comedorDeviceStatus.getDeviceStatus(deviceId || deviceIp, deviceId);
+      
+      if (!status) {
+        return res.status(404).json({ 
+          success: false, 
+          error: 'Dispositivo não encontrado',
+          ip: deviceIp,
+          deviceId: deviceId
+        });
+      }
+      
+      res.json({
+        success: true,
+        device: status,
+        timestamp: nowISO()
+      });
+    } catch (error) {
+      err(`[COMEDOR] Erro ao obter status do dispositivo:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+
+  // API: Obter configurações do dispositivo para sincronização (público, requer deviceId)
+  app.get('/comedor/device/config/sync', (req, res) => {
+    try {
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível'
+        });
+      }
+      
+      const deviceId = req.query.deviceId || req.query.device_id;
+      
+      if (!deviceId) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'deviceId não fornecido' 
+        });
+      }
+      
+      const status = comedorDeviceStatus.getDeviceStatus(deviceId, deviceId);
+      if (!status) {
+        // Se não encontrado, retornar sucesso mas sem configurações
+        return res.json({
+          success: true,
+          found: false,
+          config: null,
+          schedules: []
+        });
+      }
+      
+      // Retornar apenas as configurações (sem dados sensíveis)
+      res.json({
+        success: true,
+        found: true,
+        config: status.config || {},
+        schedules: status.schedules || (status.config && status.config.schedules) || []
+      });
+    } catch (error) {
+      err(`[ROUTES] Erro ao obter configurações para sincronização:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // Endpoint para listar todos os dispositivos
+  app.get('/comedor/devices', auth, (req, res) => {
+    try {
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const devices = comedorDeviceStatus.listDevices();
+      
+      res.json({
+        success: true,
+        total: devices.length,
+        devices: devices,
+        timestamp: nowISO()
+      });
+    } catch (error) {
+      err(`[COMEDOR] Erro ao listar dispositivos:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // Endpoint para obter token configurado
+  app.get('/comedor/config/token', auth, (req, res) => {
+    try {
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const token = comedorDeviceStatus.getToken();
+      const config = {
+        token: token ? '***' : null, // Não retorna o token real por segurança
+        hasToken: token !== null,
+        configured: token !== null
+      };
+      
+      res.json({
+        success: true,
+        config: config,
+        timestamp: nowISO()
+      });
+    } catch (error) {
+      err(`[COMEDOR] Erro ao obter token:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // Endpoint para configurar token
+  app.post('/comedor/config/token', auth, (req, res) => {
+    try {
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const { token } = req.body;
+      
+      if (!token || typeof token !== 'string' || token.trim().length === 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Token inválido. Forneça um token não vazio.' 
+        });
+      }
+      
+      const updated = comedorDeviceStatus.setToken(token);
+      
+      if (updated) {
+        log(`[COMEDOR] Token configurado via API`);
+        res.json({ 
+          success: true, 
+          message: 'Token configurado com sucesso',
+          config: {
+            hasToken: true,
+            configured: true
+          }
+        });
+      } else {
+        res.status(400).json({ 
+          success: false, 
+          error: 'Falha ao configurar token' 
+        });
+      }
+    } catch (error) {
+      err(`[COMEDOR] Erro ao configurar token:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // Endpoint para adotar um dispositivo (autorizar sem token)
+  app.post('/comedor/device/adopt', auth, (req, res) => {
+    try {
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const { ip, deviceId, device_id } = req.body;
+      const identifier = ip || deviceId || device_id;
+      const actualDeviceId = deviceId || device_id || null;
+      
+      if (!identifier || typeof identifier !== 'string' || identifier.trim().length === 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'IP ou deviceId do dispositivo é obrigatório' 
+        });
+      }
+      
+      const adopted = comedorDeviceStatus.adoptDevice(identifier.trim(), actualDeviceId ? actualDeviceId.trim() : null);
+      
+      if (adopted) {
+        log(`[COMEDOR] Dispositivo ${actualDeviceId || identifier} (IP: ${ip || 'N/A'}) adotado via API`);
+        res.json({ 
+          success: true, 
+          message: 'Dispositivo adotado com sucesso',
+          device: {
+            deviceId: actualDeviceId,
+            ip: ip || identifier,
+            adopted: true
+          }
+        });
+      } else {
+        res.status(400).json({ 
+          success: false, 
+          error: 'Falha ao adotar dispositivo' 
+        });
+      }
+    } catch (error) {
+      err(`[COMEDOR] Erro ao adotar dispositivo:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // Endpoint para remover adoção de um dispositivo
+  app.post('/comedor/device/unadopt', auth, (req, res) => {
+    try {
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const { ip, deviceId, device_id } = req.body;
+      const identifier = ip || deviceId || device_id;
+      const actualDeviceId = deviceId || device_id || null;
+      
+      if (!identifier || typeof identifier !== 'string' || identifier.trim().length === 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'IP ou deviceId do dispositivo é obrigatório' 
+        });
+      }
+      
+      const unadopted = comedorDeviceStatus.unadoptDevice(identifier.trim(), actualDeviceId ? actualDeviceId.trim() : null);
+      
+      if (unadopted) {
+        log(`[COMEDOR] Adoção removida do dispositivo ${actualDeviceId || identifier} (IP: ${ip || 'N/A'}) via API`);
+        res.json({ 
+          success: true, 
+          message: 'Adoção removida com sucesso',
+          device: {
+            deviceId: actualDeviceId,
+            ip: ip || identifier,
+            adopted: false
+          }
+        });
+      } else {
+        res.status(404).json({ 
+          success: false, 
+          error: 'Dispositivo não encontrado' 
+        });
+      }
+    } catch (error) {
+      err(`[COMEDOR] Erro ao remover adoção:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  log(`[ROUTES] Endpoints do comedor registrados com sucesso`);
+  
   return {
     processTempVideo,
-    listVideos
+    listVideos,
+    getComedorDeviceStatus: () => comedorDeviceStatus
   };
 }
 
