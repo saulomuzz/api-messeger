@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
-function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOfficial, websocketESP32, getClientIp, getAbuseIPDB, tuya, getCurrentTuyaMonitor }) {
+function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOfficial, websocketESP32, getClientIp, getAbuseIPDB, tuya, getCurrentTuyaMonitor, getCurrentComedorDeviceStatus }) {
   const { log, warn, err, dbg } = logger;
   
   // Debug: verifica se tuyaMonitor foi recebido
@@ -2295,6 +2295,614 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
     } catch (error) {
       err(`[ADMIN] Erro ao listar rotas:`, error.message);
       res.status(500).json({ success: false, error: error.message });
+    }
+  });
+  
+  // ===== COMEDOR DEVICES ENDPOINTS =====
+  
+  // API: Listar dispositivos do comedor
+  app.get('/admin/api/comedor/devices', requireAuth, async (req, res) => {
+    try {
+      const comedorDeviceStatus = getCurrentComedorDeviceStatus?.();
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const devices = comedorDeviceStatus.listDevices();
+      
+      res.json({
+        success: true,
+        total: devices.length,
+        devices: devices
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao listar dispositivos do comedor:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // API: Obter token configurado
+  app.get('/admin/api/comedor/config/token', requireAuth, async (req, res) => {
+    try {
+      const comedorDeviceStatus = getCurrentComedorDeviceStatus?.();
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const token = comedorDeviceStatus.getToken();
+      res.json({
+        success: true,
+        config: {
+          token: token ? '***' : null,
+          hasToken: token !== null,
+          configured: token !== null
+        }
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao obter token do comedor:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // API: Configurar token
+  app.post('/admin/api/comedor/config/token', requireAuth, async (req, res) => {
+    try {
+      const comedorDeviceStatus = getCurrentComedorDeviceStatus?.();
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const { token } = req.body;
+      if (!token || typeof token !== 'string' || token.trim().length === 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Token inválido. Forneça um token não vazio.' 
+        });
+      }
+      
+      const updated = comedorDeviceStatus.setToken(token);
+      if (updated) {
+        log(`[ADMIN] Token do comedor configurado via admin`);
+        res.json({ 
+          success: true, 
+          message: 'Token configurado com sucesso',
+          config: {
+            hasToken: true,
+            configured: true
+          }
+        });
+      } else {
+        res.status(400).json({ 
+          success: false, 
+          error: 'Falha ao configurar token' 
+        });
+      }
+    } catch (error) {
+      err(`[ADMIN] Erro ao configurar token do comedor:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // API: Adotar dispositivo
+  app.post('/admin/api/comedor/device/adopt', requireAuth, async (req, res) => {
+    try {
+      const comedorDeviceStatus = getCurrentComedorDeviceStatus?.();
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const { ip, deviceId, device_id } = req.body;
+      const identifier = ip || deviceId || device_id;
+      const actualDeviceId = deviceId || device_id || null;
+      
+      if (!identifier || typeof identifier !== 'string' || identifier.trim().length === 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'IP ou deviceId do dispositivo é obrigatório' 
+        });
+      }
+      
+      // Obter status do dispositivo para pegar o IP atual
+      const deviceStatus = comedorDeviceStatus.getDeviceStatus(identifier.trim(), actualDeviceId ? actualDeviceId.trim() : null);
+      const deviceIp = deviceStatus?.ip || ip || identifier;
+      
+      const adopted = comedorDeviceStatus.adoptDevice(identifier.trim(), actualDeviceId ? actualDeviceId.trim() : null);
+      if (adopted) {
+        log(`[ADMIN] Dispositivo ${actualDeviceId || identifier} (IP: ${deviceIp}) adotado via admin`);
+        
+        // Tentar enviar token ao dispositivo via HTTP POST
+        try {
+          const token = comedorDeviceStatus.getToken();
+          if (token && deviceIp) {
+            const axios = require('axios');
+            const configUrl = `http://${deviceIp}/config/from-server`;
+            const configData = {
+              apiNotificationToken: token
+            };
+            
+            dbg(`[ADMIN] Enviando token ao dispositivo ${deviceIp}...`);
+            dbg(`[ADMIN] URL: ${configUrl}`);
+            dbg(`[ADMIN] Token (primeiros 10 chars): ${token.substring(0, 10)}...`);
+            await axios.post(configUrl, configData, {
+              timeout: 5000,
+              headers: { 
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+              },
+              maxRedirects: 0
+            }).then((response) => {
+              log(`[ADMIN] Token enviado com sucesso ao dispositivo ${deviceIp} (status: ${response.status})`);
+            }).catch((error) => {
+              const errorMsg = error.response 
+                ? `Status ${error.response.status}: ${error.response.statusText}` 
+                : error.message;
+              warn(`[ADMIN] Falha ao enviar token ao dispositivo ${deviceIp}: ${errorMsg}`);
+              if (error.response && error.response.data) {
+                dbg(`[ADMIN] Resposta do dispositivo: ${JSON.stringify(error.response.data)}`);
+              }
+              // Não falha a adoção se não conseguir enviar token
+            });
+          }
+        } catch (sendError) {
+          warn(`[ADMIN] Erro ao enviar token ao dispositivo:`, sendError.message);
+          // Não falha a adoção se não conseguir enviar token
+        }
+        
+        res.json({ 
+          success: true, 
+          message: 'Dispositivo adotado com sucesso',
+          device: {
+            deviceId: actualDeviceId,
+            ip: deviceIp,
+            adopted: true
+          }
+        });
+      } else {
+        res.status(400).json({ 
+          success: false, 
+          error: 'Falha ao adotar dispositivo' 
+        });
+      }
+    } catch (error) {
+      err(`[ADMIN] Erro ao adotar dispositivo do comedor:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // API: Remover adoção de dispositivo
+  app.post('/admin/api/comedor/device/unadopt', requireAuth, async (req, res) => {
+    try {
+      const comedorDeviceStatus = getCurrentComedorDeviceStatus?.();
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const { ip, deviceId, device_id } = req.body;
+      const identifier = ip || deviceId || device_id;
+      const actualDeviceId = deviceId || device_id || null;
+      
+      if (!identifier || typeof identifier !== 'string' || identifier.trim().length === 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'IP ou deviceId do dispositivo é obrigatório' 
+        });
+      }
+      
+      const unadopted = comedorDeviceStatus.unadoptDevice(identifier.trim(), actualDeviceId ? actualDeviceId.trim() : null);
+      if (unadopted) {
+        log(`[ADMIN] Adoção removida do dispositivo ${actualDeviceId || identifier} (IP: ${ip || 'N/A'}) via admin`);
+        res.json({ 
+          success: true, 
+          message: 'Adoção removida com sucesso',
+          device: {
+            deviceId: actualDeviceId,
+            ip: ip || identifier,
+            adopted: false
+          }
+        });
+      } else {
+        res.status(404).json({ 
+          success: false, 
+          error: 'Dispositivo não encontrado' 
+        });
+      }
+    } catch (error) {
+      err(`[ADMIN] Erro ao remover adoção do dispositivo:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // API: Status de um dispositivo específico
+  app.get('/admin/api/comedor/device/status', requireAuth, async (req, res) => {
+    try {
+      const comedorDeviceStatus = getCurrentComedorDeviceStatus?.();
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const deviceIp = req.query.ip;
+      const deviceId = req.query.deviceId || req.query.device_id;
+      
+      if (!deviceIp && !deviceId) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'IP ou deviceId do dispositivo não fornecido' 
+        });
+      }
+      
+      const status = comedorDeviceStatus.getDeviceStatus(deviceId || deviceIp, deviceId);
+      if (!status) {
+        return res.status(404).json({ 
+          success: false, 
+          error: 'Dispositivo não encontrado',
+          ip: deviceIp,
+          deviceId: deviceId
+        });
+      }
+      
+      res.json({
+        success: true,
+        device: status
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao obter status do dispositivo:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // API: Buscar configurações do ESP32
+  app.get('/admin/api/comedor/device/config/fetch', requireAuth, async (req, res) => {
+    try {
+      const comedorDeviceStatus = getCurrentComedorDeviceStatus?.();
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const deviceIp = req.query.ip;
+      const deviceId = req.query.deviceId || req.query.device_id;
+      
+      if (!deviceIp) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'IP do dispositivo é obrigatório' 
+        });
+      }
+      
+      try {
+        const axios = require('axios');
+        const configUrl = `http://${deviceIp}/config`;
+        dbg(`[ADMIN] Buscando configurações do dispositivo ${deviceIp}...`);
+        
+        const [configResponse, schedulesResponse] = await Promise.all([
+          axios.get(configUrl, { timeout: 5000 }),
+          axios.get(`http://${deviceIp}/schedules`, { timeout: 5000 }).catch(() => null)
+        ]);
+        
+        const espConfig = configResponse.data;
+        const espSchedules = schedulesResponse ? schedulesResponse.data : null;
+        
+        dbg(`[ADMIN] Configurações recebidas do ESP32:`, JSON.stringify(espConfig, null, 2));
+        
+        // Helper para converter string para boolean
+        const parseBool = (val) => {
+          if (val === true || val === 'true') return true;
+          if (val === false || val === 'false') return false;
+          return val;
+        };
+        
+        // Helper para converter string para número
+        const parseNum = (val) => {
+          if (val === undefined || val === null) return undefined;
+          const parsed = typeof val === 'string' ? parseFloat(val) : val;
+          return isNaN(parsed) ? undefined : parsed;
+        };
+        
+        // Helper para converter string para inteiro
+        const parseIntSafe = (val) => {
+          if (val === undefined || val === null) return undefined;
+          const parsed = typeof val === 'string' ? parseInt(val, 10) : val;
+          return isNaN(parsed) ? undefined : parsed;
+        };
+        
+        // Mapear TODAS as configurações do ESP32 para o formato da API (com conversão de tipos)
+        const apiConfig = {
+          // Stepper
+          stepperSpeed: parseIntSafe(espConfig.stepperSpeed),
+          stepperDirection: parseBool(espConfig.stepperDirection),
+          stepperStepsForward: parseIntSafe(espConfig.stepperStepsForward),
+          stepperBackoffSteps: parseIntSafe(espConfig.stepperBackoffSteps),
+          
+          // Servo
+          servoTimeA: parseIntSafe(espConfig.servoTimeA),
+          servoTimeB: parseIntSafe(espConfig.servoTimeB),
+          servoSpeed: parseIntSafe(espConfig.servoSpeed),
+          servoSpeedA: parseIntSafe(espConfig.servoSpeedA),
+          servoSpeedB: parseIntSafe(espConfig.servoSpeedB),
+          servoUseHome: parseBool(espConfig.servoUseHome),
+          
+          // Balança
+          scaleOffset: parseNum(espConfig.scaleOffset),
+          scaleFactor: parseNum(espConfig.scaleFactor),
+          weightTolerance: parseNum(espConfig.weightTolerance),
+          scaleZeroTolerance: parseNum(espConfig.scaleZeroTolerance) || parseNum(espConfig.weightTolerance),
+          
+          // Alimentação
+          defaultFeedAmountA: parseNum(espConfig.defaultFeedAmountA),
+          defaultFeedAmountB: parseNum(espConfig.defaultFeedAmountB),
+          fallbackInterval: parseIntSafe(espConfig.fallbackInterval),
+          
+          // Reservatório
+          reservoirEmptyCm: parseNum(espConfig.reservoirEmptyCm),
+          reservoirFullCm: parseNum(espConfig.reservoirFullCm),
+          
+          // Debug
+          debugEnabled: parseBool(espConfig.debugEnabled),
+          debugLevelSensor: parseBool(espConfig.debugLevelSensor),
+          
+          // Animais e Notificações (strings, manter como estão mas garantir que são strings)
+          animalType: typeof espConfig.animalType === 'string' ? espConfig.animalType : (espConfig.animalType || ''),
+          animalAName: typeof espConfig.animalAName === 'string' ? espConfig.animalAName : (espConfig.animalAName || ''),
+          animalBName: typeof espConfig.animalBName === 'string' ? espConfig.animalBName : (espConfig.animalBName || ''),
+          apiNotificationUrl: typeof espConfig.apiNotificationUrl === 'string' ? espConfig.apiNotificationUrl : (espConfig.apiNotificationUrl || ''),
+          apiNotificationUseSSL: parseBool(espConfig.apiNotificationUseSSL),
+          
+          // Horários
+          schedules: espSchedules || []
+        };
+        
+        // Remover campos undefined
+        Object.keys(apiConfig).forEach(key => {
+          if (apiConfig[key] === undefined) {
+            delete apiConfig[key];
+          }
+        });
+        
+        dbg(`[ADMIN] Configurações mapeadas para API:`, JSON.stringify(apiConfig, null, 2));
+        
+        // Salvar na API se deviceId foi fornecido
+        if (deviceId) {
+          const updated = comedorDeviceStatus.updateDeviceConfig(deviceIp, deviceId, apiConfig);
+          if (updated) {
+            log(`[ADMIN] Configurações buscadas do ESP32 e salvas na API para dispositivo ${deviceId}`);
+          }
+        }
+        
+        res.json({
+          success: true,
+          message: 'Configurações buscadas do ESP32 com sucesso',
+          config: apiConfig,
+          rawConfig: espConfig,
+          schedules: espSchedules
+        });
+      } catch (fetchError) {
+        const errorMsg = fetchError.response 
+          ? `Status ${fetchError.response.status}: ${fetchError.response.statusText}` 
+          : fetchError.message;
+        warn(`[ADMIN] Erro ao buscar configurações do ESP32 ${deviceIp}: ${errorMsg}`);
+        res.status(500).json({
+          success: false,
+          error: `Erro ao buscar configurações do ESP32: ${errorMsg}`
+        });
+      }
+    } catch (error) {
+      err(`[ADMIN] Erro ao buscar configurações do dispositivo:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
+    }
+  });
+  
+  // API: Atualizar configurações de um dispositivo
+  app.post('/admin/api/comedor/device/config', requireAuth, async (req, res) => {
+    try {
+      const comedorDeviceStatus = getCurrentComedorDeviceStatus?.();
+      if (!comedorDeviceStatus) {
+        return res.status(503).json({ 
+          success: false, 
+          error: 'Comedor Device Status não disponível' 
+        });
+      }
+      
+      const { ip, deviceId, device_id, config, sendToDevice } = req.body;
+      const identifier = ip || deviceId || device_id;
+      const actualDeviceId = deviceId || device_id || null;
+      const shouldSendToDevice = sendToDevice !== false; // Por padrão envia ao dispositivo
+      
+      if (!identifier || typeof identifier !== 'string' || identifier.trim().length === 0) {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'IP ou deviceId do dispositivo é obrigatório' 
+        });
+      }
+      
+      if (!config || typeof config !== 'object') {
+        return res.status(400).json({ 
+          success: false, 
+          error: 'Configurações inválidas' 
+        });
+      }
+      
+      // Salvar na API
+      const updated = comedorDeviceStatus.updateDeviceConfig(identifier.trim(), actualDeviceId ? actualDeviceId.trim() : null, config);
+      if (!updated) {
+        return res.status(404).json({ 
+          success: false, 
+          error: 'Dispositivo não encontrado' 
+        });
+      }
+      
+      log(`[ADMIN] Configurações do dispositivo ${actualDeviceId || identifier} atualizadas via admin`);
+      
+      // Se solicitado, enviar ao dispositivo
+      let sentToDevice = false;
+      if (shouldSendToDevice && ip) {
+        try {
+          const axios = require('axios');
+          const configUrl = `http://${ip}/config/from-server`;
+          
+          // Mapear configurações da API para o formato do ESP32
+          const espConfig = {};
+          
+          // Sempre enviar token se disponível
+          const token = comedorDeviceStatus.getToken();
+          if (token) {
+            espConfig.apiNotificationToken = token;
+          }
+          
+          // Stepper
+          if (config.stepperDirection !== undefined) espConfig.stepperDirection = config.stepperDirection;
+          if (config.stepperSpeed !== undefined) espConfig.stepperSpeed = config.stepperSpeed;
+          if (config.stepperStepsForward !== undefined) espConfig.stepperStepsForward = config.stepperStepsForward;
+          if (config.stepperBackoffSteps !== undefined) espConfig.stepperBackoffSteps = config.stepperBackoffSteps;
+
+          // Servo
+          if (config.servoTimeA !== undefined) espConfig.servoTimeA = config.servoTimeA;
+          if (config.servoTimeB !== undefined) espConfig.servoTimeB = config.servoTimeB;
+          if (config.servoSpeed !== undefined) espConfig.servoSpeed = config.servoSpeed;
+          if (config.servoSpeedA !== undefined) espConfig.servoSpeedA = config.servoSpeedA;
+          if (config.servoSpeedB !== undefined) espConfig.servoSpeedB = config.servoSpeedB;
+          if (config.servoUseHome !== undefined) espConfig.servoUseHome = config.servoUseHome;
+
+          // Balança
+          if (config.scaleOffset !== undefined) espConfig.scaleOffset = config.scaleOffset;
+          if (config.scaleFactor !== undefined) espConfig.scaleFactor = config.scaleFactor;
+          if (config.scaleZeroTolerance !== undefined || config.weightTolerance !== undefined) {
+            espConfig.weightTolerance = config.scaleZeroTolerance || config.weightTolerance;
+            espConfig.scaleZeroTolerance = config.scaleZeroTolerance || config.weightTolerance;
+          }
+
+          // Alimentação
+          if (config.defaultFeedAmountA !== undefined) espConfig.defaultFeedAmountA = config.defaultFeedAmountA;
+          if (config.defaultFeedAmountB !== undefined) espConfig.defaultFeedAmountB = config.defaultFeedAmountB;
+          if (config.fallbackInterval !== undefined) espConfig.fallbackInterval = config.fallbackInterval;
+
+          // Reservatório
+          if (config.reservoirEmptyCm !== undefined) espConfig.reservoirEmptyCm = config.reservoirEmptyCm;
+          if (config.reservoirFullCm !== undefined) espConfig.reservoirFullCm = config.reservoirFullCm;
+
+          // Debug
+          if (config.debugEnabled !== undefined) espConfig.debugEnabled = config.debugEnabled;
+          if (config.debugLevelSensor !== undefined) espConfig.debugLevelSensor = config.debugLevelSensor;
+
+          // Animais e Notificações
+          if (config.animalType !== undefined) espConfig.animalType = config.animalType;
+          if (config.animalAName !== undefined) espConfig.animalAName = config.animalAName;
+          if (config.animalBName !== undefined) espConfig.animalBName = config.animalBName;
+          if (config.apiNotificationUrl !== undefined) espConfig.apiNotificationUrl = config.apiNotificationUrl;
+          if (config.apiNotificationUseSSL !== undefined) espConfig.apiNotificationUseSSL = config.apiNotificationUseSSL;
+          
+          dbg(`[ADMIN] Enviando configurações ao dispositivo ${ip}...`);
+          await axios.post(configUrl, espConfig, {
+            timeout: 5000,
+            headers: { 
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+            }
+          });
+          
+          sentToDevice = true;
+          log(`[ADMIN] Configurações enviadas ao dispositivo ${ip} com sucesso`);
+        } catch (sendError) {
+          const errorMsg = sendError.response 
+            ? `Status ${sendError.response.status}: ${sendError.response.statusText}` 
+            : sendError.message;
+          warn(`[ADMIN] Erro ao enviar configurações ao dispositivo ${ip}: ${errorMsg}`);
+          // Não falha a operação, apenas avisa
+        }
+      }
+      
+      // Se schedules foram fornecidos e dispositivo foi encontrado, enviar schedules
+      let schedulesSent = false;
+      if (config.schedules && Array.isArray(config.schedules) && shouldSendToDevice && ip) {
+        try {
+          const axios = require('axios');
+          const schedulesUrl = `http://${ip}/schedules/save`;
+          
+          const schedulesPayload = {};
+          config.schedules.forEach((schedule, i) => {
+            schedulesPayload[`schedule${i}_hour`] = schedule.hour || 0;
+            schedulesPayload[`schedule${i}_minute`] = schedule.minute || 0;
+            schedulesPayload[`schedule${i}_amountA`] = schedule.amountA || 0;
+            schedulesPayload[`schedule${i}_amountB`] = schedule.amountB || 0;
+            schedulesPayload[`schedule${i}_enabled`] = schedule.enabled ? 'true' : 'false';
+          });
+          
+          dbg(`[ADMIN] Enviando schedules ao dispositivo ${ip}...`);
+          await axios.post(schedulesUrl, new URLSearchParams(schedulesPayload).toString(), {
+            timeout: 5000,
+            headers: { 
+              'Content-Type': 'application/x-www-form-urlencoded'
+            }
+          });
+          
+          schedulesSent = true;
+          log(`[ADMIN] Schedules enviados ao dispositivo ${ip} com sucesso`);
+        } catch (schedError) {
+          const errorMsg = schedError.response 
+            ? `Status ${schedError.response.status}: ${schedError.response.statusText}` 
+            : schedError.message;
+          warn(`[ADMIN] Erro ao enviar schedules ao dispositivo ${ip}: ${errorMsg}`);
+          // Não falha a operação, apenas avisa
+        }
+      }
+      
+      res.json({ 
+        success: true, 
+        message: 'Configurações atualizadas com sucesso' + (sentToDevice ? ' e enviadas ao dispositivo' : ''),
+        sentToDevice: sentToDevice,
+        schedulesSent: schedulesSent,
+        device: {
+          deviceId: actualDeviceId,
+          ip: ip || identifier,
+          config: config
+        }
+      });
+    } catch (error) {
+      err(`[ADMIN] Erro ao atualizar configurações do dispositivo:`, error.message);
+      res.status(500).json({ 
+        success: false, 
+        error: error.message 
+      });
     }
   });
   

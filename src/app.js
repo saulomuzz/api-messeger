@@ -96,6 +96,9 @@ const VIDEO_AUDIO_BITRATE = process.env.VIDEO_AUDIO_BITRATE || '128k'; // Bitrat
 const BACKUP_ENABLED = /^true$/i.test(process.env.BACKUP_ENABLED || 'true'); // Backup habilitado (padrão: true)
 const BACKUP_INTERVAL_HOURS = parseInt(process.env.BACKUP_INTERVAL_HOURS || '24', 10); // Intervalo em horas (padrão: 24)
 const BACKUP_MAX_COUNT = parseInt(process.env.BACKUP_MAX_COUNT || '7', 10); // Máximo de backups (padrão: 7)
+// Configurações do Comedor Monitor
+const COMEDOR_MESSAGE_TEMPLATE_SUCCESS = process.env.COMEDOR_MESSAGE_TEMPLATE_SUCCESS || ''; // Template para alimentação bem-sucedida (opcional)
+const COMEDOR_API_TOKEN = process.env.COMEDOR_API_TOKEN || ''; // Token de autenticação para notificações do ESP32 (opcional)
 
 /* ===== logging ===== */
 const logger = initLogger({
@@ -443,15 +446,20 @@ try {
   // Não encerra a aplicação, mas loga o erro
 }
 
-// Middleware de verificação de IP bloqueado e validação AbuseIPDB (executado no início de cada requisição)
+// Middleware consolidado de verificação de IP (otimizado - cacheia IP normalizado no req)
 app.use(async (req, res, next) => {
   // Ignora requisições WebSocket (upgrade requests) - elas são tratadas pelo módulo WebSocket
   if (req.headers.upgrade === 'websocket' || req.path === '/ws/esp32') {
     return next();
   }
   
+  // Cacheia IP normalizado no req para evitar múltiplas normalizações
+  if (!req._normalizedIp) {
   const clientIp = getClientIp(req);
-  const normalizedIp = normalizeIp(clientIp);
+    req._normalizedIp = normalizeIp(clientIp);
+    req._clientIp = clientIp; // Mantém IP original também
+  }
+  const normalizedIp = req._normalizedIp;
   
   // Ignora IPs locais e inválidos
   if (!normalizedIp || normalizedIp === 'unknown' || normalizedIp === 'localhost' || 
@@ -460,39 +468,34 @@ app.use(async (req, res, next) => {
     return next();
   }
   
-  // Ignora IPs na whitelist
+  // Ignora IPs na whitelist (verificação rápida)
   if (ENABLE_IP_WHITELIST && IP_WHITELIST.length > 0) {
     const isAllowed = IP_WHITELIST.some(allowedIp => {
       if (allowedIp.includes('/')) {
         return ipInCidr(normalizedIp, allowedIp);
       }
-      return normalizeIp(normalizedIp) === normalizeIp(allowedIp);
+      return normalizedIp === normalizeIp(allowedIp);
     });
     if (isAllowed) {
       return next();
     }
   }
   
-  // Verifica se IP está bloqueado no banco
+  // Verifica se IP está bloqueado no banco (síncrono - bloqueia requisição)
   if (ipBlocker && ipBlocker.isBlocked) {
     try {
-      const isBlocked = await ipBlocker.isBlocked(normalizedIp);
+      const isBlocked = await Promise.race([
+        ipBlocker.isBlocked(normalizedIp),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 1000))
+      ]);
       if (isBlocked) {
         // Registra tentativa de acesso bloqueado
         if (ipBlocker.recordBlockedAttempt) {
-          await ipBlocker.recordBlockedAttempt(normalizedIp);
+          ipBlocker.recordBlockedAttempt(normalizedIp).catch(() => {});
         }
         warn(`[SECURITY] Tentativa de acesso de IP bloqueado: ${normalizedIp} em ${req.path}`);
         // Retorna 404 genérico para não revelar que o IP está bloqueado
         return res.status(404).send('Not Found');
-      }
-      
-      // Se não está bloqueado, verifica se está em whitelist/yellowlist e registra tentativa
-      if (ipBlocker && ipBlocker.recordIPAttempt) {
-        // Registra tentativa de acesso (atualiza contador se estiver em alguma lista)
-        ipBlocker.recordIPAttempt(normalizedIp).catch(err => {
-          dbg(`[SECURITY] Erro ao registrar tentativa de IP:`, err.message);
-        });
       }
     } catch (e) {
       // Em caso de erro, permite acesso mas loga
@@ -500,13 +503,17 @@ app.use(async (req, res, next) => {
     }
   }
   
-  // Valida IP no AbuseIPDB para rotas não configuradas ou suspeitas
+  // Registra tentativa de acesso (não bloqueia)
+  if (ipBlocker && ipBlocker.recordIPAttempt) {
+    ipBlocker.recordIPAttempt(normalizedIp).catch(() => {});
+  }
+  
+  // Valida IP no AbuseIPDB para rotas não configuradas ou suspeitas (assíncrono)
   const knownRoutes = ['/health', '/webhook/whatsapp', '/esp32/validate', '/qr.png', '/qr/status', '/status', '/send', '/trigger-snapshot', '/tuya/', '/esp32/ota', '/esp32/ota/check', '/esp32/ota/download', '/admin'];
   const isKnownRoute = knownRoutes.some(route => req.path.startsWith(route));
   
   // Valida apenas se não for rota conhecida
   if (!isKnownRoute && abuseIPDB && abuseIPDB.checkAndBlockIP) {
-    try {
       // Verifica de forma assíncrona (não bloqueia a requisição imediatamente)
       abuseIPDB.checkAndBlockIP(normalizedIp, `Tentativa de acesso a rota não configurada: ${req.method} ${req.path}`)
         .then(result => {
@@ -516,13 +523,7 @@ app.use(async (req, res, next) => {
             dbg(`[ABUSEIPDB] IP ${normalizedIp} verificado: ${result.abuseConfidence}% confiança, ${result.reports} report(s)`);
           }
         })
-        .catch(err => {
-          warn(`[ABUSEIPDB] Erro ao verificar/bloquear IP ${normalizedIp}:`, err.message);
-        });
-    } catch (abuseError) {
-      // Não bloqueia requisição em caso de erro na verificação
-      dbg(`[ABUSEIPDB] Erro ao iniciar verificação:`, abuseError.message);
-    }
+      .catch(() => {}); // Ignora erros silenciosamente
   }
   
   next();
@@ -791,11 +792,21 @@ async function auth(req, res, next) {
     attempts.lastAttempt = now;
     failedAttempts.set(clientIp, attempts);
     
-    // Bloqueia IP após 5 tentativas falhadas em 15 minutos
+    // Bloqueia IP após 5 tentativas falhadas em 15 minutos (mas NÃO bloqueia IPs privados)
     if (attempts.count >= 5) {
       const timeSinceFirst = now - attempts.firstAttempt;
       if (timeSinceFirst < 15 * 60 * 1000) { // 15 minutos
-        // Bloqueia no banco de dados
+        // Verifica se é IP privado - não bloqueia IPs privados
+        if (isLocalIP(clientIp)) {
+          warn(`[SECURITY] IP privado ${clientIp} não será bloqueado apesar de ${attempts.count} tentativas falhadas`);
+          // Ainda retorna erro, mas não bloqueia
+          return res.status(401).json({ 
+            error: 'invalid_token', 
+            message: 'Token inválido ou não fornecido' 
+          });
+        }
+        
+        // Bloqueia no banco de dados (apenas IPs públicos)
         const reason = `Múltiplas tentativas falhadas de autenticação (${attempts.count} tentativas)`;
         if (ipBlocker && ipBlocker.blockIP) {
           try {
@@ -1067,7 +1078,9 @@ try {
     enableVideoRecording: ENABLE_VIDEO_RECORDING,
     videoRecordDurationSec: VIDEO_RECORD_DURATION_SEC,
     minVideoRecordIntervalMs: MIN_VIDEO_RECORD_INTERVAL_MS,
-    strictRateLimit // Passa rate limit estrito para endpoints críticos
+    strictRateLimit, // Passa rate limit estrito para endpoints críticos
+    comedorMessageTemplate: COMEDOR_MESSAGE_TEMPLATE_SUCCESS, // Template de mensagem do comedor
+    comedorApiToken: COMEDOR_API_TOKEN // Token de autenticação para notificações
   });
   log(`[INIT] Módulo Routes inicializado com sucesso`);
 } catch (routesError) {
@@ -1613,44 +1626,7 @@ async function triggerSnapshotForWS(message, clientIp) {
 if (ENABLE_GLOBAL_IP_VALIDATION && ipBlocker && abuseIPDB) {
   log(`[INIT] Habilitando validação global de IPs (verificação AbuseIPDB em todas as requisições)`);
   
-  // Função para verificar se IP é local
-  function isLocalIP(ip) {
-    if (!ip || ip === 'unknown' || ip === 'localhost') return true;
-    
-    // Remove prefixo IPv6
-    let normalizedIp = ip;
-    if (normalizedIp.startsWith('::ffff:')) {
-      normalizedIp = normalizedIp.substring(7);
-    }
-    
-    // IPs locais
-    if (normalizedIp === '127.0.0.1' || normalizedIp === '::1') return true;
-    
-    // Verifica ranges privados
-    const parts = normalizedIp.split('.');
-    if (parts.length === 4) {
-      const [a, b] = parts.map(Number);
-      
-      // 10.0.0.0/8
-      if (a === 10) return true;
-      
-      // 192.168.0.0/16
-      if (a === 192 && b === 168) return true;
-      
-      // 172.16.0.0/12
-      if (a === 172 && b >= 16 && b <= 31) return true;
-      
-      // 127.0.0.0/8
-      if (a === 127) return true;
-      
-      // 169.254.0.0/16 (link-local)
-      if (a === 169 && b === 254) return true;
-    }
-    
-    return false;
-  }
-  
-  // Função para verificar se IP está na whitelist
+  // Função para verificar se IP está na whitelist (usando isIPInList do módulo ip-utils)
   function isWhitelisted(ip) {
     if (!ip || ip === 'unknown') return false;
     
@@ -1659,18 +1635,8 @@ if (ENABLE_GLOBAL_IP_VALIDATION && ipBlocker && abuseIPDB) {
     
     if (allWhitelists.length === 0) return false;
     
-    let normalizedIp = ip;
-    if (normalizedIp.startsWith('::ffff:')) {
-      normalizedIp = normalizedIp.substring(7);
-    }
-    
-    return allWhitelists.some(allowedIp => {
-      if (allowedIp.includes('/')) {
-        // CIDR notation
-        return ipInCidr(normalizedIp, allowedIp);
-      }
-      return normalizeIp(normalizedIp) === normalizeIp(allowedIp);
-    });
+    // Usa isIPInList do módulo ip-utils para verificação
+    return isIPInList(ip, allWhitelists);
   }
   
   // Middleware global de validação de IP (DEVE ser ANTES de todas as rotas)
@@ -1682,10 +1648,13 @@ if (ENABLE_GLOBAL_IP_VALIDATION && ipBlocker && abuseIPDB) {
       return next();
     }
     
+    // Usa IP normalizado já cacheado no req (otimização)
+    let normalizedIp = req._normalizedIp;
+    if (!normalizedIp) {
     const clientIp = getClientIp(req);
-    let normalizedIp = clientIp;
-    if (normalizedIp && normalizedIp.startsWith('::ffff:')) {
-      normalizedIp = normalizedIp.substring(7);
+      normalizedIp = normalizeIp(clientIp);
+      req._normalizedIp = normalizedIp;
+      req._clientIp = clientIp;
     }
     
     // Se IP é local ou está na whitelist do ENV, permite sem validação
@@ -1887,7 +1856,8 @@ server = app.listen(PORT, () => {
       getClientIp: getClientIp,
       getAbuseIPDB: () => abuseIPDB, // Função getter para acesso ao módulo AbuseIPDB
       tuya, // Módulo Tuya para controle de dispositivos
-      getCurrentTuyaMonitor: () => tuyaMonitor // Getter para acesso dinâmico ao Tuya Monitor
+      getCurrentTuyaMonitor: () => tuyaMonitor, // Getter para acesso dinâmico ao Tuya Monitor
+      getCurrentComedorDeviceStatus: () => routesModule?.getComedorDeviceStatus?.() // Getter para acesso ao Comedor Device Status
     });
     log(`[INIT] Módulo Admin inicializado com sucesso`);
     
@@ -1934,6 +1904,17 @@ server = app.listen(PORT, () => {
       res.status(404).json({ 
         error: 'not_found',
         message: 'Rota administrativa não encontrada',
+        path: req.path
+      });
+      return;
+    }
+    
+    // Ignora rotas do comedor (já registradas pelo módulo routes)
+    if (path.startsWith('/comedor')) {
+      // Se chegou aqui, a rota do comedor não foi encontrada - retorna 404
+      res.status(404).json({ 
+        error: 'not_found',
+        message: 'Rota do comedor não encontrada',
         path: req.path
       });
       return;
