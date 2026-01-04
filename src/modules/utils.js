@@ -110,9 +110,17 @@ function readNumbersFromFile(filePath) {
       return [];
     }
     const content = fs.readFileSync(filePath, 'utf8');
-    const lines = content.split('\n')
+    const allLines = content.split('\n');
+    const lines = allLines
       .map(line => line.trim())
       .filter(line => line && !line.startsWith('#') && line.length > 0);
+    
+    // Log detalhado para debug
+    if (allLines.length !== lines.length) {
+      const skipped = allLines.length - lines.length;
+      // Não loga aqui para evitar spam - será logado no módulo que chama
+    }
+    
     return lines;
   } catch (e) {
     return [];
