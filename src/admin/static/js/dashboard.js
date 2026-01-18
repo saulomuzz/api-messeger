@@ -1,6 +1,7 @@
 // Dashboard JavaScript - Versão 2.0
 let currentTab = 'overview';
 let statsData = null;
+let videosCache = [];
 
 // Estado de paginação e ordenação
 const pagination = {
@@ -112,7 +113,328 @@ function loadTabData(tabName) {
     case 'comedor': 
       if (typeof loadComedorTab === 'function') loadComedorTab(); 
       break;
+    case 'videos': loadVideos(); break;
+    case 'whatsapp-audit': loadWhatsappThreads(); break;
   }
+}
+
+// ===== VÍDEOS =====
+
+async function loadVideos() {
+  try {
+    const container = document.getElementById('videosContainer');
+    if (container) {
+      container.innerHTML = '<div class="loading-spinner"></div>';
+    }
+    const response = await fetch('/admin/api/videos');
+    const data = await response.json();
+    if (!data.success) {
+      showToast('Erro ao carregar vídeos', 'error');
+      return;
+    }
+    videosCache = data.videos || [];
+    applyVideoFilters();
+  } catch (error) {
+    console.error('Erro ao carregar vídeos:', error);
+    showToast('Erro ao carregar vídeos', 'error');
+  }
+}
+
+function renderVideos(videos) {
+  const container = document.getElementById('videosContainer');
+  if (!container) return;
+  if (!videos || videos.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🎥</div>Nenhum vídeo disponível</div>';
+    return;
+  }
+
+  const cardsHtml = videos.map((video) => {
+    const createdAt = formatDate(video.createdAt);
+    const expiresAt = formatDate(video.expiresAt);
+    const phoneList = (video.phoneNumbers || []).join(', ') || 'N/A';
+    const fileStatus = video.fileExists ? '✅' : '❌';
+    const viewCount = Number(video.viewCount || 0);
+    const lastViewedAt = video.lastViewedAt ? formatDate(video.lastViewedAt) : 'Nunca';
+    const lastViewedBy = video.lastViewedBy || 'N/A';
+    const streamUrl = `/admin/api/videos/${video.videoId}/stream`;
+    return `
+      <div class="video-card">
+        <div class="video-header">
+          <div>
+            <div class="video-title">🎥 ${video.videoId}</div>
+            <div class="video-meta">${fileStatus} Criado: ${createdAt}</div>
+            <div class="video-meta">Expira: ${expiresAt}</div>
+            <div class="video-meta">Números: ${phoneList}</div>
+            <div class="video-meta">Visto: ${viewCount}x | Último: ${lastViewedAt}</div>
+            <div class="video-meta">Último por: ${lastViewedBy}</div>
+          </div>
+          <div class="video-actions">
+            <button class="btn-danger" onclick="deleteVideo('${video.videoId}')">Apagar</button>
+          </div>
+        </div>
+        <video class="video-player" controls preload="metadata" src="${streamUrl}" onplay="markVideoViewed('${video.videoId}', this)"></video>
+      </div>
+    `;
+  }).join('');
+
+  container.innerHTML = `<div class="video-grid">${cardsHtml}</div>`;
+}
+
+function applyVideoFilters() {
+  const searchInput = document.getElementById('videoSearchInput');
+  const statusFilter = document.getElementById('videoStatusFilter');
+  const sortSelect = document.getElementById('videoSortSelect');
+  const searchValue = (searchInput?.value || '').toLowerCase().trim();
+  const statusValue = (statusFilter?.value || '').toLowerCase().trim();
+  const sortValue = sortSelect?.value || 'createdAt_desc';
+  
+  let filtered = [...videosCache];
+  
+  if (statusValue) {
+    filtered = filtered.filter(video => (video.status || '').toLowerCase() === statusValue);
+  }
+  
+  if (searchValue) {
+    filtered = filtered.filter(video => {
+      const idMatch = String(video.videoId || '').toLowerCase().includes(searchValue);
+      const statusMatch = String(video.status || '').toLowerCase().includes(searchValue);
+      const phoneMatch = (video.phoneNumbers || []).some(p => String(p).toLowerCase().includes(searchValue));
+      return idMatch || statusMatch || phoneMatch;
+    });
+  }
+  
+  const [field, order] = sortValue.split('_');
+  filtered.sort((a, b) => {
+    let aValue;
+    let bValue;
+    
+    if (field === 'views') {
+      aValue = Number(a.viewCount || 0);
+      bValue = Number(b.viewCount || 0);
+    } else if (field === 'expiresAt') {
+      aValue = Number(a.expiresAt || 0);
+      bValue = Number(b.expiresAt || 0);
+    } else {
+      aValue = Number(a.createdAt || 0);
+      bValue = Number(b.createdAt || 0);
+    }
+    
+    if (aValue === bValue) return 0;
+    const direction = order === 'asc' ? 1 : -1;
+    return aValue > bValue ? direction : -direction;
+  });
+  
+  renderVideos(filtered);
+}
+
+function clearVideoFilters() {
+  const searchInput = document.getElementById('videoSearchInput');
+  const statusFilter = document.getElementById('videoStatusFilter');
+  const sortSelect = document.getElementById('videoSortSelect');
+  
+  if (searchInput) searchInput.value = '';
+  if (statusFilter) statusFilter.value = '';
+  if (sortSelect) sortSelect.value = 'createdAt_desc';
+  
+  renderVideos(videosCache);
+}
+
+async function markVideoViewed(videoId, _videoEl) {
+  try {
+    await fetch(`/admin/api/videos/${videoId}/viewed`, { method: 'POST' });
+  } catch (error) {
+    console.error('Erro ao marcar vídeo como visto:', error);
+  }
+}
+
+async function deleteVideo(videoId) {
+  if (!confirm('Tem certeza que deseja apagar este vídeo?')) return;
+  try {
+    const response = await fetch(`/admin/api/videos/${videoId}`, { method: 'DELETE' });
+    const data = await response.json();
+    if (data.success) {
+      showToast('Vídeo apagado com sucesso', 'success');
+      loadVideos();
+    } else {
+      showToast('Erro ao apagar vídeo', 'error');
+    }
+  } catch (error) {
+    console.error('Erro ao apagar vídeo:', error);
+    showToast('Erro ao apagar vídeo', 'error');
+  }
+}
+
+// ===== WHATSAPP AUDIT =====
+
+async function loadWhatsappThreads() {
+  try {
+    const container = document.getElementById('auditThreads');
+    if (container) {
+      container.classList.add('loading-spinner');
+      container.innerHTML = '<div class="loading-spinner"></div>';
+    }
+    const search = document.getElementById('auditSearchInput')?.value || '';
+    const response = await fetch(`/admin/api/whatsapp/audit/threads?limit=100&search=${encodeURIComponent(search)}`);
+    let data;
+    try {
+      data = await response.json();
+    } catch (e) {
+      showToast('Resposta inválida do servidor', 'error');
+      const container = document.getElementById('auditThreads');
+      if (container) {
+        container.classList.remove('loading-spinner');
+        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">⚠️</div>Erro ao carregar</div>';
+      }
+      return;
+    }
+    if (!data.success) {
+      showToast('Erro ao carregar conversas', 'error');
+      const container = document.getElementById('auditThreads');
+      if (container) {
+        container.classList.remove('loading-spinner');
+        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">⚠️</div>Erro ao carregar</div>';
+      }
+      return;
+    }
+    renderAuditThreads(data.threads || []);
+  } catch (error) {
+    console.error('Erro ao carregar threads WhatsApp:', error);
+    showToast('Erro ao carregar conversas', 'error');
+    const container = document.getElementById('auditThreads');
+    if (container) {
+      container.classList.remove('loading-spinner');
+      container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">⚠️</div>Erro ao carregar</div>';
+    }
+  }
+}
+
+function renderAuditThreads(threads) {
+  const container = document.getElementById('auditThreads');
+  if (!container) return;
+  container.classList.remove('loading-spinner');
+  if (!threads || threads.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">📭</div>Nenhuma conversa</div>';
+    return;
+  }
+  const normalizePhone = (value) => String(value || '').replace(/\D/g, '');
+  const merged = new Map();
+  threads.forEach((thread) => {
+    const phone = normalizePhone(thread.phone);
+    if (!phone) return;
+    const current = merged.get(phone) || { phone, total: 0, last_at: 0 };
+    const total = Number(thread.total || 0);
+    const lastAt = Number(thread.last_at || 0);
+    current.total += total;
+    current.last_at = Math.max(current.last_at, lastAt);
+    merged.set(phone, current);
+  });
+  const mergedThreads = Array.from(merged.values()).sort((a, b) => b.last_at - a.last_at);
+  const html = mergedThreads.map(thread => {
+    const lastAt = thread.last_at ? formatDate(thread.last_at * 1000) : 'N/A';
+    return `
+      <div class="chat-list-item" onclick="loadWhatsappMessages('${thread.phone}', this)">
+        <div style="font-weight: 600; font-size: 13px;">${thread.phone}</div>
+        <div style="font-size: 11px; color: #888;">Último: ${lastAt}</div>
+        <div style="font-size: 11px; color: #888;">Total: ${thread.total}</div>
+      </div>
+    `;
+  }).join('');
+  container.innerHTML = html;
+}
+
+async function loadWhatsappMessages(phone, el) {
+  try {
+    document.querySelectorAll('.chat-list-item').forEach(item => item.classList.remove('active'));
+    if (el) el.classList.add('active');
+    const container = document.getElementById('auditMessages');
+    if (container) {
+      container.innerHTML = '<div class="loading-spinner"></div>';
+    }
+    const response = await fetch(`/admin/api/whatsapp/audit/messages?phone=${encodeURIComponent(phone)}&limit=200`);
+    let data;
+    try {
+      data = await response.json();
+    } catch (e) {
+      showToast('Resposta inválida do servidor', 'error');
+      if (container) {
+        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">⚠️</div>Erro ao carregar</div>';
+      }
+      return;
+    }
+    if (!data.success) {
+      showToast('Erro ao carregar mensagens', 'error');
+      if (container) {
+        container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">⚠️</div>Erro ao carregar</div>';
+      }
+      return;
+    }
+    renderAuditMessages(data.messages || [], data.media || {});
+  } catch (error) {
+    console.error('Erro ao carregar mensagens WhatsApp:', error);
+    showToast('Erro ao carregar mensagens', 'error');
+    const container = document.getElementById('auditMessages');
+    if (container) {
+      container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">⚠️</div>Erro ao carregar</div>';
+    }
+  }
+}
+
+function renderAuditMessages(messages, mediaMap = {}) {
+  const container = document.getElementById('auditMessages');
+  if (!container) return;
+  if (!messages || messages.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div class="empty-state-icon">💬</div>Sem mensagens</div>';
+    return;
+  }
+  const sorted = [...messages].sort((a, b) => a.created_at - b.created_at);
+  const html = sorted.map(msg => {
+    let payload = null;
+    try { payload = msg.payload_json ? JSON.parse(msg.payload_json) : null; } catch {}
+    const when = msg.created_at ? formatDate(msg.created_at * 1000) : '';
+    const direction = msg.direction;
+    const mediaId = payload?.image?.id || payload?.video?.id || payload?.audio?.id || payload?.document?.id || payload?.mediaId || null;
+    let mediaHtml = '';
+    if (mediaId && mediaMap[mediaId]?.base64) {
+      const contentType = mediaMap[mediaId].contentType || 'application/octet-stream';
+      const dataUrl = `data:${contentType};base64,${mediaMap[mediaId].base64}`;
+      if (contentType.startsWith('image/')) {
+        mediaHtml = `<div style="margin-top:8px;"><img src="${dataUrl}" alt="media" style="max-width:100%; border-radius:8px;"/></div>`;
+      } else if (contentType.startsWith('video/')) {
+        mediaHtml = `<div style="margin-top:8px;"><video controls style="max-width:100%; border-radius:8px;" src="${dataUrl}"></video></div>`;
+      } else if (contentType.startsWith('audio/')) {
+        mediaHtml = `<div style="margin-top:8px;"><audio controls src="${dataUrl}"></audio></div>`;
+      } else {
+        mediaHtml = `<div style="margin-top:8px;"><a href="${dataUrl}" download="media">Baixar arquivo</a></div>`;
+      }
+    }
+    let text = '';
+    if (payload?.text?.body) text = payload.text.body;
+    else if (payload?.text) text = payload.text;
+    else if (payload?.templateName) text = `Template: ${payload.templateName}`;
+    else if (payload?.mediaUrl) text = `Mídia: ${payload.mediaUrl}`;
+    else if (payload?.mediaId) text = `Mídia (ID): ${payload.mediaId}`;
+    else if (payload?.buttons) text = `Botões: ${payload.buttons.map(b => b.title || b.text).join(', ')}`;
+    else text = msg.type || 'Mensagem';
+    const status = msg.status ? ` (${msg.status})` : '';
+    const error = msg.error_message ? `Erro: ${msg.error_message}` : '';
+    if (direction === 'status') {
+      return `
+        <div class="chat-bubble chat-status">
+          ${msg.status || 'status'} ${status}<div class="chat-meta">${when}</div>
+          ${error ? `<div class="chat-meta">${error}</div>` : ''}
+        </div>
+      `;
+    }
+    const bubbleClass = direction === 'out' ? 'chat-out' : 'chat-in';
+    return `
+      <div class="chat-bubble ${bubbleClass}">
+        <div>${text}${status}</div>
+        ${mediaHtml}
+        <div class="chat-meta">${when}</div>
+      </div>
+    `;
+  }).join('');
+  container.innerHTML = html;
 }
 
 // ===== VISÃO GERAL =====

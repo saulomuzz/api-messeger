@@ -4,8 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin - Dashboard Profissional</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/remixicon@3.5.0/fonts/remixicon.css" rel="stylesheet">
+    
     
     <style>
         :root {
@@ -188,6 +187,28 @@
         .btn-danger { background: var(--danger); color: white; }
         .btn-success { background: var(--success); color: white; }
 
+        /* Videos */
+        .video-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+        .video-card { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 16px; }
+        .video-header { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+        .video-title { font-weight: 600; margin-bottom: 6px; }
+        .video-meta { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
+        .video-actions { display: flex; align-items: flex-start; gap: 8px; }
+        .video-player { width: 100%; border-radius: 10px; background: #000; }
+
+        /* WhatsApp Audit */
+        .chat-layout { display: grid; grid-template-columns: 280px 1fr; gap: 16px; }
+        .chat-sidebar { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 12px; max-height: 70vh; overflow: auto; }
+        .chat-list-item { padding: 10px; border-radius: 8px; cursor: pointer; border: 1px solid transparent; }
+        .chat-list-item:hover { background: rgba(0,0,0,0.04); }
+        .chat-list-item.active { border-color: var(--primary); background: rgba(79,70,229,0.08); }
+        .chat-messages { background: var(--bg-card); border: 1px solid var(--border-color); border-radius: 12px; padding: 16px; max-height: 70vh; overflow: auto; }
+        .chat-bubble { max-width: 70%; padding: 10px 12px; border-radius: 12px; margin-bottom: 8px; font-size: 14px; }
+        .chat-in { background: #f0f0f0; margin-right: auto; }
+        .chat-out { background: #d9fdd3; margin-left: auto; }
+        .chat-status { background: #eef2ff; margin: 0 auto 8px; text-align: center; font-size: 12px; }
+        .chat-meta { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+
         /* Badges */
         .badge { padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 600; text-transform: uppercase; display: inline-block; }
         
@@ -281,6 +302,12 @@
             </button>
             <button class="nav-item" onclick="switchTab('devices', event)">
                 <i class="ri-cpu-line"></i> Dispositivos
+            </button>
+            <button class="nav-item" onclick="switchTab('videos', event)">
+                <i class="ri-video-line"></i> Vídeos
+            </button>
+            <button class="nav-item" onclick="switchTab('whatsapp-audit', event)">
+                <i class="ri-chat-3-line"></i> WhatsApp Chat
             </button>
             <button class="nav-item" onclick="switchTab('migrations', event)">
                 <i class="ri-exchange-line"></i> Migrações
@@ -522,6 +549,55 @@
                 <div class="table-container" id="devicesTable"><div class="loading-spinner"></div></div>
             </div>
 
+            <div id="tab-videos" class="tab-content">
+                <h3 class="section-title">🎥 Vídeos Gravados</h3>
+                <div class="form-card">
+                    <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                        <input type="text" id="videoSearchInput" placeholder="Buscar por ID, número ou status..." style="flex: 2;" onkeypress="if(event.key==='Enter') applyVideoFilters()">
+                        <select id="videoStatusFilter" style="flex: 1;">
+                            <option value="">Status (Todos)</option>
+                            <option value="ready">Pronto</option>
+                            <option value="processing">Processando</option>
+                            <option value="failed">Falha</option>
+                        </select>
+                        <select id="videoSortSelect" style="flex: 1;">
+                            <option value="createdAt_desc">Mais recentes</option>
+                            <option value="createdAt_asc">Mais antigos</option>
+                            <option value="views_desc">Mais vistos</option>
+                            <option value="views_asc">Menos vistos</option>
+                            <option value="expiresAt_asc">Expiram primeiro</option>
+                            <option value="expiresAt_desc">Expiram por último</option>
+                        </select>
+                        <button class="btn-primary" onclick="applyVideoFilters()">Aplicar</button>
+                        <button class="btn-secondary" onclick="clearVideoFilters()">Limpar</button>
+                    </div>
+                </div>
+                <div id="videosContainer">
+                    <div class="loading-spinner"></div>
+                </div>
+            </div>
+
+            <div id="tab-whatsapp-audit" class="tab-content">
+                <h3 class="section-title">💬 Histórico WhatsApp</h3>
+                <div class="form-card">
+                    <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                        <input type="text" id="auditSearchInput" placeholder="Buscar número..." style="flex: 2;" onkeypress="if(event.key==='Enter') loadWhatsappThreads()">
+                        <button class="btn-primary" onclick="loadWhatsappThreads()">Buscar</button>
+                    </div>
+                </div>
+                <div class="chat-layout">
+                    <div class="chat-sidebar">
+                        <div id="auditThreads" class="loading-spinner"></div>
+                    </div>
+                    <div class="chat-messages">
+                        <div id="auditMessages" class="empty-state">
+                            <div class="empty-state-icon">💬</div>
+                            Selecione uma conversa para visualizar
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <div id="tab-migrations" class="tab-content">
                 <div class="form-card">
                     <div style="display: flex; gap: 12px; flex-wrap: wrap;">
@@ -736,7 +812,7 @@
         </div>
     </div>
 
-    <script src="/admin/static/js/dashboard.js"></script>
+    <script src="/admin/static/js/dashboard.js?v=20260118-1"></script>
     <script>
         // --- UI UTILS ---
         function toggleSidebar() {

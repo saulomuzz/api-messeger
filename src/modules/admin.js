@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 
-function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOfficial, websocketESP32, getClientIp, getAbuseIPDB, tuya, getCurrentTuyaMonitor, getCurrentComedorDeviceStatus }) {
+function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOfficial, websocketESP32, getClientIp, getAbuseIPDB, tuya, getCurrentTuyaMonitor, getCurrentComedorDeviceStatus, getCurrentRoutesModule }) {
   const { log, warn, err, dbg } = logger;
   
   // Debug: verifica se tuyaMonitor foi recebido
@@ -51,7 +51,14 @@ function initAdminModule({ app, appRoot, logger, getCurrentIpBlocker, whatsappOf
   }));
   
   // Registra rotas do dashboard
-  createDashboardRoutes({ app, requireAuth, dashboardController, logger });
+  createDashboardRoutes({
+    app,
+    requireAuth,
+    dashboardController,
+    logger,
+    getVideoManager: getCurrentRoutesModule,
+    getAuditStore: getCurrentIpBlocker
+  });
   
   // Expõe statisticsModel globalmente para outros módulos
   global.statisticsModel = statisticsModel;

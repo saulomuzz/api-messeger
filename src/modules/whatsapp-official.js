@@ -23,6 +23,7 @@ const path = require('path');
  * @param {Object} config.ipBlocker - Módulo de bloqueio de IPs
  * @param {string} config.numbersFile - Arquivo com números autorizados
  * @param {string} config.recordDurationSec - Duração padrão de gravação
+ * @param {number} config.videoViewHours - Tempo de visualização de vídeos (horas)
  * @returns {Object} API do módulo WhatsApp Business
  */
 function initWhatsAppOfficialModule({
@@ -38,7 +39,8 @@ function initWhatsAppOfficialModule({
   ipBlocker,
   numbersFile,
   recordDurationSec,
-  whatsappMaxVideoSizeMB = 16
+  whatsappMaxVideoSizeMB = 16,
+  videoViewHours = 24
 }) {
   const { log, dbg, warn, err } = logger;
   const { normalizeBR, isNumberAuthorized } = utils;
@@ -54,7 +56,10 @@ function initWhatsAppOfficialModule({
   let isReady = true; // API oficial sempre está "pronta" (não precisa de QR)
   let tempVideoProcessor = null; // Função para processar vídeos temporários
   let listVideosFunction = null; // Função para listar histórico de vídeos
+  let getVideoIdByMessageIdFunction = null; // Função para resolver vídeo via messageId
+  let addPendingVideoRequestFunction = null; // Função para registrar pedido pendente
   let triggerSnapshotFunction = null; // Função para disparar snapshot manualmente
+  const VIDEO_VIEW_HOURS = Number.isFinite(Number(videoViewHours)) && Number(videoViewHours) > 0 ? Number(videoViewHours) : 24;
   
   /**
    * Divide mensagem longa em partes menores (limite do WhatsApp: 4096 caracteres)
@@ -100,6 +105,86 @@ function initWhatsAppOfficialModule({
     }
     
     return parts;
+  }
+
+  function sanitizePayload(payload) {
+    if (!payload) return null;
+    const clone = JSON.parse(JSON.stringify(payload));
+    if (clone.base64) delete clone.base64;
+    if (clone.file) delete clone.file;
+    if (clone.buffer) delete clone.buffer;
+    return clone;
+  }
+
+  function normalizeAuditPhone(phone) {
+    if (!phone) return null;
+    let digits = String(phone).replace(/\D/g, '');
+    if (digits.startsWith('55') && digits.length === 13 && digits[4] === '9') {
+      digits = `${digits.slice(0, 4)}${digits.slice(5)}`;
+    }
+    return digits;
+  }
+
+  async function logAuditEvent({
+    direction,
+    phone,
+    messageId,
+    type,
+    status,
+    timestamp,
+    payload,
+    errorCode,
+    errorMessage
+  }) {
+    if (!ipBlocker || !ipBlocker.logWhatsappAudit) return;
+    try {
+      const normalizedPhone = normalizeAuditPhone(phone);
+      await ipBlocker.logWhatsappAudit({
+        direction,
+        phone: normalizedPhone,
+        messageId,
+        type,
+        status,
+        timestamp,
+        payload: sanitizePayload(payload),
+        errorCode,
+        errorMessage
+      });
+    } catch (e) {
+      dbg(`[WHATSAPP-API] Erro ao registrar auditoria:`, e.message);
+    }
+  }
+
+  function buildInboundPayload(message) {
+    if (!message) return null;
+    const base = {
+      id: message.id,
+      type: message.type,
+      timestamp: message.timestamp,
+      context: message.context || null
+    };
+    if (message.text?.body) {
+      base.text = { body: message.text.body };
+    }
+    if (message.button) {
+      base.button = { text: message.button.text, payload: message.button.payload };
+    }
+    if (message.interactive) {
+      base.interactive = message.interactive;
+    }
+    if (message.image) {
+      base.image = { id: message.image.id, mime_type: message.image.mime_type, caption: message.image.caption };
+    }
+    if (message.video) {
+      base.video = { id: message.video.id, mime_type: message.video.mime_type, caption: message.video.caption };
+    }
+    if (message.audio) {
+      base.audio = { id: message.audio.id, mime_type: message.audio.mime_type };
+    }
+    if (message.document) {
+      base.document = { id: message.document.id, mime_type: message.document.mime_type, filename: message.document.filename, caption: message.document.caption };
+    }
+    return base;
   }
   
   /**
@@ -147,6 +232,19 @@ function initWhatsAppOfficialModule({
         
         const messageId = response.data.messages?.[0]?.id || 'unknown';
         log(`[WHATSAPP-API] ✅ Mensagem${partNumber} enviada com sucesso para ${toNumber}: ${messageId}`);
+        
+        await logAuditEvent({
+          direction: 'out',
+          phone: toNumber,
+          messageId,
+          type: 'text',
+          status: 'sent',
+          payload: {
+            text: part,
+            partIndex: i + 1,
+            totalParts: parts.length
+          }
+        });
         
         // Incrementa estatística de mensagem enviada
         if (global.statisticsModel) {
@@ -198,8 +296,27 @@ function initWhatsAppOfficialModule({
         }
         
         dbg(`[WHATSAPP-API] Detalhes completos:`, JSON.stringify(errorData, null, 2));
+        await logAuditEvent({
+          direction: 'out',
+          phone: String(to).replace(/^\+/, ''),
+          messageId: null,
+          type: 'text',
+          status: 'failed',
+          payload: { text: message },
+          errorCode: errorData.error?.code,
+          errorMessage: errorData.error?.message
+        });
       } else {
         err(`[WHATSAPP-API] ❌ Erro ao enviar mensagem para ${to}:`, error.message);
+        await logAuditEvent({
+          direction: 'out',
+          phone: String(to).replace(/^\+/, ''),
+          messageId: null,
+          type: 'text',
+          status: 'failed',
+          payload: { text: message },
+          errorMessage: error.message
+        });
       }
       throw error;
     }
@@ -251,9 +368,27 @@ function initWhatsAppOfficialModule({
       );
       
       log(`[WHATSAPP-API] Mensagem interativa enviada para ${toNumber}`);
+      await logAuditEvent({
+        direction: 'out',
+        phone: toNumber,
+        messageId: response.data.messages?.[0]?.id || null,
+        type: 'interactive',
+        status: 'sent',
+        payload: { text, buttons, footer }
+      });
       return response.data;
     } catch (error) {
       err(`[WHATSAPP-API] Erro ao enviar botões interativos:`, error.response?.data || error.message);
+      await logAuditEvent({
+        direction: 'out',
+        phone: String(to).replace(/^\+/, ''),
+        messageId: null,
+        type: 'interactive',
+        status: 'failed',
+        payload: { text, buttons, footer },
+        errorCode: error.response?.data?.error?.code,
+        errorMessage: error.response?.data?.error?.message || error.message
+      });
       throw error;
     }
   }
@@ -299,9 +434,27 @@ function initWhatsAppOfficialModule({
       );
       
       log(`[WHATSAPP-API] List Message enviada para ${toNumber}`);
+      await logAuditEvent({
+        direction: 'out',
+        phone: toNumber,
+        messageId: response.data.messages?.[0]?.id || null,
+        type: 'interactive_list',
+        status: 'sent',
+        payload: { title, description, buttonText, sections }
+      });
       return response.data;
     } catch (error) {
       err(`[WHATSAPP-API] Erro ao enviar List Message:`, error.response?.data || error.message);
+      await logAuditEvent({
+        direction: 'out',
+        phone: String(to).replace(/^\+/, ''),
+        messageId: null,
+        type: 'interactive_list',
+        status: 'failed',
+        payload: { title, description, buttonText },
+        errorCode: error.response?.data?.error?.code,
+        errorMessage: error.response?.data?.error?.message || error.message
+      });
       throw error;
     }
   }
@@ -408,9 +561,27 @@ function initWhatsAppOfficialModule({
       );
       
       log(`[WHATSAPP-API] Mídia ${mediaType} enviada para ${toNumber}`);
+      await logAuditEvent({
+        direction: 'out',
+        phone: toNumber,
+        messageId: response.data.messages?.[0]?.id || null,
+        type: mediaType,
+        status: 'sent',
+        payload: { mediaUrl, caption }
+      });
       return response.data;
     } catch (error) {
       err(`[WHATSAPP-API] Erro ao enviar mídia:`, error.response?.data || error.message);
+      await logAuditEvent({
+        direction: 'out',
+        phone: String(to).replace(/^\+/, ''),
+        messageId: null,
+        type: mediaType,
+        status: 'failed',
+        payload: { mediaUrl, caption },
+        errorCode: error.response?.data?.error?.code,
+        errorMessage: error.response?.data?.error?.message || error.message
+      });
       throw error;
     }
   }
@@ -453,6 +624,14 @@ function initWhatsAppOfficialModule({
       );
       
       log(`[WHATSAPP-API] Mídia ${mediaType} (ID: ${mediaId}) enviada para ${toNumber}`);
+      await logAuditEvent({
+        direction: 'out',
+        phone: toNumber,
+        messageId: response.data.messages?.[0]?.id || null,
+        type: mediaType,
+        status: 'sent',
+        payload: { mediaId, caption }
+      });
       
       // Retorna formato compatível com whatsapp-web.js
       return {
@@ -463,6 +642,16 @@ function initWhatsAppOfficialModule({
       };
     } catch (error) {
       err(`[WHATSAPP-API] Erro ao enviar mídia por ID:`, error.response?.data || error.message);
+      await logAuditEvent({
+        direction: 'out',
+        phone: String(to).replace(/^\+/, ''),
+        messageId: null,
+        type: mediaType,
+        status: 'failed',
+        payload: { mediaId, caption },
+        errorCode: error.response?.data?.error?.code,
+        errorMessage: error.response?.data?.error?.message || error.message
+      });
       throw error;
     }
   }
@@ -505,7 +694,7 @@ function initWhatsAppOfficialModule({
       const toNumber = normalized.replace(/^\+/, '');
       
       // Lista de templates MARKETING que requerem opt-in
-      const marketingTemplates = ['alerta_campainha'];
+      const marketingTemplates = [];
       
       // Verifica opt-in para templates MARKETING
       if (marketingTemplates.includes(templateName)) {
@@ -560,6 +749,15 @@ function initWhatsAppOfficialModule({
       const messageId = response.data.messages?.[0]?.id || 'unknown';
       log(`[WHATSAPP-API] ✅ Template "${templateName}" enviado para ${toNumber}: ${messageId}`);
       
+      await logAuditEvent({
+        direction: 'out',
+        phone: toNumber,
+        messageId,
+        type: 'template',
+        status: 'sent',
+        payload: { templateName, languageCode, components }
+      });
+      
       // Incrementa estatística de mensagem enviada
       if (global.statisticsModel) {
         global.statisticsModel.incrementSent();
@@ -595,8 +793,27 @@ function initWhatsAppOfficialModule({
           
           dbg(`[WHATSAPP-API] Código de erro: ${errorCode}, Mensagem: ${errorMessage}`);
         }
+        await logAuditEvent({
+          direction: 'out',
+          phone: String(to).replace(/^\+/, ''),
+          messageId: null,
+          type: 'template',
+          status: 'failed',
+          payload: { templateName, languageCode },
+          errorCode: errorData.error?.code,
+          errorMessage: errorData.error?.message
+        });
       } else {
         err(`[WHATSAPP-API] ❌ Erro ao enviar template "${templateName}":`, error.message);
+        await logAuditEvent({
+          direction: 'out',
+          phone: String(to).replace(/^\+/, ''),
+          messageId: null,
+          type: 'template',
+          status: 'failed',
+          payload: { templateName, languageCode },
+          errorMessage: error.message
+        });
       }
       throw error;
     }
@@ -728,6 +945,16 @@ function initWhatsAppOfficialModule({
             
             log(`[WHATSAPP-API] Status de entrega: ${statusType} para ${recipientId} (msgId: ${messageId})`);
             
+            await logAuditEvent({
+              direction: 'status',
+              phone: recipientId,
+              messageId,
+              type: 'status',
+              status: statusType,
+              timestamp,
+              payload: { status }
+            });
+            
             if (statusType === 'sent') {
               dbg(`[WHATSAPP-API] ✅ Mensagem ${messageId} enviada para ${recipientId}`);
             } else if (statusType === 'delivered') {
@@ -739,6 +966,18 @@ function initWhatsAppOfficialModule({
               const errorCode = error?.code;
               const errorMessage = error?.message;
               const errorDetails = error?.error_data;
+              
+              await logAuditEvent({
+                direction: 'status',
+                phone: recipientId,
+                messageId,
+                type: 'status',
+                status: statusType,
+                timestamp,
+                payload: { errorDetails },
+                errorCode,
+                errorMessage
+              });
               
               err(`[WHATSAPP-API] ❌ Mensagem ${messageId} falhou para ${recipientId}`);
               err(`[WHATSAPP-API] Código: ${errorCode}, Mensagem: ${errorMessage}`);
@@ -778,6 +1017,16 @@ function initWhatsAppOfficialModule({
             log(`[WHATSAPP-API] Processando mensagem tipo: ${messageType} de ${from} (ID: ${messageId})`);
             dbg(`[WHATSAPP-API] Mensagem completa:`, JSON.stringify(message, null, 2));
             
+            await logAuditEvent({
+              direction: 'in',
+              phone: from,
+              messageId,
+              type: messageType,
+              status: 'received',
+              timestamp: message.timestamp,
+              payload: buildInboundPayload(message)
+            });
+            
             // Incrementa estatística de mensagem recebida
             if (global.statisticsModel) {
               global.statisticsModel.incrementReceived();
@@ -810,6 +1059,24 @@ function initWhatsAppOfficialModule({
               warn(`[WHATSAPP-API] Tipo interativo desconhecido: ${interactiveResponse?.type}`);
             }
             
+            // Processa mensagens de botão (quick reply de template)
+            if (messageType === 'button') {
+              const buttonText = message.button?.text || message.button?.payload || '';
+              log(`[WHATSAPP-API] Botão quick reply recebido de ${from}: "${buttonText}"`);
+              const contextMessageId = message.context?.id || message.context?.message_id || message.context?.messageId || null;
+              const buttonLower = String(buttonText || '').toLowerCase().trim();
+              if (buttonLower === 'ver gravação' || buttonLower === 'ver gravacao' || buttonLower === 'ver gravaçao' || buttonLower === 'vergravacao' || buttonLower === 'vergravação') {
+                await handleVideoRequest(from, contextMessageId, false);
+              } else if (buttonLower === 'mais opções' || buttonLower === 'mais opcoes' || buttonLower === 'mais opção' || buttonLower === 'mais opcao') {
+                await sendOptionsMenu(from);
+              } else if (buttonText) {
+                await handleTextMessage(from, buttonText, messageId);
+              } else {
+                warn(`[WHATSAPP-API] Botão quick reply sem texto/payload de ${from}`);
+              }
+              continue;
+            }
+
             // Processa mensagens de texto
             if (messageType === 'text') {
               const text = message.text?.body || '';
@@ -832,10 +1099,22 @@ function initWhatsAppOfficialModule({
               // Verifica se há context (pode indicar resposta a botão)
               if (message.context) {
                 log(`[WHATSAPP-API] Mensagem de texto com context detectada de ${from}. Context:`, JSON.stringify(message.context));
+                const contextMessageId = message.context?.id || message.context?.message_id || message.context?.messageId || null;
                 // Se o texto corresponde a um ID de botão conhecido, trata como resposta interativa
-                if (text === 'btn_ver_opcoes' || text.toLowerCase().includes('ver opções') || text.toLowerCase().includes('ver opcoes')) {
+                if (
+                  text === 'btn_ver_opcoes' ||
+                  text.toLowerCase().includes('ver opções') ||
+                  text.toLowerCase().includes('ver opcoes') ||
+                  text.toLowerCase().includes('mais opções') ||
+                  text.toLowerCase().includes('mais opcoes')
+                ) {
                   log(`[WHATSAPP-API] Texto parece ser resposta de botão: "${text}"`);
                   await handleInteractiveResponse(from, 'btn_ver_opcoes', text);
+                  continue;
+                }
+                if (text.toLowerCase().includes('ver grava')) {
+                  log(`[WHATSAPP-API] Texto parece ser resposta de "Ver Gravação": "${text}"`);
+                  await handleVideoRequest(from, contextMessageId, false);
                   continue;
                 }
               }
@@ -988,7 +1267,7 @@ function initWhatsAppOfficialModule({
       // Formata lista de vídeos com informações detalhadas
       let message = `📹 *Histórico de Vídeos*\n\n`;
       message += `📊 *Total:* ${videos.length} vídeo(s) disponível(is)\n`;
-      message += `⏰ *Válidos por:* 24 horas após gravação\n\n`;
+      message += `⏰ *Válidos por:* ${VIDEO_VIEW_HOURS} hora(s) após gravação\n\n`;
       message += `━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
       
       displayVideos.forEach((video, index) => {
@@ -1004,7 +1283,7 @@ function initWhatsAppOfficialModule({
         
         // Calcula tempo restante
         const now = Date.now();
-        const expiresAt = video.expiresAt || (video.createdAt + (24 * 60 * 60 * 1000));
+        const expiresAt = video.expiresAt || (video.createdAt + (VIDEO_VIEW_HOURS * 60 * 60 * 1000));
         const timeRemaining = expiresAt - now;
         const hoursRemaining = Math.floor(timeRemaining / (60 * 60 * 1000));
         const minutesRemaining = Math.floor((timeRemaining % (60 * 60 * 1000)) / (60 * 1000));
@@ -1039,7 +1318,7 @@ function initWhatsAppOfficialModule({
       message += `\n💡 *Como usar:*\n`;
       message += `• Digite \`!video <ID>\` para ver um vídeo\n`;
       message += `• Ou clique no botão "Ver Vídeo" quando receber a notificação\n`;
-      message += `• Vídeos expiram automaticamente após 24 horas`;
+      message += `• Vídeos expiram automaticamente após ${VIDEO_VIEW_HOURS} hora(s)`;
       
       // Tenta enviar com List Message (permite mais opções que botões)
       if (displayVideos.length > 0 && sendListMessage) {
@@ -1160,7 +1439,7 @@ function initWhatsAppOfficialModule({
           {
             id: 'opt_videos',
             title: '📹 Histórico de Vídeos',
-            description: 'Ver vídeos gravados recentemente (últimas 24h)'
+            description: `Ver vídeos gravados recentemente (últimas ${VIDEO_VIEW_HOURS}h)`
           },
           {
             id: 'opt_blocked_ips',
@@ -1215,7 +1494,7 @@ function initWhatsAppOfficialModule({
             '💡 *Luzes Ligadas*\n   Ver quantas luzes estão ligadas\n\n' +
             '📸 *Snapshot da Câmera*\n   Tirar foto instantânea\n\n' +
             '🎥 *Gravar Vídeo*\n   Gravar vídeo da câmera\n\n' +
-            '📹 *Histórico de Vídeos*\n   Ver vídeos recentes (24h)\n\n' +
+            `📹 *Histórico de Vídeos*\n   Ver vídeos recentes (${VIDEO_VIEW_HOURS}h)\n\n` +
             '🛡️ *IPs Bloqueados*\n   Ver lista de IPs bloqueados\n\n' +
             '❓ *Ajuda*\n   Ver comandos disponíveis',
             [
@@ -1559,6 +1838,106 @@ function initWhatsAppOfficialModule({
   /**
    * Processa mensagem de texto recebida
    */
+  function formatVideoError(errorCode) {
+    switch (errorCode) {
+      case 'processing':
+        return '⏳ Vídeo em processamento. Assim que pronto lhe será enviado.';
+      case 'expired':
+        return '⏰ Este vídeo expirou e não está mais disponível.';
+      case 'not_found':
+        return '⏰ Este vídeo expirou ou foi removido.';
+      case 'failed':
+        return '❌ Falha ao gerar o vídeo. Tente novamente mais tarde.';
+      default:
+        return `❌ ${errorCode || 'Erro ao processar vídeo'}`;
+    }
+  }
+
+  async function handleVideoRequest(from, contextMessageId = null, fallbackToLatest = true) {
+    // Busca vídeo associado ao messageId do template (quando disponível)
+    let videoId = null;
+    if (contextMessageId && getVideoIdByMessageIdFunction) {
+      try {
+        videoId = getVideoIdByMessageIdFunction(contextMessageId, from);
+      } catch (e) {
+        dbg(`[WHATSAPP-API] Erro ao resolver vídeo por messageId:`, e.message);
+      }
+    }
+    
+    // Fallback: vídeo mais recente do usuário
+    if (!videoId && fallbackToLatest) {
+      if (!listVideosFunction) {
+        await sendTextMessage(from, '❌ Sistema de vídeos não disponível.');
+        return;
+      }
+      const videos = listVideosFunction(from);
+      if (videos.length === 0) {
+        await sendTextMessage(from, '❌ Nenhum vídeo disponível no momento.');
+        return;
+      }
+      videoId = videos[0].videoId;
+    }
+    
+    if (!videoId) {
+      await sendTextMessage(from, formatVideoError('not_found'));
+      return;
+    }
+    
+    if (!tempVideoProcessor) {
+      await sendTextMessage(from, '❌ Sistema de vídeos temporários não disponível.');
+      return;
+    }
+    
+    const result = tempVideoProcessor(videoId, from);
+    if (!result.success) {
+      if (result.error === 'processing' && addPendingVideoRequestFunction) {
+        addPendingVideoRequestFunction(videoId, from);
+      }
+      await sendTextMessage(from, formatVideoError(result.error));
+      return;
+    }
+    
+    if (!fs.existsSync(result.filePath)) {
+      await sendTextMessage(from, '❌ Arquivo de vídeo não encontrado.');
+      return;
+    }
+    
+    // Divide vídeo em partes se necessário
+    let videoParts;
+    if (camera && camera.splitVideoIfNeeded) {
+      videoParts = await camera.splitVideoIfNeeded(result.filePath);
+      log(`[WHATSAPP-API] Vídeo dividido em ${videoParts.length} parte(s)`);
+    } else {
+      warn(`[WHATSAPP-API] Função splitVideoIfNeeded não disponível, usando arquivo original`);
+      videoParts = [result.filePath];
+    }
+    
+    // Envia cada parte
+    for (let i = 0; i < videoParts.length; i++) {
+      const partFile = videoParts[i];
+      const partBuffer = fs.readFileSync(partFile);
+      const partNumber = videoParts.length > 1 ? ` (Parte ${i + 1}/${videoParts.length})` : '';
+      const caption = `🎥 Vídeo da campainha${partNumber}`;
+      
+      try {
+        await sendTextMessage(from, `⏳ Enviando vídeo${partNumber}...`);
+        const videoBase64 = partBuffer.toString('base64');
+        await sendMediaFromBase64(from, videoBase64, 'video/mp4', caption);
+        log(`[WHATSAPP-API] Parte ${i + 1}/${videoParts.length} do vídeo ${videoId} enviada para ${from}`);
+        
+        if (i < videoParts.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+      } catch (sendError) {
+        err(`[WHATSAPP-API] Erro ao enviar parte ${i + 1}/${videoParts.length}:`, sendError.message);
+        await sendTextMessage(from, `❌ Erro ao enviar parte ${i + 1}/${videoParts.length}: ${sendError.message}`);
+      }
+    }
+  }
+
+  /**
+   * Processa mensagem de texto recebida
+   */
   async function handleTextMessage(from, text, messageId) {
     dbg(`[WHATSAPP-API] Mensagem recebida de ${from}: "${text}"`);
     
@@ -1594,79 +1973,11 @@ function initWhatsAppOfficialModule({
       return;
     }
     
-    // Processa resposta "Ver Gravação" do template alerta_campainha
+    // Processa resposta "Ver Gravação" do template status_portao
     if (msgLower === 'ver gravação' || msgLower === 'ver gravacao' || msgLower === 'ver gravaçao' || msgLower === 'vergravação' || msgLower === 'vergravacao') {
       log(`[WHATSAPP-API] Resposta "Ver Gravação" recebida de ${from}`);
       try {
-        // Busca o vídeo mais recente para este número
-        if (!listVideosFunction) {
-          await sendTextMessage(from, '❌ Sistema de vídeos não disponível.');
-          return;
-        }
-        
-        const videos = listVideosFunction(from);
-        if (videos.length === 0) {
-          await sendTextMessage(from, '❌ Nenhum vídeo disponível no momento.');
-          return;
-        }
-        
-        // Pega o vídeo mais recente
-        const latestVideo = videos[0];
-        const videoId = latestVideo.videoId;
-        
-        log(`[WHATSAPP-API] Enviando vídeo mais recente ${videoId} para ${from}`);
-        
-        if (!tempVideoProcessor) {
-          await sendTextMessage(from, '❌ Sistema de vídeos temporários não disponível.');
-          return;
-        }
-        
-        const result = tempVideoProcessor(videoId, from);
-        
-        if (!result.success) {
-          await sendTextMessage(from, `❌ ${result.error || 'Erro ao processar vídeo'}`);
-          return;
-        }
-        
-        if (!fs.existsSync(result.filePath)) {
-          await sendTextMessage(from, '❌ Arquivo de vídeo não encontrado.');
-          return;
-        }
-        
-        // Divide vídeo em partes se necessário
-        let videoParts;
-        if (camera && camera.splitVideoIfNeeded) {
-          videoParts = await camera.splitVideoIfNeeded(result.filePath);
-          log(`[WHATSAPP-API] Vídeo dividido em ${videoParts.length} parte(s)`);
-        } else {
-          warn(`[WHATSAPP-API] Função splitVideoIfNeeded não disponível, usando arquivo original`);
-          videoParts = [result.filePath];
-        }
-        
-        // Envia cada parte
-        for (let i = 0; i < videoParts.length; i++) {
-          const partFile = videoParts[i];
-          const partBuffer = fs.readFileSync(partFile);
-          const partSizeMB = partBuffer.length / 1024 / 1024;
-          
-          const partNumber = videoParts.length > 1 ? ` (Parte ${i + 1}/${videoParts.length})` : '';
-          const caption = `🎥 Vídeo da campainha${partNumber}`;
-          
-          try {
-            await sendTextMessage(from, `⏳ Enviando vídeo${partNumber}...`);
-            const videoBase64 = partBuffer.toString('base64');
-            await sendMediaFromBase64(from, videoBase64, 'video/mp4', caption);
-            log(`[WHATSAPP-API] Parte ${i + 1}/${videoParts.length} do vídeo ${videoId} enviada para ${from}`);
-            
-            // Aguarda entre envios
-            if (i < videoParts.length - 1) {
-              await new Promise(resolve => setTimeout(resolve, 2000));
-            }
-          } catch (sendError) {
-            err(`[WHATSAPP-API] Erro ao enviar parte ${i + 1}/${videoParts.length}:`, sendError.message);
-            await sendTextMessage(from, `❌ Erro ao enviar parte ${i + 1}/${videoParts.length}: ${sendError.message}`);
-          }
-        }
+        await handleVideoRequest(from);
       } catch (e) {
         err(`[WHATSAPP-API] Erro ao processar "Ver Gravação":`, e.message);
         await sendTextMessage(from, `❌ Erro ao processar vídeo: ${e.message}`);
@@ -1685,8 +1996,18 @@ function initWhatsAppOfficialModule({
       return;
     }
     
-    // Processa botão "Ver opções" (mantido para compatibilidade, mas agora envia menu completo diretamente)
-    if (text === 'btn_ver_opcoes' || msgLower === 'ver opções' || msgLower === 'ver opcoes' || msgLower === 'ver opção' || msgLower === 'ver opcao') {
+    // Processa botão "Ver opções"/"Mais opções"
+    if (
+      text === 'btn_ver_opcoes' ||
+      msgLower === 'ver opções' ||
+      msgLower === 'ver opcoes' ||
+      msgLower === 'ver opção' ||
+      msgLower === 'ver opcao' ||
+      msgLower === 'mais opções' ||
+      msgLower === 'mais opcoes' ||
+      msgLower === 'mais opção' ||
+      msgLower === 'mais opcao'
+    ) {
       log(`[WHATSAPP-API] Botão "Ver opções" detectado de ${from}`);
       try {
         await sendOptionsMenu(from); // Agora envia menu completo diretamente
@@ -1808,10 +2129,13 @@ function initWhatsAppOfficialModule({
       try {
         const result = tempVideoProcessor(videoId, from);
         
-        if (!result.success) {
-          await sendTextMessage(from, `❌ ${result.error || 'Erro ao processar vídeo'}`);
-          return;
+      if (!result.success) {
+        if (result.error === 'processing' && addPendingVideoRequestFunction) {
+          addPendingVideoRequestFunction(videoId, from);
         }
+        await sendTextMessage(from, formatVideoError(result.error));
+        return;
+      }
         
         // Lê o arquivo de vídeo
         
@@ -2408,7 +2732,10 @@ function initWhatsAppOfficialModule({
         
         if (!result.success) {
           err(`[WHATSAPP-API] Erro ao processar vídeo ${videoId}: ${result.error}`);
-          await sendTextMessage(from, `❌ ${result.error || 'Erro ao processar vídeo'}`);
+          if (result.error === 'processing' && addPendingVideoRequestFunction) {
+            addPendingVideoRequestFunction(videoId, normalizedFrom);
+          }
+          await sendTextMessage(from, formatVideoError(result.error));
           return;
         }
         
@@ -2631,6 +2958,14 @@ function initWhatsAppOfficialModule({
     setListVideosFunction: (listFunction) => {
       listVideosFunction = listFunction;
       log(`[WHATSAPP-API] Função de listagem de vídeos configurada`);
+    },
+    setGetVideoIdByMessageIdFunction: (getter) => {
+      getVideoIdByMessageIdFunction = getter;
+      log(`[WHATSAPP-API] Função de resolução de vídeo por messageId configurada`);
+    },
+    setAddPendingVideoRequestFunction: (adder) => {
+      addPendingVideoRequestFunction = adder;
+      log(`[WHATSAPP-API] Função de pedidos pendentes configurada`);
     },
     setTriggerSnapshotFunction: (triggerFunction) => {
       triggerSnapshotFunction = triggerFunction;

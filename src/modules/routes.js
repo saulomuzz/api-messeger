@@ -50,6 +50,8 @@ function initRoutesModule({
   enableVideoRecording = true,
   videoRecordDurationSec = 15,
   minVideoRecordIntervalMs = 60000,
+  videoViewHours = 24,
+  videoRetentionHours = 24,
   strictRateLimit,
   comedorMessageTemplate,
   comedorApiToken
@@ -97,10 +99,11 @@ function initRoutesModule({
   const VIDEO_RECORD_DURATION_SEC = videoRecordDurationSec; // Configurável via .env
   const MIN_VIDEO_RECORD_INTERVAL_MS = minVideoRecordIntervalMs; // Configurável via .env
   
-  // Sistema de gerenciamento de vídeos temporários (24 horas)
+  // Sistema de gerenciamento de vídeos temporários (configurável via .env)
   const TEMP_VIDEOS_DIR = path.join(recordingsDir || path.join(__dirname, '..', '..', 'recordings'), 'temp_videos');
   const TEMP_VIDEOS_DB = path.join(TEMP_VIDEOS_DIR, 'videos_db.json');
-  const VIDEO_EXPIRY_HOURS = 24;
+  const VIDEO_VIEW_HOURS = Number.isFinite(Number(videoViewHours)) && Number(videoViewHours) > 0 ? Number(videoViewHours) : 24;
+  const VIDEO_RETENTION_HOURS = Number.isFinite(Number(videoRetentionHours)) && Number(videoRetentionHours) > 0 ? Number(videoRetentionHours) : VIDEO_VIEW_HOURS;
   
   // Garante que o diretório existe
   if (!fs.existsSync(TEMP_VIDEOS_DIR)) {
@@ -137,7 +140,8 @@ function initRoutesModule({
     const expired = [];
     
     for (const [videoId, videoData] of Object.entries(db)) {
-      if (now > videoData.expiresAt) {
+    const retentionExpiresAt = videoData.retentionExpiresAt || videoData.expiresAt;
+    if (retentionExpiresAt && now > retentionExpiresAt) {
         expired.push(videoId);
         // Remove arquivo
         if (videoData.filePath && fs.existsSync(videoData.filePath)) {
@@ -155,6 +159,27 @@ function initRoutesModule({
       expired.forEach(id => delete db[id]);
       saveTempVideosDB(db);
       log(`[TEMP-VIDEOS] ${expired.length} vídeo(s) expirado(s) removido(s)`);
+    }
+
+    // Remove arquivos órfãos no diretório de gravações (não listados no DB)
+    try {
+      const retentionMs = VIDEO_RETENTION_HOURS * 60 * 60 * 1000;
+      const dbFilePaths = new Set(Object.values(db).map(v => v.filePath).filter(Boolean));
+      if (fs.existsSync(recordingsDir || '')) {
+        const files = fs.readdirSync(recordingsDir);
+        for (const file of files) {
+          if (!file.startsWith('recording_') || !file.endsWith('.mp4')) continue;
+          const filePath = path.join(recordingsDir, file);
+          if (dbFilePaths.has(filePath)) continue;
+          const stat = fs.statSync(filePath);
+          if (Date.now() - stat.mtimeMs > retentionMs) {
+            fs.unlinkSync(filePath);
+            log(`[TEMP-VIDEOS] Arquivo órfão removido: ${filePath}`);
+          }
+        }
+      }
+    } catch (e) {
+      warn(`[TEMP-VIDEOS] Erro ao remover arquivos órfãos:`, e.message);
     }
   }
   
@@ -177,23 +202,94 @@ function initRoutesModule({
     }
   }
   
-  // Registra vídeo temporário
-  function registerTempVideo(filePath, phoneNumbers) {
+  // Registra vídeo temporário (pronto)
+  function registerTempVideo(filePath, phoneNumbers, messageIds = []) {
     const videoId = `video_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-    const expiresAt = Date.now() + (VIDEO_EXPIRY_HOURS * 60 * 60 * 1000);
+    const expiresAt = Date.now() + (VIDEO_VIEW_HOURS * 60 * 60 * 1000);
+    const retentionExpiresAt = Date.now() + (VIDEO_RETENTION_HOURS * 60 * 60 * 1000);
     
     const db = loadTempVideosDB();
     db[videoId] = {
       filePath,
       phoneNumbers: phoneNumbers.map(n => normalizeBR(n)),
+      messageIds: Array.isArray(messageIds) ? messageIds.filter(Boolean) : [],
+      status: 'ready',
+      pendingRequests: [],
+      viewCount: 0,
+      lastViewedAt: null,
+      lastViewedBy: null,
       createdAt: Date.now(),
       expiresAt,
+      viewExpiresAt: expiresAt,
+      retentionExpiresAt,
       expiresAtISO: new Date(expiresAt).toISOString()
     };
     saveTempVideosDB(db);
     
-    log(`[TEMP-VIDEOS] Vídeo registrado: ${videoId} (expira em ${VIDEO_EXPIRY_HOURS}h)`);
+    log(`[TEMP-VIDEOS] Vídeo registrado: ${videoId} (expira em ${VIDEO_VIEW_HOURS}h)`);
     return videoId;
+  }
+
+  // Cria registro de vídeo em processamento
+  function createPendingVideo(phoneNumbers, messageIds = []) {
+    const videoId = `video_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    const expiresAt = Date.now() + (VIDEO_VIEW_HOURS * 60 * 60 * 1000);
+    const retentionExpiresAt = Date.now() + (VIDEO_RETENTION_HOURS * 60 * 60 * 1000);
+    const db = loadTempVideosDB();
+    db[videoId] = {
+      filePath: null,
+      phoneNumbers: phoneNumbers.map(n => normalizeBR(n)),
+      messageIds: Array.isArray(messageIds) ? messageIds.filter(Boolean) : [],
+      status: 'processing',
+      pendingRequests: [],
+      viewCount: 0,
+      lastViewedAt: null,
+      lastViewedBy: null,
+      createdAt: Date.now(),
+      expiresAt,
+      viewExpiresAt: expiresAt,
+      retentionExpiresAt,
+      expiresAtISO: new Date(expiresAt).toISOString()
+    };
+    saveTempVideosDB(db);
+    log(`[TEMP-VIDEOS] Vídeo pendente criado: ${videoId}`);
+    return videoId;
+  }
+
+  // Finaliza vídeo pendente
+  function finalizeTempVideo(videoId, filePath) {
+    if (!videoId) return false;
+    const db = loadTempVideosDB();
+    const entry = db[videoId];
+    if (entry) {
+      entry.filePath = filePath;
+      entry.status = 'ready';
+      db[videoId] = entry;
+      saveTempVideosDB(db);
+      log(`[TEMP-VIDEOS] Vídeo pendente finalizado: ${videoId}`);
+      sendPendingVideoRequests(videoId);
+      return true;
+    }
+    return false;
+  }
+
+  // Marca vídeo como falha
+  function markVideoFailed(videoId, reason = null) {
+    if (!videoId) return false;
+    const db = loadTempVideosDB();
+    const entry = db[videoId];
+    if (!entry) return false;
+    entry.status = 'failed';
+    entry.error = reason || entry.error || 'failed';
+    db[videoId] = entry;
+    saveTempVideosDB(db);
+    warn(`[TEMP-VIDEOS] Vídeo marcado como falha: ${videoId} (${entry.error})`);
+    return true;
+  }
+
+  // Registro externo (reutiliza formato padrão)
+  function registerTempVideoExternal(filePath, phoneNumbers, messageIds = []) {
+    return registerTempVideo(filePath, phoneNumbers, messageIds);
   }
   
   // Obtém vídeo temporário
@@ -233,15 +329,25 @@ function initRoutesModule({
       // Verifica se arquivo ainda existe
       const fileExists = videoData.filePath && fs.existsSync(videoData.filePath);
       
+      const status = videoData.status || (videoData.filePath ? 'ready' : 'processing');
       videos.push({
         videoId,
         createdAt: videoData.createdAt,
         createdAtISO: new Date(videoData.createdAt).toISOString(),
         expiresAt: videoData.expiresAt,
         expiresAtISO: videoData.expiresAtISO,
+        viewExpiresAt: videoData.viewExpiresAt || videoData.expiresAt,
+        retentionExpiresAt: videoData.retentionExpiresAt || null,
         filePath: videoData.filePath,
         fileExists,
-        phoneNumbers: videoData.phoneNumbers
+        phoneNumbers: videoData.phoneNumbers,
+        messageIds: Array.isArray(videoData.messageIds) ? videoData.messageIds : [],
+        status,
+        error: videoData.error || null,
+        pendingRequestsCount: Array.isArray(videoData.pendingRequests) ? videoData.pendingRequests.length : 0,
+        viewCount: Number(videoData.viewCount || 0),
+        lastViewedAt: videoData.lastViewedAt || null,
+        lastViewedBy: videoData.lastViewedBy || null
       });
     }
     
@@ -249,6 +355,192 @@ function initRoutesModule({
     videos.sort((a, b) => b.createdAt - a.createdAt);
     
     return videos;
+  }
+
+  // Atualiza messageIds associados a um vídeo
+  function updateVideoMessageIds(videoId, messageIds) {
+    if (!videoId || !Array.isArray(messageIds) || messageIds.length === 0) {
+      return false;
+    }
+    const db = loadTempVideosDB();
+    const entry = db[videoId];
+    if (!entry) {
+      return false;
+    }
+    const existing = Array.isArray(entry.messageIds) ? entry.messageIds : [];
+    const merged = Array.from(new Set([...existing, ...messageIds.filter(Boolean)]));
+    entry.messageIds = merged;
+    db[videoId] = entry;
+    saveTempVideosDB(db);
+    log(`[TEMP-VIDEOS] messageIds atualizados para ${videoId} (${merged.length} id(s))`);
+    return true;
+  }
+
+  function addPendingVideoRequest(videoId, phoneNumber) {
+    if (!videoId || !phoneNumber) return false;
+    const db = loadTempVideosDB();
+    const entry = db[videoId];
+    if (!entry) return false;
+    const normalized = normalizeBR(phoneNumber);
+    const pending = Array.isArray(entry.pendingRequests) ? entry.pendingRequests : [];
+    if (!pending.includes(normalized)) {
+      pending.push(normalized);
+    }
+    entry.pendingRequests = pending;
+    db[videoId] = entry;
+    saveTempVideosDB(db);
+    log(`[TEMP-VIDEOS] Pedido pendente registrado: ${videoId} -> ${normalized}`);
+    return true;
+  }
+
+  function consumePendingRequests(videoId) {
+    const db = loadTempVideosDB();
+    const entry = db[videoId];
+    if (!entry) return [];
+    const pending = Array.isArray(entry.pendingRequests) ? entry.pendingRequests : [];
+    entry.pendingRequests = [];
+    db[videoId] = entry;
+    saveTempVideosDB(db);
+    return pending;
+  }
+
+  // Obtém vídeo por ID (uso admin)
+  function getVideoById(videoId) {
+    if (!videoId) return null;
+    runCleanupIfNeeded();
+    const db = loadTempVideosDB();
+    const videoData = db[videoId];
+    if (!videoData) return null;
+    const fileExists = videoData.filePath && fs.existsSync(videoData.filePath);
+    return {
+      videoId,
+      ...videoData,
+      fileExists,
+      status: videoData.status || (videoData.filePath ? 'ready' : 'processing')
+    };
+  }
+
+  // Marca vídeo como visualizado
+  function markVideoViewed(videoId, viewer = null) {
+    if (!videoId) return false;
+    const db = loadTempVideosDB();
+    const entry = db[videoId];
+    if (!entry) return false;
+    entry.viewCount = Number(entry.viewCount || 0) + 1;
+    entry.lastViewedAt = Date.now();
+    entry.lastViewedBy = viewer || entry.lastViewedBy || null;
+    db[videoId] = entry;
+    saveTempVideosDB(db);
+    log(`[TEMP-VIDEOS] Vídeo ${videoId} marcado como visto`);
+    return true;
+  }
+
+  async function sendVideoToNumber(to, filePath, videoId) {
+    if (!whatsapp || !whatsapp.sendMediaFromBase64) {
+      warn(`[TEMP-VIDEOS] sendMediaFromBase64 não disponível para ${to}`);
+      return;
+    }
+    const normalized = normalizeBR(to);
+    if (!fs.existsSync(filePath)) {
+      warn(`[TEMP-VIDEOS] Arquivo não encontrado para envio: ${filePath}`);
+      return;
+    }
+    let videoParts = [filePath];
+    if (camera && camera.splitVideoIfNeeded) {
+      try {
+        videoParts = await camera.splitVideoIfNeeded(filePath);
+      } catch (e) {
+        warn(`[TEMP-VIDEOS] Erro ao dividir vídeo ${videoId}:`, e.message);
+        videoParts = [filePath];
+      }
+    }
+    for (let i = 0; i < videoParts.length; i++) {
+      const partFile = videoParts[i];
+      const partNumber = videoParts.length > 1 ? ` (Parte ${i + 1}/${videoParts.length})` : '';
+      const caption = `🎥 Vídeo da campainha${partNumber}`;
+      try {
+        if (whatsapp.sendTextMessage) {
+          await whatsapp.sendTextMessage(normalized, `⏳ Enviando vídeo${partNumber}...`);
+        }
+        const buffer = fs.readFileSync(partFile);
+        const base64 = buffer.toString('base64');
+        await whatsapp.sendMediaFromBase64(normalized, base64, 'video/mp4', caption);
+        log(`[TEMP-VIDEOS] Vídeo ${videoId} enviado para ${normalized}${partNumber}`);
+      } catch (e) {
+        err(`[TEMP-VIDEOS] Erro ao enviar vídeo ${videoId} para ${normalized}:`, e.message);
+      }
+      if (i < videoParts.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+  }
+
+  function sendPendingVideoRequests(videoId) {
+    setImmediate(async () => {
+      const pending = consumePendingRequests(videoId);
+      if (pending.length === 0) return;
+      const video = getVideoById(videoId);
+      if (!video || !video.filePath) return;
+      for (const phone of pending) {
+        await sendVideoToNumber(phone, video.filePath, videoId);
+      }
+    });
+  }
+
+  // Remove vídeo manualmente
+  function deleteTempVideo(videoId) {
+    if (!videoId) return { success: false, error: 'video_id_required' };
+    const db = loadTempVideosDB();
+    const entry = db[videoId];
+    if (!entry) {
+      return { success: false, error: 'video_not_found' };
+    }
+    if (entry.filePath && fs.existsSync(entry.filePath)) {
+      try {
+        fs.unlinkSync(entry.filePath);
+      } catch (e) {
+        warn(`[TEMP-VIDEOS] Erro ao remover arquivo ${entry.filePath}:`, e.message);
+      }
+    }
+    delete db[videoId];
+    saveTempVideosDB(db);
+    log(`[TEMP-VIDEOS] Vídeo removido manualmente: ${videoId}`);
+    return { success: true };
+  }
+
+  // Verifica se o número pode acessar o vídeo
+  function canAccessVideo(videoData, phoneNumber) {
+    if (!phoneNumber) return false;
+    const normalizedPhone = normalizeBR(phoneNumber);
+    const isAuthorized = videoData.phoneNumbers.some(p => {
+      const normalized = normalizeBR(p);
+      return normalized === normalizedPhone || normalized.replace(/^\+/, '') === normalizedPhone.replace(/^\+/, '');
+    });
+    if (isAuthorized) {
+      return true;
+    }
+    const authorizedNumbers = readNumbersFromFile(numbersFile || '');
+    if (authorizedNumbers.length > 0) {
+      return isNumberAuthorized(phoneNumber, numbersFile || '', dbg);
+    }
+    return true;
+  }
+
+  // Busca vídeo pelo messageId do template (para correlacionar botão)
+  function getVideoIdByMessageId(messageId, phoneNumber) {
+    if (!messageId) return null;
+    runCleanupIfNeeded();
+    const db = loadTempVideosDB();
+    for (const [videoId, videoData] of Object.entries(db)) {
+      const ids = Array.isArray(videoData.messageIds) ? videoData.messageIds : [];
+      if (ids.includes(messageId)) {
+        if (canAccessVideo(videoData, phoneNumber)) {
+          return videoId;
+        }
+        return null;
+      }
+    }
+    return null;
   }
   
   // Limpa vídeos expirados periodicamente (a cada hora) - otimizado
@@ -1042,9 +1334,12 @@ function initRoutesModule({
       }
       
       // Grava vídeo em background (não bloqueia o envio do template)
+      const phoneNumbers = validNumbers.map(n => n.normalized);
+      let pendingVideoId = null;
+      let rtspUrl = null;
       let videoIdPromise = Promise.resolve(null);
       if (ENABLE_VIDEO_RECORDING && camera && camera.buildRTSPUrl && camera.recordRTSPVideo) {
-        const rtspUrl = camera.buildRTSPUrl();
+        rtspUrl = camera.buildRTSPUrl();
         if (rtspUrl) {
           // Verifica intervalo mínimo entre gravações
           const now = Date.now();
@@ -1060,6 +1355,7 @@ function initRoutesModule({
               } else {
                 // Marca que está gravando para evitar múltiplas gravações simultâneas
                 isRecordingVideo = true;
+                pendingVideoId = createPendingVideo(phoneNumbers);
                 // NÃO atualiza lastVideoRecordTime aqui - será atualizado quando a gravação terminar
                 log(`[SNAPSHOT][${rid}] Iniciando gravação de vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos em background...`);
                 log(`[SNAPSHOT][${rid}] Última gravação: ${lastVideoRecordTime > 0 ? new Date(lastVideoRecordTime).toISOString() : 'nunca'} (${Math.floor((now - lastVideoRecordTime) / 1000)}s atrás)`);
@@ -1070,7 +1366,7 @@ function initRoutesModule({
                     reply: async () => {} // Não precisa responder durante gravação
                   };
                   
-                  const result = await camera.recordRTSPVideo(rtspUrl, VIDEO_RECORD_DURATION_SEC, fakeMessage);
+                const result = await camera.recordRTSPVideo(rtspUrl, VIDEO_RECORD_DURATION_SEC, fakeMessage);
               
               if (result.success && result.filePath && fs.existsSync(result.filePath)) {
                 // Comprime vídeo apenas se necessário (função já verifica tamanho)
@@ -1085,10 +1381,14 @@ function initRoutesModule({
                   // Continua com arquivo original se compressão falhar
                 }
                 
-                // Registra vídeo temporário
-                const phoneNumbers = validNumbers.map(n => n.normalized);
-                const videoId = registerTempVideo(finalVideoPath, phoneNumbers);
-                log(`[SNAPSHOT][${rid}] Vídeo gravado e registrado: ${videoId}`);
+                // Finaliza vídeo pendente
+                let videoId = pendingVideoId;
+                if (videoId && finalizeTempVideo(videoId, finalVideoPath)) {
+                  log(`[SNAPSHOT][${rid}] Vídeo gravado e finalizado: ${videoId}`);
+                } else {
+                  videoId = registerTempVideo(finalVideoPath, phoneNumbers);
+                  log(`[SNAPSHOT][${rid}] Vídeo gravado e registrado: ${videoId}`);
+                }
                 
                 // Atualiza timestamp APÓS gravação terminar (não quando inicia)
                 lastVideoRecordTime = Date.now();
@@ -1097,12 +1397,18 @@ function initRoutesModule({
                 return videoId;
               } else {
                 warn(`[SNAPSHOT][${rid}] Falha na gravação de vídeo: ${result.error || 'Erro desconhecido'}`);
+                if (pendingVideoId) {
+                  markVideoFailed(pendingVideoId, result.error || 'failed');
+                }
                 // Atualiza timestamp mesmo em caso de falha para evitar tentativas muito frequentes
                 lastVideoRecordTime = Date.now();
                 return null;
               }
             } catch (videoError) {
               err(`[SNAPSHOT][${rid}] Erro ao gravar vídeo:`, videoError.message);
+              if (pendingVideoId) {
+                markVideoFailed(pendingVideoId, videoError.message);
+              }
               // Atualiza timestamp mesmo em caso de erro para evitar tentativas muito frequentes
               lastVideoRecordTime = Date.now();
               return null;
@@ -1131,13 +1437,14 @@ function initRoutesModule({
         log(`[SNAPSHOT][${rid}] Gravação de vídeo desabilitada (ENABLE_VIDEO_RECORDING=false)`);
       }
       
-      // Envia template "alerta_campainha" para todos os números em paralelo
+      // Envia template "status_portao" para todos os números em paralelo
+      const templateMessageIds = [];
       const sendPromises = validNumbers.map(async ({ normalized, numberId, rawPhone }) => {
         try {
           const to = numberId._serialized;
           let r;
           
-          // Usa template "alerta_campainha" com imagem no header
+          // Usa template "status_portao" com imagem no header
           if (whatsapp.sendTemplateMessage) {
             const components = [
               {
@@ -1150,73 +1457,20 @@ function initRoutesModule({
                     }
                   }
                 ]
-              },
-              {
-                type: 'body',
-                parameters: [
-                  {
-                    type: 'text',
-                    text: 'tocando'
-                  }
-                ]
               }
             ];
-            r = await whatsapp.sendTemplateMessage(to, 'alerta_campainha', 'pt_BR', components);
+            r = await whatsapp.sendTemplateMessage(to, 'status_portao', 'pt_BR', components);
           } else {
             throw new Error('API WhatsApp não configurada para envio de templates');
           }
           
           log(`[SNAPSHOT OK][${rid}] Template enviado para ${to} | id=${r.id?._serialized || r.messages?.[0]?.id || 'n/a'}`);
-          
-          // Envia mensagem perguntando se quer ver o vídeo (aguarda gravação terminar em background)
-          // Não bloqueia o retorno da requisição
-          videoIdPromise.then(async (videoId) => {
-            if (!videoId) {
-              log(`[SNAPSHOT][${rid}] Nenhum vídeo gravado, não enviando mensagem de vídeo para ${to}`);
-              return; // Se não gravou vídeo, não envia mensagem
-            }
-            
-            log(`[SNAPSHOT][${rid}] Vídeo gravado (ID: ${videoId}), enviando mensagem para ${to}...`);
-            
-            try {
-              // Aguarda um pouco para garantir que tudo está processado
-              await new Promise(resolve => setTimeout(resolve, 1000));
-              
-              if (whatsapp.sendInteractiveButtons) {
-                // API Oficial - usa botões interativos
-                log(`[SNAPSHOT][${rid}] Enviando botões interativos para ${to}...`);
-                try {
-                  await whatsapp.sendInteractiveButtons(
-                    to,
-                    `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos da campainha.\n\nDeseja visualizar o vídeo? (Válido por 24 horas)`,
-                    [
-                      { id: `view_video_${videoId}`, title: '👁️ Ver Vídeo' },
-                      { id: 'skip_video', title: '⏭️ Pular' }
-                    ],
-                    'Campainha - Vídeo Temporário'
-                  );
-                  log(`[SNAPSHOT][${rid}] ✅ Botões interativos enviados com sucesso para ${to}`);
-                } catch (buttonError) {
-                  err(`[SNAPSHOT][${rid}] ❌ Erro ao enviar botões interativos:`, buttonError.message);
-                  // Tenta fallback para texto
-                  try {
-                    await whatsapp.sendTextMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
-                    log(`[SNAPSHOT][${rid}] ✅ Mensagem de texto enviada como fallback para ${to}`);
-                  } catch (textError) {
-                    err(`[SNAPSHOT][${rid}] ❌ Erro ao enviar mensagem de texto:`, textError.message);
-                  }
-                }
-              } else {
-                warn(`[SNAPSHOT][${rid}] Nenhum método de envio disponível para mensagem de vídeo`);
-              }
-            } catch (videoMsgError) {
-              err(`[SNAPSHOT][${rid}] ❌ Erro geral ao enviar mensagem de vídeo para ${to}:`, videoMsgError.message);
-              err(`[SNAPSHOT][${rid}] Stack:`, videoMsgError.stack);
-            }
-          }).catch((error) => {
-            err(`[SNAPSHOT][${rid}] ❌ Erro ao processar promise de vídeo:`, error.message);
-            err(`[SNAPSHOT][${rid}] Stack:`, error.stack);
-          });
+          const messageId = r.id?._serialized || r.messages?.[0]?.id || null;
+          if (messageId) {
+            templateMessageIds.push(messageId);
+          } else {
+            warn(`[SNAPSHOT][${rid}] Template enviado sem messageId para ${to}`);
+          }
           
           return { phone: normalized, success: true, to, msgId: r.id?._serialized || r.messages?.[0]?.id || null };
         } catch (e) {
@@ -1237,6 +1491,23 @@ function initRoutesModule({
           tried: n.tried
         }))
       ];
+
+      // Vincula messageIds ao vídeo pendente assim que possível (permite "processing")
+      if (pendingVideoId && templateMessageIds.length > 0) {
+        updateVideoMessageIds(pendingVideoId, templateMessageIds);
+      }
+
+      // Vincula messageIds ao vídeo gravado (se houver)
+      videoIdPromise.then((videoId) => {
+        if (!videoId) return;
+        if (templateMessageIds.length === 0) {
+          warn(`[SNAPSHOT][${rid}] Vídeo ${videoId} sem messageIds para vincular`);
+          return;
+        }
+        updateVideoMessageIds(videoId, templateMessageIds);
+      }).catch((error) => {
+        err(`[SNAPSHOT][${rid}] ❌ Erro ao vincular messageIds:`, error.message);
+      });
       
       const successCount = results.filter(r => r.success).length;
       log(`[SNAPSHOT][${rid}] Processo concluído: ${successCount}/${results.length} enviados com sucesso`);
@@ -1504,53 +1775,41 @@ function initRoutesModule({
     
     if (!videoData) {
       warn(`[TEMP-VIDEOS] Vídeo ${videoId} não encontrado no banco de dados`);
-      return { success: false, error: 'Vídeo não encontrado ou expirado' };
+      return { success: false, error: 'not_found' };
+    }
+    
+    const viewExpiresAt = videoData.viewExpiresAt || videoData.expiresAt;
+    if (viewExpiresAt && Date.now() > viewExpiresAt) {
+      warn(`[TEMP-VIDEOS] Vídeo ${videoId} expirado`);
+      return { success: false, error: 'expired' };
     }
     
     dbg(`[TEMP-VIDEOS] Vídeo encontrado: ${videoId}, caminho: ${videoData.filePath}`);
     
-    // Verifica se o número está autorizado para ver este vídeo
-    // Agora permite que qualquer número autorizado veja qualquer vídeo
-    const normalizedPhone = normalizeBR(phoneNumber);
-    dbg(`[TEMP-VIDEOS] Número normalizado: ${normalizedPhone}`);
+    if (!canAccessVideo(videoData, phoneNumber)) {
+      warn(`[TEMP-VIDEOS] Número ${phoneNumber} não autorizado no sistema`);
+      return { success: false, error: 'Você não está autorizado a ver este vídeo' };
+    }
     
-    const isAuthorized = videoData.phoneNumbers.some(p => {
-      const normalized = normalizeBR(p);
-      const matches = normalized === normalizedPhone || normalized.replace(/^\+/, '') === normalizedPhone.replace(/^\+/, '');
-      if (matches) {
-        dbg(`[TEMP-VIDEOS] Número autorizado na lista original: ${normalized}`);
-      }
-      return matches;
-    });
-    
-    // Se não está na lista original, verifica se o número está autorizado no sistema
-    if (!isAuthorized) {
-      const authorizedNumbers = readNumbersFromFile(numbersFile || '');
-      if (authorizedNumbers.length > 0) {
-        // Se há números autorizados no sistema, verifica se o número atual está autorizado
-        const isSystemAuthorized = isNumberAuthorized(phoneNumber, numbersFile || '', dbg);
-        if (!isSystemAuthorized) {
-          warn(`[TEMP-VIDEOS] Número ${phoneNumber} não autorizado no sistema`);
-          return { success: false, error: 'Você não está autorizado a ver este vídeo' };
-        }
-        log(`[TEMP-VIDEOS] Número ${phoneNumber} autorizado no sistema (não estava na lista original)`);
-      } else {
-        // Se não há lista de autorizados, permite acesso
-        log(`[TEMP-VIDEOS] Número ${phoneNumber} autorizado (sem lista de restrição)`);
-      }
-    } else {
-      log(`[TEMP-VIDEOS] Número ${phoneNumber} autorizado na lista original do vídeo`);
+    const status = videoData.status || (videoData.filePath ? 'ready' : 'processing');
+    if (status === 'processing') {
+      log(`[TEMP-VIDEOS] Vídeo ${videoId} ainda em processamento`);
+      return { success: false, error: 'processing' };
+    }
+    if (status === 'failed') {
+      warn(`[TEMP-VIDEOS] Vídeo ${videoId} com falha: ${videoData.error || 'failed'}`);
+      return { success: false, error: 'failed' };
     }
     
     // Verifica se o arquivo ainda existe
     if (!videoData.filePath) {
       warn(`[TEMP-VIDEOS] Vídeo ${videoId} não tem caminho de arquivo`);
-      return { success: false, error: 'Caminho do arquivo não encontrado' };
+      return { success: false, error: 'not_found' };
     }
     
     if (!fs.existsSync(videoData.filePath)) {
       warn(`[TEMP-VIDEOS] Arquivo não existe: ${videoData.filePath}`);
-      return { success: false, error: 'Arquivo de vídeo não encontrado no servidor' };
+      return { success: false, error: 'not_found' };
     }
     
     log(`[TEMP-VIDEOS] Vídeo ${videoId} autorizado e arquivo encontrado: ${videoData.filePath}`);
@@ -2066,6 +2325,16 @@ function initRoutesModule({
   return {
     processTempVideo,
     listVideos,
+    registerTempVideoExternal,
+    createPendingVideoExternal: createPendingVideo,
+    finalizeTempVideo,
+    markVideoFailed,
+    addPendingVideoRequest,
+    updateVideoMessageIds,
+    getVideoById,
+    deleteTempVideo,
+    markVideoViewed,
+    getVideoIdByMessageId,
     getComedorDeviceStatus: () => comedorDeviceStatus
   };
 }
