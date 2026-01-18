@@ -114,9 +114,10 @@ class IPCache {
  * @param {Object} config.logger - Objeto com funções de log
  * @returns {Object} API do módulo
  */
-function initIPBlockerModule({ appRoot, logger }) {
+function initIPBlockerModule({ appRoot, logger, whatsappAuditRetentionDays = 180 }) {
   try {
-    const { log, dbg, warn, err } = logger;
+  const { log, dbg, warn, err } = logger;
+  const AUDIT_RETENTION_DAYS = Number(whatsappAuditRetentionDays) > 0 ? Number(whatsappAuditRetentionDays) : 180;
     
     if (!appRoot) {
       err(`[IP-BLOCKER] ❌ appRoot não fornecido`);
@@ -502,8 +503,32 @@ function initIPBlockerModule({ appRoot, logger }) {
                                 
                                 db.run(`CREATE INDEX IF NOT EXISTS idx_whatsapp_opt_in_phone ON whatsapp_opt_in(phone)`, () => {});
                                 db.run(`CREATE INDEX IF NOT EXISTS idx_whatsapp_opt_in_status ON whatsapp_opt_in(opted_in)`, () => {});
-                                
-                                resolve();
+
+                                // Cria tabela de auditoria de mensagens WhatsApp
+                                db.run(`
+                                  CREATE TABLE IF NOT EXISTS whatsapp_message_audit (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    direction TEXT NOT NULL,
+                                    phone TEXT,
+                                    message_id TEXT,
+                                    type TEXT,
+                                    status TEXT,
+                                    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                                    payload_json TEXT,
+                                    error_code TEXT,
+                                    error_message TEXT
+                                  )
+                                `, (error) => {
+                                  if (error) {
+                                    warn(`[IP-BLOCKER] Erro ao criar tabela whatsapp_message_audit:`, error.message);
+                                  }
+                                  
+                                  db.run(`CREATE INDEX IF NOT EXISTS idx_whatsapp_audit_phone ON whatsapp_message_audit(phone)`, () => {});
+                                  db.run(`CREATE INDEX IF NOT EXISTS idx_whatsapp_audit_created ON whatsapp_message_audit(created_at)`, () => {});
+                                  db.run(`CREATE INDEX IF NOT EXISTS idx_whatsapp_audit_message_id ON whatsapp_message_audit(message_id)`, () => {});
+                                  
+                                  resolve();
+                                });
                               });
                             });
                           });
@@ -2460,6 +2485,156 @@ function initIPBlockerModule({ appRoot, logger }) {
     });
   }
   
+  // ===== WHATSAPP AUDIT =====
+  
+  function logWhatsappAudit({
+    direction,
+    phone,
+    messageId,
+    type,
+    status,
+    timestamp,
+    payload,
+    errorCode,
+    errorMessage
+  }) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve();
+        return;
+      }
+      const createdAt = timestamp ? Math.floor(Number(timestamp)) : Math.floor(Date.now() / 1000);
+      const payloadJson = payload ? JSON.stringify(payload) : null;
+      db.run(`
+        INSERT INTO whatsapp_message_audit (
+          direction, phone, message_id, type, status, created_at, payload_json, error_code, error_message
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        direction || null,
+        phone || null,
+        messageId || null,
+        type || null,
+        status || null,
+        createdAt,
+        payloadJson,
+        errorCode || null,
+        errorMessage || null
+      ], (error) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao registrar auditoria WhatsApp:`, error.message);
+        }
+        resolve();
+      });
+    });
+  }
+  
+  function listWhatsappThreads(limit = 50, offset = 0, search = '') {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve([]);
+        return;
+      }
+      const phoneExpr = `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, '+', ''), ' ', ''), '-', ''), '(', ''), ')', '')`;
+      const normalizedExpr = `CASE WHEN LENGTH(${phoneExpr}) = 13 AND SUBSTR(${phoneExpr}, 1, 2) = '55' AND SUBSTR(${phoneExpr}, 5, 1) = '9' THEN SUBSTR(${phoneExpr}, 1, 4) || SUBSTR(${phoneExpr}, 6) ELSE ${phoneExpr} END`;
+      let query = `
+        SELECT ${normalizedExpr} as phone, COUNT(*) as total, MAX(created_at) as last_at
+        FROM whatsapp_message_audit
+        WHERE phone IS NOT NULL
+      `;
+      const params = [];
+      if (search) {
+        query += ` AND ${normalizedExpr} LIKE ?`;
+        params.push(`%${search.replace(/\D/g, '')}%`);
+      }
+      query += ` GROUP BY ${normalizedExpr} ORDER BY last_at DESC LIMIT ? OFFSET ?`;
+      params.push(limit, offset);
+      db.all(query, params, (error, rows) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao listar threads WhatsApp:`, error.message);
+          resolve([]);
+          return;
+        }
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  function listWhatsappMessages(phone, limit = 50, before = null) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady || !phone) {
+        resolve([]);
+        return;
+      }
+      const phoneExpr = `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(phone, '+', ''), ' ', ''), '-', ''), '(', ''), ')', '')`;
+      const normalizedExpr = `CASE WHEN LENGTH(${phoneExpr}) = 13 AND SUBSTR(${phoneExpr}, 1, 2) = '55' AND SUBSTR(${phoneExpr}, 5, 1) = '9' THEN SUBSTR(${phoneExpr}, 1, 4) || SUBSTR(${phoneExpr}, 6) ELSE ${phoneExpr} END`;
+      let normalized = String(phone).replace(/\D/g, '');
+      if (normalized.startsWith('55') && normalized.length === 13 && normalized[4] === '9') {
+        normalized = `${normalized.slice(0, 4)}${normalized.slice(5)}`;
+      }
+      let query = `
+        SELECT * FROM whatsapp_message_audit
+        WHERE ${normalizedExpr} = ?
+      `;
+      const params = [normalized];
+      if (before) {
+        query += ` AND created_at < ?`;
+        params.push(Number(before));
+      }
+      query += ` ORDER BY created_at DESC LIMIT ?`;
+      params.push(limit);
+      db.all(query, params, (error, rows) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao listar mensagens WhatsApp:`, error.message);
+          resolve([]);
+          return;
+        }
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  function searchWhatsappMessages(q, limit = 50, offset = 0) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady || !q) {
+        resolve([]);
+        return;
+      }
+      const like = `%${q}%`;
+      db.all(`
+        SELECT * FROM whatsapp_message_audit
+        WHERE payload_json LIKE ? OR error_message LIKE ? OR message_id LIKE ? OR phone LIKE ?
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+      `, [like, like, like, like, limit, offset], (error, rows) => {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao buscar mensagens WhatsApp:`, error.message);
+          resolve([]);
+          return;
+        }
+        resolve(rows || []);
+      });
+    });
+  }
+  
+  function cleanWhatsappAudit(retentionDays = 180) {
+    return new Promise((resolve) => {
+      if (!db || !dbReady) {
+        resolve(0);
+        return;
+      }
+      const days = Number(retentionDays) > 0 ? Number(retentionDays) : 180;
+      const cutoff = Math.floor(Date.now() / 1000) - (days * 24 * 60 * 60);
+      db.run(`DELETE FROM whatsapp_message_audit WHERE created_at < ?`, [cutoff], function(error) {
+        if (error) {
+          dbg(`[IP-BLOCKER] Erro ao limpar auditoria WhatsApp:`, error.message);
+          resolve(0);
+          return;
+        }
+        resolve(this.changes || 0);
+      });
+    });
+  }
+
   // ===== TUYA EVENTS =====
   
   /**
@@ -3661,6 +3836,12 @@ function initIPBlockerModule({ appRoot, logger }) {
       countAccessLogs,
       getAccessStatsByRoute,
       getAccessStatsByIP,
+      // WhatsApp Audit
+      logWhatsappAudit,
+      listWhatsappThreads,
+      listWhatsappMessages,
+      searchWhatsappMessages,
+      cleanWhatsappAudit,
       // Tuya Events
       logTuyaEvent,
       listTuyaEvents,
@@ -3876,10 +4057,20 @@ function initIPBlockerModule({ appRoot, logger }) {
     });
   }, 6 * 60 * 60 * 1000);
   
+  // Limpa auditoria WhatsApp diariamente
+  setInterval(() => {
+    cleanWhatsappAudit(AUDIT_RETENTION_DAYS).catch(err => {
+      warn(`[IP-BLOCKER] Erro ao limpar auditoria WhatsApp:`, err.message);
+    });
+  }, 24 * 60 * 60 * 1000);
+  
   // Limpa e verifica duplicidades na inicialização
   Promise.all([
     cleanExpiredEntries().catch(err => {
       warn(`[IP-BLOCKER] Erro ao limpar entradas expiradas na inicialização:`, err.message);
+    }),
+    cleanWhatsappAudit(AUDIT_RETENTION_DAYS).catch(err => {
+      warn(`[IP-BLOCKER] Erro ao limpar auditoria WhatsApp na inicialização:`, err.message);
     }),
     checkAndFixDuplicates().catch(err => {
       warn(`[IP-BLOCKER] Erro ao verificar duplicidades na inicialização:`, err.message);
@@ -3929,6 +4120,12 @@ function initIPBlockerModule({ appRoot, logger }) {
       countAccessLogs: () => Promise.resolve(0),
       getAccessStatsByRoute: () => Promise.resolve([]),
       getAccessStatsByIP: () => Promise.resolve([]),
+      // WhatsApp Audit fallbacks
+      logWhatsappAudit: () => Promise.resolve(),
+      listWhatsappThreads: () => Promise.resolve([]),
+      listWhatsappMessages: () => Promise.resolve([]),
+      searchWhatsappMessages: () => Promise.resolve([]),
+      cleanWhatsappAudit: () => Promise.resolve(0),
       // Tuya Events fallbacks
       logTuyaEvent: () => Promise.resolve(),
       listTuyaEvents: () => Promise.resolve([]),

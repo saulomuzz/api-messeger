@@ -69,6 +69,12 @@ const MIN_SNAPSHOT_INTERVAL_MS = parseInt(process.env.MIN_SNAPSHOT_INTERVAL_MS |
 const ENABLE_VIDEO_RECORDING = /^true$/i.test(process.env.ENABLE_VIDEO_RECORDING || 'true'); // Habilitar gravação de vídeo (padrão: true)
 const VIDEO_RECORD_DURATION_SEC = parseInt(process.env.VIDEO_RECORD_DURATION_SEC || '15', 10); // Duração do vídeo ao tocar campainha (padrão: 15 segundos)
 const MIN_VIDEO_RECORD_INTERVAL_MS = parseInt(process.env.MIN_VIDEO_RECORD_INTERVAL_MS || '60000', 10); // Intervalo mínimo entre gravações em ms (padrão: 60 segundos = 1 minuto)
+const parsePositiveHours = (value, fallback) => {
+  const n = Number.parseInt(String(value), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+const VIDEO_VIEW_HOURS = parsePositiveHours(process.env.VIDEO_VIEW_HOURS || process.env.WHATSAPP_VIDEO_VIEW_HOURS || process.env.VIDEO_EXPIRY_HOURS || '24', 24); // Tempo que pode ser visto no WhatsApp
+const VIDEO_RETENTION_HOURS = parsePositiveHours(process.env.VIDEO_RETENTION_HOURS || process.env.VIDEO_EXPIRY_HOURS || VIDEO_VIEW_HOURS, VIDEO_VIEW_HOURS); // Tempo de permanência no servidor
 const RECORDINGS_DIR = process.env.RECORDINGS_DIR || path.join(APP_ROOT, 'recordings');
 const NUMBERS_FILE = process.env.NUMBERS_FILE || path.join(APP_ROOT, 'numbers.txt');
 const AUTH_DATA_PATH = process.env.AUTH_DATA_PATH || path.join(APP_ROOT, '.wwebjs_auth');
@@ -92,6 +98,7 @@ const VIDEO_GOP = parseInt(process.env.VIDEO_GOP || '60', 10); // GOP size (padr
 const VIDEO_MAX_WIDTH = parseInt(process.env.VIDEO_MAX_WIDTH || '1920', 10); // Largura máxima (padrão: 1920)
 const VIDEO_MAX_HEIGHT = parseInt(process.env.VIDEO_MAX_HEIGHT || '1080', 10); // Altura máxima (padrão: 1080)
 const VIDEO_AUDIO_BITRATE = process.env.VIDEO_AUDIO_BITRATE || '128k'; // Bitrate de áudio (padrão: 128k)
+const WHATSAPP_AUDIT_RETENTION_DAYS = parseInt(process.env.WHATSAPP_AUDIT_RETENTION_DAYS || '180', 10); // Retenção de auditoria WhatsApp
 // Configurações de backup automático
 const BACKUP_ENABLED = /^true$/i.test(process.env.BACKUP_ENABLED || 'true'); // Backup habilitado (padrão: true)
 const BACKUP_INTERVAL_HOURS = parseInt(process.env.BACKUP_INTERVAL_HOURS || '24', 10); // Intervalo em horas (padrão: 24)
@@ -340,7 +347,8 @@ try {
   log(`[INIT] APP_ROOT: ${APP_ROOT}`);
   const ipBlockerResult = initIPBlockerModule({
     appRoot: APP_ROOT,
-    logger
+    logger,
+    whatsappAuditRetentionDays: WHATSAPP_AUDIT_RETENTION_DAYS
   });
   log(`[INIT] initIPBlockerModule retornou: ${typeof ipBlockerResult}`);
   log(`[INIT] ipBlockerResult é null: ${ipBlockerResult === null}`);
@@ -1012,6 +1020,7 @@ try {
     ipBlocker,
     numbersFile: NUMBERS_FILE,
     recordDurationSec: RECORD_DURATION_SEC,
+    videoViewHours: VIDEO_VIEW_HOURS,
     whatsappMaxVideoSizeMB: WHATSAPP_MAX_VIDEO_SIZE_MB
   });
   log(`[INIT] Módulo WhatsApp Official inicializado com sucesso`);
@@ -1078,6 +1087,8 @@ try {
     enableVideoRecording: ENABLE_VIDEO_RECORDING,
     videoRecordDurationSec: VIDEO_RECORD_DURATION_SEC,
     minVideoRecordIntervalMs: MIN_VIDEO_RECORD_INTERVAL_MS,
+    videoViewHours: VIDEO_VIEW_HOURS,
+    videoRetentionHours: VIDEO_RETENTION_HOURS,
     strictRateLimit, // Passa rate limit estrito para endpoints críticos
     comedorMessageTemplate: COMEDOR_MESSAGE_TEMPLATE_SUCCESS, // Template de mensagem do comedor
     comedorApiToken: COMEDOR_API_TOKEN // Token de autenticação para notificações
@@ -1113,6 +1124,20 @@ try {
       } else {
         warn(`[INIT] setListVideosFunction não existe no módulo WhatsApp`);
       }
+    }
+
+    if (routesModule.getVideoIdByMessageId && whatsapp.setGetVideoIdByMessageIdFunction) {
+      whatsapp.setGetVideoIdByMessageIdFunction(routesModule.getVideoIdByMessageId);
+      log(`[INIT] Função de resolução de vídeo por messageId configurada`);
+    } else {
+      warn(`[INIT] getVideoIdByMessageId não disponível (tipo: ${typeof routesModule.getVideoIdByMessageId}) ou setGetVideoIdByMessageIdFunction não existe`);
+    }
+
+    if (routesModule.addPendingVideoRequest && whatsapp.setAddPendingVideoRequestFunction) {
+      whatsapp.setAddPendingVideoRequestFunction(routesModule.addPendingVideoRequest);
+      log(`[INIT] Função de pedidos pendentes configurada`);
+    } else {
+      warn(`[INIT] addPendingVideoRequest não disponível (tipo: ${typeof routesModule.addPendingVideoRequest}) ou setAddPendingVideoRequestFunction não existe`);
     }
     
     // Configura função de trigger de snapshot
@@ -1489,13 +1514,14 @@ async function triggerSnapshotForWS(message, clientIp) {
       }
     }
     
-    // Envia template "alerta_campainha" para todos os números válidos
+    // Envia template "status_portao" para todos os números válidos
+    const templateMessageIds = [];
     const sendPromises = validNumbers.map(async ({ normalized, numberId }) => {
       try {
         // Para API oficial, usa o número normalizado diretamente
         const to = numberId?._serialized || normalized.replace(/^\+/, '') || normalized;
         if (whatsapp.sendTemplateMessage) {
-          // Template "alerta_campainha" com imagem no header e parâmetro "tocando" no body
+          // Template "status_portao" com imagem no header
           const components = [
             {
               type: 'header',
@@ -1507,18 +1533,13 @@ async function triggerSnapshotForWS(message, clientIp) {
                   }
                 }
               ]
-            },
-            {
-              type: 'body',
-              parameters: [
-                {
-                  type: 'text',
-                  text: 'tocando'
-                }
-              ]
             }
           ];
-          await whatsapp.sendTemplateMessage(to, 'alerta_campainha', 'pt_BR', components);
+          const response = await whatsapp.sendTemplateMessage(to, 'status_portao', 'pt_BR', components);
+          const messageId = response?.id?._serialized || response?.messages?.[0]?.id || null;
+          if (messageId) {
+            templateMessageIds.push(messageId);
+          }
         } else {
           return { success: false, error: 'sendTemplateMessage not available' };
         }
@@ -1535,6 +1556,7 @@ async function triggerSnapshotForWS(message, clientIp) {
     if (ENABLE_VIDEO_RECORDING && camera && camera.buildRTSPUrl && camera.recordRTSPVideo) {
       const rtspUrl = camera.buildRTSPUrl();
       if (rtspUrl) {
+        let pendingVideoId = null;
         // Verifica intervalo mínimo entre gravações
         const now = Date.now();
         const timeSinceLastVideo = now - lastVideoRecordTimeWS;
@@ -1543,103 +1565,60 @@ async function triggerSnapshotForWS(message, clientIp) {
           const secondsRemaining = Math.ceil((MIN_VIDEO_RECORD_INTERVAL_MS - timeSinceLastVideo) / 1000);
           log(`[WS-ESP32] Gravação de vídeo ignorada - cooldown ativo (${secondsRemaining}s restantes)`);
         } else {
+          if (routesModule?.createPendingVideoExternal) {
+            const phoneNumbers = validNumbers.map(n => normalizeBR(n.normalized));
+            pendingVideoId = routesModule.createPendingVideoExternal(phoneNumbers);
+            if (pendingVideoId && routesModule.updateVideoMessageIds && templateMessageIds.length > 0) {
+              routesModule.updateVideoMessageIds(pendingVideoId, templateMessageIds);
+            }
+          }
           (async () => {
             try {
               const fakeMessage = { from: 'system', reply: async () => {} };
               const result = await camera.recordRTSPVideo(rtspUrl, VIDEO_RECORD_DURATION_SEC, fakeMessage);
             if (result.success && result.filePath) {
               const finalVideoPath = await camera.compressVideoIfNeeded(result.filePath, fakeMessage);
-              // Registra vídeo temporário usando a mesma lógica do routes
-              // (registerTempVideo não é exportado, então fazemos manualmente)
               let videoId = null;
               try {
-                const tempVideosDBPath = path.join(RECORDINGS_DIR, 'temp_videos', 'videos.json');
-                const VIDEO_EXPIRY_HOURS = 24;
-                
-                let db = {};
-                if (fs.existsSync(tempVideosDBPath)) {
-                  db = JSON.parse(fs.readFileSync(tempVideosDBPath, 'utf8'));
+                if (pendingVideoId && routesModule?.finalizeTempVideo) {
+                  if (routesModule.finalizeTempVideo(pendingVideoId, finalVideoPath)) {
+                    videoId = pendingVideoId;
+                    log(`[WS-ESP32] Vídeo pendente finalizado via routesModule: ${videoId}`);
+                  }
                 }
-                
-                videoId = `video_${Date.now()}_${Math.random().toString(36).substring(7)}`;
-                const expiresAt = Date.now() + (VIDEO_EXPIRY_HOURS * 60 * 60 * 1000);
-                const phoneNumbers = validNumbers.map(n => normalizeBR(n.normalized));
-                
-                db[videoId] = {
-                  filePath: finalVideoPath,
-                  phoneNumbers,
-                  createdAt: Date.now(),
-                  expiresAt,
-                  expiresAtISO: new Date(expiresAt).toISOString()
-                };
-                
-                // Cria diretório se não existir
-                const dbDir = path.dirname(tempVideosDBPath);
-                if (!fs.existsSync(dbDir)) {
-                  fs.mkdirSync(dbDir, { recursive: true });
+                if (!videoId && routesModule?.registerTempVideoExternal) {
+                  const phoneNumbers = validNumbers.map(n => normalizeBR(n.normalized));
+                  videoId = routesModule.registerTempVideoExternal(finalVideoPath, phoneNumbers);
+                  log(`[WS-ESP32] Vídeo registrado via routesModule: ${videoId}`);
+                  if (videoId && routesModule.updateVideoMessageIds && templateMessageIds.length > 0) {
+                    routesModule.updateVideoMessageIds(videoId, templateMessageIds);
+                  }
+                } else if (!videoId) {
+                  warn(`[WS-ESP32] registerTempVideoExternal não disponível no routesModule`);
                 }
-                
-                fs.writeFileSync(tempVideosDBPath, JSON.stringify(db, null, 2));
-                log(`[WS-ESP32] Vídeo registrado: ${videoId}`);
                 
                 // Atualiza timestamp APÓS gravação terminar
                 lastVideoRecordTimeWS = Date.now();
                 log(`[WS-ESP32] Timestamp de gravação atualizado: ${new Date(lastVideoRecordTimeWS).toISOString()}`);
                 
-                // Envia mensagem com botões para todos os números que receberam a imagem
                 if (videoId && validNumbers.length > 0) {
-                  log(`[WS-ESP32] Enviando notificação de vídeo para ${validNumbers.length} número(s)...`);
-                  
-                  // Aguarda um pouco para garantir que tudo está processado
-                  await new Promise(resolve => setTimeout(resolve, 1000));
-                  
-                  for (const { normalized, numberId } of validNumbers) {
-                    try {
-                      const to = numberId._serialized || normalized.replace(/^\+/, '') || normalized;
-                      
-                      if (whatsapp.sendInteractiveButtons) {
-                        // API Oficial - usa botões interativos
-                        log(`[WS-ESP32] Enviando botões interativos para ${to}...`);
-                        try {
-                          await whatsapp.sendInteractiveButtons(
-                            to,
-                            `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos da campainha.\n\nDeseja visualizar o vídeo? (Válido por 24 horas)`,
-                            [
-                              { id: `view_video_${videoId}`, title: '👁️ Ver Vídeo' },
-                              { id: 'skip_video', title: '⏭️ Pular' }
-                            ],
-                            'Campainha - Vídeo Temporário'
-                          );
-                          log(`[WS-ESP32] ✅ Botões interativos enviados com sucesso para ${to}`);
-                        } catch (buttonError) {
-                          err(`[WS-ESP32] ❌ Erro ao enviar botões interativos para ${to}:`, buttonError.message);
-                          // Tenta fallback para texto
-                          try {
-                            await whatsapp.sendTextMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
-                            log(`[WS-ESP32] ✅ Mensagem de texto enviada como fallback para ${to}`);
-                          } catch (textError) {
-                            err(`[WS-ESP32] ❌ Erro ao enviar mensagem de texto:`, textError.message);
-                          }
-                        }
-                      } else {
-                        warn(`[WS-ESP32] sendInteractiveButtons não disponível, enviando mensagem de texto`);
-                        await whatsapp.sendTextMessage(to, `🎥 *Vídeo Gravado*\n\nFoi gravado um vídeo de ${VIDEO_RECORD_DURATION_SEC} segundos.\n\nDigite: \`!video ${videoId}\` para ver o vídeo (válido por 24 horas)`);
-                        log(`[WS-ESP32] ✅ Mensagem de texto enviada para ${to}`);
-                      }
-                    } catch (sendError) {
-                      err(`[WS-ESP32] ❌ Erro ao enviar notificação de vídeo para ${normalized}:`, sendError.message);
-                    }
-                  }
+                  log(`[WS-ESP32] Vídeo registrado (${videoId}). Aguardando clique em "Ver Gravação" para envio.`);
                 }
               } catch (e) {
                 warn(`[WS-ESP32] Erro ao registrar vídeo:`, e.message);
               }
             } else {
+              if (pendingVideoId && routesModule?.markVideoFailed) {
+                routesModule.markVideoFailed(pendingVideoId, result.error || 'failed');
+              }
               // Atualiza timestamp mesmo em caso de falha
               lastVideoRecordTimeWS = Date.now();
             }
           } catch (e) {
             warn(`[WS-ESP32] Erro ao gravar vídeo:`, e.message);
+            if (pendingVideoId && routesModule?.markVideoFailed) {
+              routesModule.markVideoFailed(pendingVideoId, e.message);
+            }
             // Atualiza timestamp mesmo em caso de erro
             lastVideoRecordTimeWS = Date.now();
           }
@@ -1897,7 +1876,8 @@ server = app.listen(PORT, () => {
       getAbuseIPDB: () => abuseIPDB, // Função getter para acesso ao módulo AbuseIPDB
       tuya, // Módulo Tuya para controle de dispositivos
       getCurrentTuyaMonitor: () => tuyaMonitor, // Getter para acesso dinâmico ao Tuya Monitor
-      getCurrentComedorDeviceStatus: () => routesModule?.getComedorDeviceStatus?.() // Getter para acesso ao Comedor Device Status
+      getCurrentComedorDeviceStatus: () => routesModule?.getComedorDeviceStatus?.(), // Getter para acesso ao Comedor Device Status
+      getCurrentRoutesModule: () => routesModule
     });
     log(`[INIT] Módulo Admin inicializado com sucesso`);
     

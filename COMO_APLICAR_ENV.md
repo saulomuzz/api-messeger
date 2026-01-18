@@ -77,3 +77,22 @@ curl -X POST http://localhost:3000/send \
 
 Deve retornar `{"ok":true,...}` sem erro de "invalid signature"!
 
+## 🎥 Parâmetros de Vídeo
+
+Você pode controlar o tempo de visualização no WhatsApp e o tempo de retenção no servidor:
+
+```
+VIDEO_VIEW_HOURS=24
+VIDEO_RETENTION_HOURS=24
+```
+
+- `VIDEO_VIEW_HOURS`: tempo que o vídeo pode ser visto no WhatsApp.
+- `VIDEO_RETENTION_HOURS`: tempo que o arquivo permanece no servidor antes de ser apagado.
+
+## 🧾 Auditoria WhatsApp
+
+```
+WHATSAPP_AUDIT_RETENTION_DAYS=180
+```
+
+- `WHATSAPP_AUDIT_RETENTION_DAYS`: tempo de retenção do histórico de mensagens (dias).
