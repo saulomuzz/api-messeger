@@ -1,416 +1,159 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin - Login</title>
+    <meta charset="utf-8">
+    <meta http-equiv="x-ua-compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>api-messeger | Login</title>
+    <link rel="shortcut icon" type="image/x-icon" href="/admin/static/assets/images/favicon.ico">
+    <link rel="stylesheet" type="text/css" href="/admin/static/assets/css/bootstrap.min.css">
+    <link rel="stylesheet" type="text/css" href="/admin/static/assets/vendors/css/vendors.min.css">
+    <link rel="stylesheet" type="text/css" href="/admin/static/assets/css/theme.min.css">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
+        .auth-brand-chip {
+            display: inline-flex;
             align-items: center;
+            gap: 10px;
+            padding: 8px 14px;
+            border-radius: 999px;
+            background: rgba(30, 41, 59, 0.06);
+            color: #0f172a;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+        }
+        .auth-brand-chip .dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #16a34a, #0f766e);
+            box-shadow: 0 0 0 6px rgba(22, 163, 74, 0.12);
+        }
+        .auth-cover-content-wrapper {
+            position: relative;
+            overflow: hidden;
+            background:
+                radial-gradient(circle at top left, rgba(34, 197, 94, 0.18), transparent 36%),
+                radial-gradient(circle at bottom right, rgba(14, 165, 233, 0.16), transparent 32%),
+                linear-gradient(135deg, #0f172a, #0b3b49 58%, #14532d);
+        }
+        .auth-side-copy {
+            position: absolute;
+            inset: 0;
+            display: flex;
+            flex-direction: column;
             justify-content: center;
-            padding: 20px;
+            padding: 4rem;
+            color: #f8fafc;
         }
-        
-        .container {
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            padding: 40px;
-            max-width: 400px;
-            width: 100%;
+        .auth-side-copy h1 {
+            font-size: clamp(2rem, 4vw, 3.8rem);
+            line-height: 1.02;
+            margin-bottom: 1rem;
+            max-width: 12ch;
         }
-        
-        h1 {
-            color: #333;
-            margin-bottom: 10px;
-            font-size: 28px;
+        .auth-side-copy p {
+            max-width: 46ch;
+            color: rgba(248, 250, 252, 0.82);
+            font-size: 1rem;
         }
-        
-        .subtitle {
-            color: #666;
-            margin-bottom: 30px;
-            font-size: 14px;
+        .auth-side-points {
+            margin-top: 2rem;
+            display: grid;
+            gap: 1rem;
         }
-        
-        .form-group {
-            margin-bottom: 20px;
+        .auth-side-points div {
+            padding: 1rem 1.2rem;
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.08);
+            backdrop-filter: blur(10px);
         }
-        
-        label {
+        .auth-side-points strong {
             display: block;
-            margin-bottom: 8px;
-            color: #333;
-            font-weight: 500;
-            font-size: 14px;
+            margin-bottom: .2rem;
+            color: #fff;
         }
-        
-        input {
-            width: 100%;
-            padding: 12px 16px;
-            border: 2px solid #e0e0e0;
-            border-radius: 8px;
-            font-size: 16px;
-            transition: border-color 0.3s;
-        }
-        
-        input:focus {
-            outline: none;
-            border-color: #667eea;
-        }
-        
-        button {
-            width: 100%;
-            padding: 14px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 8px;
-            font-size: 16px;
+        .login-error {
+            display: none;
+            padding: 12px 14px;
+            border-radius: 12px;
+            background: #fef2f2;
+            color: #b91c1c;
+            border: 1px solid #fecaca;
+            margin-bottom: 1rem;
+            font-size: 13px;
             font-weight: 600;
-            cursor: pointer;
-            transition: transform 0.2s, box-shadow 0.2s;
         }
-        
-        button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
-        }
-        
-        button:active {
-            transform: translateY(0);
-        }
-        
-        button:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-            transform: none;
-        }
-        
-        .error {
-            background: #fee;
-            color: #c33;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            font-size: 14px;
-            display: none;
-        }
-        
-        .success {
-            background: #efe;
-            color: #3c3;
-            padding: 12px;
-            border-radius: 8px;
-            margin-bottom: 20px;
-            font-size: 14px;
-            display: none;
-        }
-        
-        .step {
-            display: none;
-        }
-        
-        .step.active {
+        .login-error.show {
             display: block;
         }
-        
-        .code-display {
-            text-align: center;
-            font-size: 32px;
-            font-weight: bold;
-            color: #667eea;
-            letter-spacing: 8px;
-            margin: 20px 0;
-            padding: 20px;
-            background: #f5f5f5;
-            border-radius: 8px;
-        }
-        
-        .back-link {
-            text-align: center;
-            margin-top: 20px;
-        }
-        
-        .back-link a {
-            color: #667eea;
-            text-decoration: none;
-            font-size: 14px;
-        }
-        
-        .back-link a:hover {
-            text-decoration: underline;
+        .auth-card-note {
+            font-size: 13px;
+            color: #64748b;
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🔐 Admin</h1>
-        <p class="subtitle">Acesso administrativo ao sistema</p>
-        
-        <div id="error" class="error"></div>
-        <div id="success" class="success"></div>
-        
-        <!-- Step 1: Solicitar código -->
-        <div id="step1" class="step active">
-            <div class="form-group">
-                <label for="phone">Número de telefone</label>
-                <input type="tel" id="phone" placeholder="(11) 99999-9999" maxlength="15" required>
-            </div>
-            <button id="requestCodeBtn">Solicitar código</button>
-        </div>
-        
-        <!-- Step 2: Inserir código -->
-        <div id="step2" class="step">
-            <p style="margin-bottom: 20px; color: #666;">Digite o código enviado para seu WhatsApp:</p>
-            <div class="form-group">
-                <label for="code">Código de acesso</label>
-                <input type="text" id="code" placeholder="000000" maxlength="6" pattern="[0-9]{6}" required>
-            </div>
-            <div class="form-group" style="display: flex; align-items: center; gap: 10px;">
-                <input type="checkbox" id="trustDevice" style="width: auto; margin: 0;">
-                <label for="trustDevice" style="margin: 0; cursor: pointer; font-weight: normal;">
-                    🔒 Confiar neste dispositivo por 30 dias
-                </label>
-            </div>
-            <button id="validateCodeBtn">Validar código</button>
-            <div class="back-link">
-                <a href="#" id="backLink">Voltar</a>
+    <main class="auth-cover-wrapper">
+        <div class="auth-cover-content-inner">
+            <div class="auth-cover-content-wrapper">
+                <div class="auth-side-copy">
+                    <div class="auth-brand-chip">
+                        <span class="dot"></span>
+                        WhatsApp Official Control
+                    </div>
+                    <h1>Operação, segurança e auditoria em um único painel.</h1>
+                    <p>Gerencie clientes da API, reputação de IP, templates da Meta, auto replies e trilha completa de envio sem navegar por telas dispersas.</p>
+                    <div class="auth-side-points">
+                        <div>
+                            <strong>Segurança primeiro</strong>
+                            Allowlist por cliente, bloqueio manual e classificação com AbuseIPDB.
+                        </div>
+                        <div>
+                            <strong>Fluxo operacional</strong>
+                            Configuração da WABA, testes de envio, templates e webhook no mesmo lugar.
+                        </div>
+                    </div>
+                </div>
             </div>
         </div>
-    </div>
-    
-    <script>
-        function showError(message) {
-            const errorDiv = document.getElementById('error');
-            errorDiv.textContent = message;
-            errorDiv.style.display = 'block';
-            document.getElementById('success').style.display = 'none';
-        }
-        
-        function showSuccess(message) {
-            const successDiv = document.getElementById('success');
-            successDiv.textContent = message;
-            successDiv.style.display = 'block';
-            document.getElementById('error').style.display = 'none';
-        }
-        
-        function hideMessages() {
-            document.getElementById('error').style.display = 'none';
-            document.getElementById('success').style.display = 'none';
-        }
-        
-        function showStep(step) {
-            document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
-            document.getElementById(`step${step}`).classList.add('active');
-            hideMessages();
-        }
-        
-        function backToStep1() {
-            showStep(1);
-            document.getElementById('code').value = '';
-        }
-        
-        // Função para aplicar máscara de telefone brasileiro
-        function formatPhone(value) {
-            // Remove tudo que não é número
-            let numbers = value.replace(/\D/g, '');
-            
-            // Remove o prefixo +55 se existir
-            if (numbers.startsWith('55') && numbers.length > 10) {
-                numbers = numbers.substring(2);
-            }
-            
-            // Aplica máscara: (XX) XXXXX-XXXX
-            if (numbers.length <= 10) {
-                return numbers.replace(/(\d{2})(\d{4})(\d{0,4})/, function(match, p1, p2, p3) {
-                    if (p3) return `(${p1}) ${p2}-${p3}`;
-                    if (p2) return `(${p1}) ${p2}`;
-                    if (p1) return `(${p1}`;
-                    return numbers;
-                });
-            } else {
-                // Para números com DDD + 9 dígitos
-                return numbers.replace(/(\d{2})(\d{5})(\d{0,4})/, function(match, p1, p2, p3) {
-                    if (p3) return `(${p1}) ${p2}-${p3}`;
-                    if (p2) return `(${p1}) ${p2}`;
-                    if (p1) return `(${p1}`;
-                    return numbers;
-                });
-            }
-        }
-        
-        // Função para normalizar telefone (remove formatação e adiciona +55)
-        function normalizePhone(value) {
-            // Remove tudo que não é número
-            let numbers = value.replace(/\D/g, '');
-            
-            // Remove o prefixo +55 se existir
-            if (numbers.startsWith('55') && numbers.length > 10) {
-                numbers = numbers.substring(2);
-            }
-            
-            // Adiciona +55 se não tiver
-            if (numbers.length >= 10 && numbers.length <= 11) {
-                return `+55${numbers}`;
-            }
-            
-            return value; // Retorna original se não conseguir normalizar
-        }
-        
-        async function requestCode() {
-            const phoneInput = document.getElementById('phone');
-            const phone = normalizePhone(phoneInput.value.trim());
-            const btn = document.getElementById('requestCodeBtn');
-            
-            if (!phone || phone.length < 12) {
-                showError('Por favor, insira um número de telefone válido');
-                return;
-            }
-            
-            btn.disabled = true;
-            btn.textContent = 'Enviando...';
-            hideMessages();
-            
-            try {
-                const response = await fetch('/admin/request-code', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ phone })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    showSuccess('Código enviado com sucesso! Verifique seu WhatsApp.');
-                    setTimeout(() => {
-                        showStep(2);
-                        document.getElementById('code').focus();
-                    }, 1000);
-                } else {
-                    showError(data.error || 'Erro ao enviar código');
-                }
-            } catch (error) {
-                showError('Erro ao solicitar código: ' + error.message);
-            } finally {
-                btn.disabled = false;
-                btn.textContent = 'Solicitar código';
-            }
-        }
-        
-        async function validateCode() {
-            const phoneInput = document.getElementById('phone');
-            const phone = normalizePhone(phoneInput.value.trim());
-            const code = document.getElementById('code').value.trim();
-            const trustDevice = document.getElementById('trustDevice').checked;
-            const btn = document.getElementById('validateCodeBtn');
-            
-            if (!code || code.length !== 6) {
-                showError('Por favor, insira um código válido (6 dígitos)');
-                return;
-            }
-            
-            btn.disabled = true;
-            btn.textContent = 'Validando...';
-            hideMessages();
-            
-            try {
-                const response = await fetch('/admin/validate-code', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json'
-                    },
-                    body: JSON.stringify({ phone, code, trustDevice })
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    const msg = data.trusted 
-                        ? 'Código válido! Dispositivo confiável salvo. Redirecionando...'
-                        : 'Código válido! Redirecionando...';
-                    showSuccess(msg);
-                    setTimeout(() => {
-                        window.location.href = '/admin/dashboard';
-                    }, 1000);
-                } else {
-                    showError(data.error || 'Código inválido');
-                }
-            } catch (error) {
-                showError('Erro ao validar código: ' + error.message);
-            } finally {
-                btn.disabled = false;
-                btn.textContent = 'Validar código';
-            }
-        }
-        
-        // Event listeners (adicionados após DOM estar pronto)
-        document.addEventListener('DOMContentLoaded', () => {
-            const requestBtn = document.getElementById('requestCodeBtn');
-            const validateBtn = document.getElementById('validateCodeBtn');
-            const backLink = document.getElementById('backLink');
-            
-            if (requestBtn) {
-                requestBtn.addEventListener('click', requestCode);
-            }
-            if (validateBtn) {
-                validateBtn.addEventListener('click', validateCode);
-            }
-            if (backLink) {
-                backLink.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    backToStep1();
-                });
-            }
-            
-            // Enter key support e máscara de telefone
-            const phoneInput = document.getElementById('phone');
-            const codeInput = document.getElementById('code');
-            
-            if (phoneInput) {
-                // Aplica máscara enquanto digita
-                phoneInput.addEventListener('input', (e) => {
-                    const cursorPosition = e.target.selectionStart;
-                    const oldValue = e.target.value;
-                    const newValue = formatPhone(e.target.value);
-                    e.target.value = newValue;
-                    
-                    // Mantém a posição do cursor
-                    const diff = newValue.length - oldValue.length;
-                    e.target.setSelectionRange(cursorPosition + diff, cursorPosition + diff);
-                });
-                
-                // Remove +55 se o usuário colar
-                phoneInput.addEventListener('paste', (e) => {
-                    e.preventDefault();
-                    const pasted = (e.clipboardData || window.clipboardData).getData('text');
-                    const cleaned = formatPhone(pasted);
-                    e.target.value = cleaned;
-                });
-                
-                phoneInput.addEventListener('keypress', (e) => {
-                    if (e.key === 'Enter') requestCode();
-                });
-            }
-            
-            if (codeInput) {
-                codeInput.addEventListener('keypress', (e) => {
-                    if (e.key === 'Enter') validateCode();
-                });
-            }
-        });
-    </script>
+        <div class="auth-cover-sidebar-inner">
+            <div class="auth-cover-card-wrapper">
+                <div class="auth-cover-card p-sm-5">
+                    <div class="wd-50 mb-4">
+                        <img src="/admin/static/assets/images/logo-abbr.png" alt="" class="img-fluid">
+                    </div>
+                    <div class="auth-brand-chip mb-4">
+                        <span class="dot"></span>
+                        api-messeger
+                    </div>
+                    <h2 class="fs-20 fw-bolder mb-2">Entrar no painel</h2>
+                    <p class="auth-card-note mb-4">Use a conta administrativa para operar a API oficial do WhatsApp e a camada de segurança do ambiente.</p>
+                    <div class="login-error {{ERROR_CLASS}}">{{ERROR}}</div>
+                    <form action="/admin/login" method="post" class="w-100">
+                        <div class="mb-4">
+                            <input type="text" name="username" class="form-control" placeholder="Usuário" autocomplete="username" required>
+                        </div>
+                        <div class="mb-4">
+                            <input type="password" name="password" class="form-control" placeholder="Senha" autocomplete="current-password" required>
+                        </div>
+                        <div class="d-grid gap-2">
+                            <button type="submit" class="btn btn-lg btn-primary">Entrar</button>
+                        </div>
+                    </form>
+                    <div class="mt-4 pt-3 border-top">
+                        <div class="d-flex justify-content-between fs-12 text-muted">
+                            <span>Painel protegido por sessão</span>
+                            <span>Admin</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script src="/admin/static/assets/vendors/js/vendors.min.js"></script>
+    <script src="/admin/static/assets/js/common-init.min.js"></script>
 </body>
 </html>
-
