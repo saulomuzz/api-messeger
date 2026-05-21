@@ -514,10 +514,11 @@ async function createDatabase({ dbPath }) {
     async listConversationSummaries(limit = 50, offset = 0) {
       const rows = await db.all(`
         WITH events AS (
-          SELECT COALESCE(NULLIF(from_number,''), source_ip, 'unknown') AS phone,
+          SELECT from_number AS phone,
                  created_at, 'inbound' AS direction, event_type AS sublabel,
                  NULL AS status, payload_json
           FROM webhook_events
+          WHERE from_number != ''
           UNION ALL
           SELECT to_number AS phone, created_at, 'outbound' AS direction,
                  message_type AS sublabel, status, payload_json
@@ -546,7 +547,7 @@ async function createDatabase({ dbPath }) {
       const row = await db.get(`
         SELECT COUNT(*) AS total FROM (
           SELECT DISTINCT phone FROM (
-            SELECT COALESCE(NULLIF(from_number,''), source_ip, 'unknown') AS phone FROM webhook_events
+            SELECT from_number AS phone FROM webhook_events WHERE from_number != ''
             UNION ALL SELECT to_number AS phone FROM message_audit
           )
         )
@@ -558,9 +559,7 @@ async function createDatabase({ dbPath }) {
       const [messages, webhooks] = await Promise.all([
         db.all('SELECT * FROM message_audit WHERE to_number = ? ORDER BY created_at ASC', [p]),
         db.all(
-          `SELECT * FROM webhook_events
-           WHERE COALESCE(NULLIF(from_number,''), source_ip, 'unknown') = ?
-           ORDER BY created_at ASC`,
+          `SELECT * FROM webhook_events WHERE from_number = ? ORDER BY created_at ASC`,
           [p]
         ),
       ]);
