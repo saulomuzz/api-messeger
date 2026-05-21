@@ -163,6 +163,18 @@ function registerAdminRoutes(app, deps) {
     res.json({ plain_token: token });
   }));
 
+  app.delete('/admin/api/clients/:id', requireAdmin, asyncHandler(async (req, res) => {
+    await db.deleteApiClient(req.params.id);
+    await db.createAdminAction({
+      adminUserId: req.adminUser.id,
+      action: 'delete_client',
+      targetType: 'api_client',
+      targetId: String(req.params.id),
+      details: {},
+    });
+    res.json({ ok: true });
+  }));
+
   app.post('/admin/api/clients/:id/allow-ip', requireAdmin, asyncHandler(async (req, res) => {
     await security.allowIpForClient({
       clientId: Number(req.params.id),
