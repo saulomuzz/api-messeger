@@ -2,11 +2,27 @@ const axios = require('axios');
 
 const { getPublicSettings } = require('./settings');
 const { sanitizePayload } = require('./utils');
+const { createChatbotService } = require('./chatbot');
 
 function createWhatsAppService({ db }) {
+  const chatbot = createChatbotService({ db });
   async function getConfig() {
     const settings = await getPublicSettings(db);
     return settings.whatsapp;
+  }
+
+  /**
+   * Retorna o destinatário real considerando o modo desenvolvedor.
+   * Quando dev.mode_enabled=true e dev.test_phone está preenchido,
+   * TODOS os envios são redirecionados para o número de teste.
+   * Retorna também um flag para prefixar mensagens de texto.
+   */
+  async function resolveRecipient(originalTo) {
+    const settings = await getPublicSettings(db);
+    if (settings.dev.mode_enabled && settings.dev.test_phone) {
+      return { to: settings.dev.test_phone, devMode: true, originalTo };
+    }
+    return { to: originalTo, devMode: false, originalTo };
   }
 
 async function graphRequest({ method, path, data, params }) {
@@ -34,17 +50,22 @@ async function graphRequest({ method, path, data, params }) {
 }
 
   async function sendText({ clientId, requestId, ip, to, text, clientReference }) {
+    const recipient = await resolveRecipient(to);
+    const body = recipient.devMode
+      ? `[DEV → ${recipient.originalTo}] ${text}`
+      : text;
     const payload = {
       messaging_product: 'whatsapp',
-      to,
+      to: recipient.to,
       type: 'text',
-      text: { body: text },
+      text: { body },
     };
     const auditId = await db.createMessageAudit({
       requestId,
       clientId,
       clientReference,
       toNumber: to,
+      devRedirectedTo: recipient.devMode ? recipient.to : '',
       messageType: 'text',
       status: 'pending',
       payload,
@@ -73,10 +94,46 @@ async function graphRequest({ method, path, data, params }) {
     }
   }
 
-  async function sendTemplate({ clientId, requestId, ip, to, templateName, languageCode, components, clientReference }) {
+  async function sendInteractive({ clientId, requestId, ip, to, interactive, clientReference }) {
+    const recipient = await resolveRecipient(to);
     const payload = {
       messaging_product: 'whatsapp',
-      to,
+      to: recipient.to,
+      type: 'interactive',
+      interactive,
+    };
+    const auditId = await db.createMessageAudit({
+      requestId,
+      clientId,
+      clientReference,
+      toNumber: to,
+      devRedirectedTo: recipient.devMode ? recipient.to : '',
+      messageType: 'interactive',
+      status: 'pending',
+      payload,
+      sourceIp: ip,
+    });
+    try {
+      const config = await getConfig();
+      const response = await graphRequest({
+        method: 'post',
+        path: `/${config.phone_number_id}/messages`,
+        data: payload,
+      });
+      const metaMessageId = response.messages?.[0]?.id || '';
+      await db.updateMessageAudit(auditId, { status: 'sent', metaMessageId, response });
+      return { auditId, metaMessageId };
+    } catch (error) {
+      await db.updateMessageAudit(auditId, { status: 'failed', error: extractAxiosError(error) });
+      throw error;
+    }
+  }
+
+  async function sendTemplate({ clientId, requestId, ip, to, templateName, languageCode, components, clientReference }) {
+    const recipient = await resolveRecipient(to);
+    const payload = {
+      messaging_product: 'whatsapp',
+      to: recipient.to,
       type: 'template',
       template: {
         name: templateName,
@@ -89,6 +146,7 @@ async function graphRequest({ method, path, data, params }) {
       clientId,
       clientReference,
       toNumber: to,
+      devRedirectedTo: recipient.devMode ? recipient.to : '',
       messageType: 'template',
       status: 'pending',
       payload,
@@ -118,9 +176,10 @@ async function graphRequest({ method, path, data, params }) {
   }
 
   async function sendMedia({ clientId, requestId, ip, to, mediaType, link, mediaId, caption, filename, clientReference }) {
+    const recipient = await resolveRecipient(to);
     const payload = {
       messaging_product: 'whatsapp',
-      to,
+      to: recipient.to,
       type: mediaType,
       [mediaType]: {
         ...(link ? { link } : {}),
@@ -134,6 +193,7 @@ async function graphRequest({ method, path, data, params }) {
       clientId,
       clientReference,
       toNumber: to,
+      devRedirectedTo: recipient.devMode ? recipient.to : '',
       messageType: mediaType,
       status: 'pending',
       payload,
@@ -208,7 +268,29 @@ async function graphRequest({ method, path, data, params }) {
       action: null,
     };
 
+    // Deduplicação: ignora webhook duplicado (retry da Meta após crash)
+    if (messageId && await db.webhookMessageProcessed(messageId)) {
+      result.action = 'duplicate_skipped';
+      return { webhookEventId: null, result };
+    }
+
+    // Botão interativo clicado pelo usuário
+    if (message?.type === 'interactive') {
+      const buttonId = message.interactive?.button_reply?.id || '';
+      const chatbotHandled = await chatbot.handle(fromNumber, buttonId, { sendText, sendInteractive });
+      if (chatbotHandled) {
+        result.action = 'chatbot';
+      }
+    }
+
     if (message?.type === 'text') {
+      // Chatbot tem prioridade sobre auto-replies
+      const chatbotHandled = await chatbot.handle(fromNumber, message.text?.body || '', { sendText, sendInteractive });
+      if (chatbotHandled) {
+        result.action = 'chatbot';
+      }
+
+      if (!chatbotHandled) {
       const autoReply = await findAutoReply(message.text?.body || '');
       if (autoReply) {
         result.matched_rule_id = autoReply.id;
@@ -236,6 +318,7 @@ async function graphRequest({ method, path, data, params }) {
           });
         }
       }
+      } // end !chatbotHandled
     }
 
     const webhookEventId = await db.insertWebhookEvent({
@@ -263,13 +346,41 @@ async function graphRequest({ method, path, data, params }) {
     }) || null;
   }
 
+  async function uploadMedia({ buffer, mimeType }) {
+    const config = await getConfig();
+    if (!config.access_token || !config.phone_number_id || !config.api_version) {
+      throw new Error('WhatsApp configuration is incomplete.');
+    }
+    const FormData = require('form-data');
+    const form = new FormData();
+    form.append('messaging_product', 'whatsapp');
+    form.append('file', buffer, { contentType: mimeType, filename: 'image.png' });
+    try {
+      const response = await axios({
+        method: 'post',
+        url: `https://graph.facebook.com/${config.api_version}/${config.phone_number_id}/media`,
+        headers: {
+          Authorization: `Bearer ${config.access_token}`,
+          ...form.getHeaders(),
+        },
+        data: form,
+        timeout: 30000,
+      });
+      return response.data.id;
+    } catch (error) {
+      throw createGraphApiError(error);
+    }
+  }
+
   return {
     getConfig,
     handleWebhook,
     listTemplates,
+    sendInteractive,
     sendMedia,
     sendTemplate,
     sendText,
+    uploadMedia,
     verifyWebhook,
   };
 }

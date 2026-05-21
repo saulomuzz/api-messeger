@@ -1,5 +1,3 @@
-const axios = require('axios');
-
 const { getPublicSettings } = require('./settings');
 const { isIpInList, normalizeIp, nowIso, parsePositiveInt, sha256 } = require('./utils');
 
@@ -37,89 +35,22 @@ function createSecurityService({ db }) {
     };
   }
 
-  function classifyScore(score, yellowThreshold, blockThreshold) {
-    if (score >= blockThreshold) {
-      return 'blacklist';
-    }
-    if (score >= yellowThreshold) {
-      return 'yellowlist';
-    }
-    return 'whitelist';
-  }
-
-  async function fetchAbuseReport(ip, settings) {
-    if (!settings.abuseKey) {
-      return {
-        ip,
-        abuseScore: 0,
-        category: 'whitelist',
-        source: 'no_api_key',
-        payload: {},
-        checkedAt: nowIso(),
-        expiresAt: new Date(Date.now() + settings.reputationTtlMinutes * 60000).toISOString(),
-      };
-    }
-
-    const response = await axios.get('https://api.abuseipdb.com/api/v2/check', {
-      params: {
-        ipAddress: ip,
-        maxAgeInDays: 90,
-        verbose: true,
-      },
-      headers: {
-        Key: settings.abuseKey,
-        Accept: 'application/json',
-      },
-      timeout: 15000,
-    });
-
-    const data = response.data?.data || {};
+  function _whitelistEntry(ip, ttlMinutes) {
     return {
       ip,
-      abuseScore: Number(data.abuseConfidenceScore || 0),
-      countryCode: data.countryCode || '',
-      usageType: data.usageType || '',
-      isp: data.isp || '',
-      domain: data.domain || '',
-      totalReports: Number(data.totalReports || 0),
-      category: classifyScore(Number(data.abuseConfidenceScore || 0), settings.yellowThreshold, settings.blockThreshold),
-      source: 'abuseipdb',
-      payload: data,
+      abuseScore: 0,
+      category: 'whitelist',
+      source: 'disabled',
+      payload: {},
       checkedAt: nowIso(),
-      expiresAt: new Date(Date.now() + settings.reputationTtlMinutes * 60000).toISOString(),
+      expiresAt: new Date(Date.now() + ttlMinutes * 60000).toISOString(),
     };
   }
 
-  async function getOrRefreshIpReputation(ip, options = {}) {
+  async function getOrRefreshIpReputation(ip) {
     const normalized = normalizeIp(ip);
     const settings = await getRuntimeSettings();
-    const cached = !options.force ? await db.getIpReputation(normalized) : null;
-    if (cached && cached.expires_at > nowIso()) {
-      return {
-        ip: cached.ip,
-        abuseScore: cached.abuse_score,
-        category: cached.category,
-        countryCode: cached.country_code,
-        usageType: cached.usage_type,
-        isp: cached.isp,
-        domain: cached.domain,
-        totalReports: cached.total_reports,
-        source: cached.source,
-        checkedAt: cached.checked_at,
-        expiresAt: cached.expires_at,
-      };
-    }
-
-    const fresh = await fetchAbuseReport(normalized, settings);
-    await db.upsertIpReputation(fresh);
-    if (fresh.category === 'blacklist') {
-      await db.blockIp({
-        ip: normalized,
-        reason: `Automatic block by AbuseIPDB score ${fresh.abuseScore}.`,
-        source: 'abuseipdb',
-      });
-    }
-    return fresh;
+    return _whitelistEntry(normalized, settings.reputationTtlMinutes);
   }
 
   async function lookupIp(ip) {

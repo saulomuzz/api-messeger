@@ -170,6 +170,7 @@ async function createDatabase({ dbPath }) {
       client_id INTEGER,
       client_reference TEXT DEFAULT '',
       to_number TEXT NOT NULL,
+      dev_redirected_to TEXT DEFAULT '',
       message_type TEXT NOT NULL,
       status TEXT NOT NULL,
       meta_message_id TEXT DEFAULT '',
@@ -238,6 +239,15 @@ async function createDatabase({ dbPath }) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS chatbot_sessions (
+      phone       TEXT PRIMARY KEY,
+      state       TEXT NOT NULL DEFAULT 'idle',
+      person_type TEXT,
+      person_name TEXT,
+      data_json   TEXT DEFAULT '{}',
+      updated_at  INTEGER NOT NULL
+    );
+
     CREATE INDEX IF NOT EXISTS idx_api_clients_token_hash ON api_clients(token_hash);
     CREATE INDEX IF NOT EXISTS idx_api_client_ips_client_id ON api_client_ips(client_id);
     CREATE INDEX IF NOT EXISTS idx_ip_reputation_category ON ip_reputation(category);
@@ -247,6 +257,9 @@ async function createDatabase({ dbPath }) {
     CREATE INDEX IF NOT EXISTS idx_message_audit_meta_message_id ON message_audit(meta_message_id);
     CREATE INDEX IF NOT EXISTS idx_webhook_events_created_at ON webhook_events(created_at);
   `);
+
+  // Migrations idempotentes — adicionam colunas em tabelas existentes sem recriar dados
+  await db.run(`ALTER TABLE message_audit ADD COLUMN dev_redirected_to TEXT DEFAULT ''`).catch(() => {});
 
   const api = {
     db,
@@ -313,6 +326,10 @@ async function createDatabase({ dbPath }) {
     },
     async regenerateApiClientToken(id, token) {
       await db.run('UPDATE api_clients SET token_hash = ?, updated_at = ? WHERE id = ?', [sha256(token), nowIso(), id]);
+    },
+    async deleteApiClient(id) {
+      await db.run('DELETE FROM api_client_ips WHERE client_id = ?', [id]);
+      await db.run('DELETE FROM api_clients WHERE id = ?', [id]);
     },
     async listApiClients() {
       const clients = await db.all(
@@ -425,14 +442,15 @@ async function createDatabase({ dbPath }) {
       const now = nowIso();
       const result = await db.run(
         `INSERT INTO message_audit (
-          request_id, client_id, client_reference, to_number, message_type, status, meta_message_id,
+          request_id, client_id, client_reference, to_number, dev_redirected_to, message_type, status, meta_message_id,
           payload_json, response_json, error_json, source_ip, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           entry.requestId,
           entry.clientId || null,
           entry.clientReference || '',
           entry.toNumber,
+          entry.devRedirectedTo || '',
           entry.messageType,
           entry.status,
           entry.metaMessageId || '',
@@ -606,6 +624,36 @@ async function createDatabase({ dbPath }) {
     },
     async markAdminLogin(userId) {
       await db.run('UPDATE admin_users SET last_login_at = ?, updated_at = ? WHERE id = ?', [nowIso(), nowIso(), userId]);
+    },
+
+    // ── Chatbot sessions ──────────────────────────────────────────────────────
+    async getChatbotSession(phone) {
+      return db.get('SELECT * FROM chatbot_sessions WHERE phone = ?', [phone]);
+    },
+    async upsertChatbotSession(phone, state, personType, personName, data) {
+      await db.run(
+        `INSERT INTO chatbot_sessions (phone, state, person_type, person_name, data_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(phone) DO UPDATE SET
+           state = excluded.state,
+           person_type = excluded.person_type,
+           person_name = excluded.person_name,
+           data_json = excluded.data_json,
+           updated_at = excluded.updated_at`,
+        [phone, state, personType || null, personName || null, JSON.stringify(data || {}), Date.now()]
+      );
+    },
+    async deleteChatbotSession(phone) {
+      await db.run('DELETE FROM chatbot_sessions WHERE phone = ?', [phone]);
+    },
+
+    async webhookMessageProcessed(messageId) {
+      if (!messageId) return false;
+      const row = await db.get(
+        `SELECT id FROM webhook_events WHERE message_id = ? AND message_id != '' LIMIT 1`,
+        [messageId]
+      );
+      return Boolean(row);
     },
   };
 

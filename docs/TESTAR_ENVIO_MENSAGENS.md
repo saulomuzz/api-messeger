@@ -81,6 +81,62 @@ Execute:
 node test-send.js
 ```
 
+## 2.1 Testar envio de imagem ou video
+
+O endpoint alinhado com a Cloud API da Meta e recomendado para outras ferramentas e:
+
+`POST /v1/messages/media`
+
+Campos aceitos:
+
+- `to`: numero em formato internacional
+- `media_type`: `image`, `video`, `document`, `audio` ou `sticker`
+- `link` ou `media_id`: informe somente um dos dois
+- `caption`: opcional para `image`, `video` e `document`
+- `filename`: opcional para `document`
+
+### Exemplo com imagem por URL
+
+```bash
+curl -X POST https://seu-dominio.com.br/v1/messages/media \
+  -H "Authorization: Bearer seu_token_do_cliente" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "5511999999999",
+    "media_type": "image",
+    "link": "https://exemplo.com/foto.jpg",
+    "caption": "Imagem enviada por integracao externa"
+  }'
+```
+
+### Exemplo com video por `media_id`
+
+```bash
+curl -X POST https://seu-dominio.com.br/v1/messages/media \
+  -H "Authorization: Bearer seu_token_do_cliente" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "5511999999999",
+    "media_type": "video",
+    "media_id": "123456789012345",
+    "caption": "Video ja hospedado na Meta"
+  }'
+```
+
+### Exemplo legado com `X-API-Token`
+
+```bash
+curl -X POST https://seu-dominio.com.br/send/media \
+  -H "Content-Type: application/json" \
+  -H "X-API-Token: seu_api_token" \
+  -d '{
+    "phone": "5511999999999",
+    "media_type": "image",
+    "link": "https://exemplo.com/foto.jpg",
+    "caption": "Imagem via endpoint legado"
+  }'
+```
+
 ## 3. Testar Mensagens Interativas
 
 ### Enviar Menu com Botões

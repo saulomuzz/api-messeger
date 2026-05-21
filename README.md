@@ -69,11 +69,73 @@ Para documentação detalhada, consulte a pasta [`docs/`](docs/):
 - `GET /status` - Estado detalhado do WhatsApp
 - `GET /qr.png` - QR Code para autenticação
 - `POST /send` - Envia mensagem de texto
+- `POST /send/media` - Envia imagem, vídeo, documento, áudio ou sticker
+- `POST /v1/messages/media` - Envia mídia com Bearer token no formato da Cloud API
 - `POST /trigger-snapshot` - **ESP32** - Envia snapshot de câmera
 - `GET /esp32/validate` - **ESP32** - Valida autorização
 - `GET /tuya/device/:deviceId/status` - **Tuya** - Consulta status de dispositivo
 - `GET /tuya/devices` - **Tuya** - Lista dispositivos do usuário
 - `POST /tuya/devices/status` - **Tuya** - Consulta status de múltiplos dispositivos
+
+## Envio de Imagem e Video
+
+Para integrações com outras ferramentas, a API aceita envio de mídia seguindo o modelo da WhatsApp Cloud API: você informa `media_type` e usa exatamente uma origem, `link` ou `media_id`.
+
+Tipos aceitos:
+
+- `image`
+- `video`
+- `document`
+- `audio`
+- `sticker`
+
+Regras:
+
+- Use apenas um entre `link` e `media_id`
+- `caption` é aceito para `image`, `video` e `document`
+- `filename` é aceito para `document`
+
+### Exemplo moderno com Bearer token
+
+```bash
+curl -X POST http://localhost:3000/v1/messages/media \
+  -H "Authorization: Bearer seu_token_do_cliente" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "5511999999999",
+    "media_type": "image",
+    "link": "https://exemplo.com/imagem.jpg",
+    "caption": "Imagem enviada pela API"
+  }'
+```
+
+### Exemplo de video com `media_id`
+
+```bash
+curl -X POST http://localhost:3000/v1/messages/media \
+  -H "Authorization: Bearer seu_token_do_cliente" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "to": "5511999999999",
+    "media_type": "video",
+    "media_id": "123456789012345",
+    "caption": "Video hospedado na Meta"
+  }'
+```
+
+### Exemplo legado com `x-api-token`
+
+```bash
+curl -X POST http://localhost:3000/send/media \
+  -H "X-API-Token: seu_token_legado" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "phone": "5511999999999",
+    "media_type": "image",
+    "link": "https://exemplo.com/imagem.jpg",
+    "caption": "Imagem via endpoint legado"
+  }'
+```
 
 ## Variáveis de Ambiente Principais
 

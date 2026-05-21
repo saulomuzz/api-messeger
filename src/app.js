@@ -25,6 +25,9 @@ const APP_ROOT = path.resolve(__dirname, '..');
 const DB_PATH = process.env.SQLITE_PATH || path.join(APP_ROOT, 'data', 'app.sqlite');
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const LEGACY_API_TOKEN = process.env.API_TOKEN || '';
+const ALLOWED_MEDIA_TYPES = new Set(['audio', 'document', 'image', 'sticker', 'video']);
+const CAPTION_MEDIA_TYPES = new Set(['document', 'image', 'video']);
+const FILENAME_MEDIA_TYPES = new Set(['document']);
 
 function createJsonError(res, requestIdValue, status, code, message, details) {
   return res.status(status).json({
@@ -40,6 +43,61 @@ function createJsonError(res, requestIdValue, status, code, message, details) {
 
 function asyncRoute(handler) {
   return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
+
+function normalizeMediaRequest(input = {}) {
+  return {
+    to: input.to ? String(input.to).trim() : '',
+    mediaType: input.media_type ? String(input.media_type).trim().toLowerCase() : '',
+    link: input.link ? String(input.link).trim() : '',
+    mediaId: input.media_id ? String(input.media_id).trim() : '',
+    caption: input.caption ? String(input.caption) : '',
+    filename: input.filename ? String(input.filename) : '',
+    clientReference: input.client_reference ? String(input.client_reference) : '',
+  };
+}
+
+function validateMediaPayload(payload) {
+  if (!payload.to) {
+    return '`to` is required.';
+  }
+
+  if (!payload.mediaType) {
+    return '`media_type` is required.';
+  }
+
+  if (!ALLOWED_MEDIA_TYPES.has(payload.mediaType)) {
+    return '`media_type` must be one of: audio, document, image, sticker, video.';
+  }
+
+  if (!payload.link && !payload.mediaId) {
+    return 'One of `link` or `media_id` is required.';
+  }
+
+  if (payload.link && payload.mediaId) {
+    return 'Use only one source: `link` or `media_id`.';
+  }
+
+  if (payload.link) {
+    try {
+      const parsed = new URL(payload.link);
+      if (!/^https?:$/i.test(parsed.protocol)) {
+        return '`link` must use `http` or `https`.';
+      }
+    } catch (error) {
+      return '`link` must be a valid URL.';
+    }
+  }
+
+  if (payload.caption && !CAPTION_MEDIA_TYPES.has(payload.mediaType)) {
+    return '`caption` is supported only for image, video or document.';
+  }
+
+  if (payload.filename && !FILENAME_MEDIA_TYPES.has(payload.mediaType)) {
+    return '`filename` is supported only for document.';
+  }
+
+  return null;
 }
 
 async function main() {
@@ -87,7 +145,26 @@ async function main() {
     next();
   });
 
-  app.use(helmet({ crossOriginResourcePolicy: false }));
+  // Admin panel usa javascript:void(0) e inline styles do tema — CSP relaxado só para /admin
+  app.use((req, res, next) => {
+    if (req.path.startsWith('/admin')) {
+      return helmet({
+        crossOriginResourcePolicy: false,
+        contentSecurityPolicy: {
+          directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'"],
+            scriptSrcAttr: ["'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
+            imgSrc: ["'self'", 'data:'],
+            connectSrc: ["'self'"],
+          },
+        },
+      })(req, res, next);
+    }
+    return helmet({ crossOriginResourcePolicy: false })(req, res, next);
+  });
   app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN, credentials: true }));
   app.use(compression());
   app.use(express.json({ limit: '2mb' }));
@@ -116,6 +193,98 @@ async function main() {
     res.locals.auditResponseBody = JSON.stringify(body);
     res.json(body);
   }));
+
+  // ── ESP32 endpoints ──────────────────────────────────────────────────────────
+
+  // Alias /health → /v1/health (ESP32 calls without /v1 prefix)
+  app.get('/health', asyncRoute(async (req, res) => {
+    const settings = await getPublicSettings(db);
+    res.json({
+      status: 'ok',
+      ready: Boolean(settings.whatsapp.phone_number_id && settings.whatsapp.access_token),
+    });
+  }));
+
+  function requireEsp32Token(req, res, next) {
+    return asyncRoute(async (req, res, next) => {
+      const token = req.get('x-esp32-token') || '';
+      const settings = await getPublicSettings(db);
+      const validToken = settings.esp32.token;
+      if (!validToken || token !== validToken) {
+        return res.status(403).json({ authorized: false, error: 'Invalid ESP32 token.' });
+      }
+      req.esp32Settings = settings.esp32;
+      next();
+    })(req, res, next);
+  }
+
+  app.get('/esp32/validate', requireEsp32Token, asyncRoute(async (req, res) => {
+    res.json({ authorized: true });
+  }));
+
+  app.post('/trigger-snapshot', requireEsp32Token, asyncRoute(async (req, res) => {
+    const { message } = req.body || {};
+    const esp32 = req.esp32Settings;
+
+    const phones = esp32.notify_phones.filter(Boolean);
+    if (!phones.length) {
+      return res.status(422).json({ ok: false, error: 'No notify_phones configured in ESP32 settings.' });
+    }
+
+    // Fetch camera snapshot and upload to Meta
+    let mediaId = null;
+    if (esp32.camera_snapshot_url) {
+      try {
+        const axios = require('axios');
+        const imgResp = await axios.get(esp32.camera_snapshot_url, { responseType: 'arraybuffer', timeout: 10000 });
+        const mimeType = imgResp.headers['content-type'] || 'image/jpeg';
+        const buffer = Buffer.from(imgResp.data);
+        const rgb = await convertToRgbJpeg(buffer);
+        mediaId = await whatsapp.uploadMedia({ buffer: rgb, mimeType: 'image/jpeg' });
+      } catch (camErr) {
+        console.error('[ESP32] Camera snapshot failed:', camErr.message);
+      }
+    }
+
+    // Send template to each phone
+    let success = 0;
+    const total = phones.length;
+    for (const phone of phones) {
+      try {
+        const components = [];
+        if (mediaId) {
+          components.push({ type: 'header', parameters: [{ type: 'image', image: { id: mediaId } }] });
+        }
+        await whatsapp.sendTemplate({
+          clientId: null,
+          requestId: req.ctx.requestId,
+          ip: req.ctx.clientIp,
+          to: phone.trim(),
+          templateName: esp32.template_name,
+          languageCode: esp32.template_language,
+          components,
+          clientReference: `esp32:trigger-snapshot:${message || ''}`.slice(0, 120),
+        });
+        success++;
+      } catch (err) {
+        console.error('[ESP32] sendTemplate failed for', phone, err.message);
+      }
+    }
+
+    res.json({ ok: success > 0, total, success, media_id: mediaId || null });
+  }));
+
+  async function convertToRgbJpeg(buffer) {
+    // Use sharp if available, otherwise return buffer as-is
+    try {
+      const sharp = require('sharp');
+      return await sharp(buffer).flatten({ background: '#ffffff' }).jpeg({ quality: 85 }).toBuffer();
+    } catch {
+      return buffer;
+    }
+  }
+
+  // ── end ESP32 ────────────────────────────────────────────────────────────────
 
   function legacyError(res, requestIdValue, status, message, extra = {}) {
     return res.status(status).json({
@@ -167,6 +336,21 @@ async function main() {
     req.ipDecision = auth.ipDecision;
     next();
   }
+
+  app.post('/v1/media/upload', authenticateApiRequest, asyncRoute(async (req, res) => {
+    const { base64, mime_type: mimeType = 'image/png' } = req.body || {};
+    if (!base64) {
+      return createJsonError(res, req.ctx.requestId, 400, 'VALIDATION_ERROR', '`base64` is required.');
+    }
+    let buffer;
+    try {
+      buffer = Buffer.from(base64, 'base64');
+    } catch {
+      return createJsonError(res, req.ctx.requestId, 400, 'VALIDATION_ERROR', 'Invalid base64 data.');
+    }
+    const mediaId = await whatsapp.uploadMedia({ buffer, mimeType });
+    res.json({ media_id: mediaId });
+  }));
 
   app.post('/v1/messages/text', authenticateApiRequest, asyncRoute(async (req, res) => {
     const { to, text, client_reference: clientReference } = req.body || {};
@@ -319,14 +503,15 @@ async function main() {
   }));
 
   app.post('/v1/messages/media', authenticateApiRequest, asyncRoute(async (req, res) => {
-    const { to, media_type: mediaType, link, media_id: mediaId, caption, filename, client_reference: clientReference } = req.body || {};
-    if (!to || !mediaType || (!link && !mediaId)) {
+    const payload = normalizeMediaRequest(req.body || {});
+    const validationError = validateMediaPayload(payload);
+    if (validationError) {
       return createJsonError(
         res,
         req.ctx.requestId,
         400,
         'VALIDATION_ERROR',
-        '`to`, `media_type` and one of `link` or `media_id` are required.'
+        validationError
       );
     }
 
@@ -334,13 +519,13 @@ async function main() {
       clientId: req.apiClient.id,
       requestId: req.ctx.requestId,
       ip: req.ctx.clientIp,
-      to,
-      mediaType,
-      link,
-      mediaId,
-      caption,
-      filename,
-      clientReference,
+      to: payload.to,
+      mediaType: payload.mediaType,
+      link: payload.link,
+      mediaId: payload.mediaId,
+      caption: payload.caption,
+      filename: payload.filename,
+      clientReference: payload.clientReference,
     });
 
     const body = {
@@ -352,6 +537,90 @@ async function main() {
     };
     res.locals.auditResponseBody = JSON.stringify(body);
     res.status(202).json(body);
+  }));
+
+  app.post('/send/media', requireLegacyToken, asyncRoute(async (req, res) => {
+    const payload = normalizeMediaRequest({
+      to: req.body?.phone,
+      media_type: req.body?.media_type,
+      link: req.body?.link,
+      media_id: req.body?.media_id,
+      caption: req.body?.caption,
+      filename: req.body?.filename,
+      client_reference: 'legacy:/send/media',
+    });
+    const validationError = validateMediaPayload(payload);
+    if (validationError) {
+      return legacyError(res, req.ctx.requestId, 400, validationError);
+    }
+
+    try {
+      const result = await whatsapp.sendMedia({
+        clientId: null,
+        requestId: req.ctx.requestId,
+        ip: req.ctx.clientIp,
+        to: payload.to,
+        mediaType: payload.mediaType,
+        link: payload.link,
+        mediaId: payload.mediaId,
+        caption: payload.caption,
+        filename: payload.filename,
+        clientReference: payload.clientReference,
+      });
+      const body = {
+        ok: true,
+        request_id: req.ctx.requestId,
+        id: result.auditId,
+        messageId: result.metaMessageId,
+      };
+      res.locals.auditResponseBody = JSON.stringify(body);
+      return res.json(body);
+    } catch (error) {
+      return legacyError(res, req.ctx.requestId, 502, error.message || 'send_media_failed');
+    }
+  }));
+
+  app.post('/send-media', requireLegacyToken, asyncRoute(async (req, res) => {
+    req.url = '/send/media';
+    req.path = '/send/media';
+    const payload = normalizeMediaRequest({
+      to: req.body?.phone,
+      media_type: req.body?.media_type,
+      link: req.body?.link,
+      media_id: req.body?.media_id,
+      caption: req.body?.caption,
+      filename: req.body?.filename,
+      client_reference: 'legacy:/send-media',
+    });
+    const validationError = validateMediaPayload(payload);
+    if (validationError) {
+      return legacyError(res, req.ctx.requestId, 400, validationError);
+    }
+
+    try {
+      const result = await whatsapp.sendMedia({
+        clientId: null,
+        requestId: req.ctx.requestId,
+        ip: req.ctx.clientIp,
+        to: payload.to,
+        mediaType: payload.mediaType,
+        link: payload.link,
+        mediaId: payload.mediaId,
+        caption: payload.caption,
+        filename: payload.filename,
+        clientReference: payload.clientReference,
+      });
+      const body = {
+        ok: true,
+        request_id: req.ctx.requestId,
+        id: result.auditId,
+        messageId: result.metaMessageId,
+      };
+      res.locals.auditResponseBody = JSON.stringify(body);
+      return res.json(body);
+    } catch (error) {
+      return legacyError(res, req.ctx.requestId, 502, error.message || 'send_media_failed');
+    }
   }));
 
   app.get('/v1/messages/:id', authenticateApiRequest, asyncRoute(async (req, res) => {
