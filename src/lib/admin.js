@@ -264,6 +264,21 @@ function registerAdminRoutes(app, deps) {
     res.json({ data, total, limit, offset });
   }));
 
+  app.get('/admin/api/audit/conversations', requireAdmin, asyncHandler(async (req, res) => {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const [data, total] = await Promise.all([
+      db.listConversationSummaries(limit, offset),
+      db.countConversations(),
+    ]);
+    res.json({ data, total, limit, offset });
+  }));
+
+  app.get('/admin/api/audit/conversation/:phone', requireAdmin, asyncHandler(async (req, res) => {
+    const thread = await db.getConversationThread(decodeURIComponent(req.params.phone));
+    res.json(thread);
+  }));
+
   app.get('/admin/api/templates', requireAdmin, asyncHandler(async (req, res) => {
     const data = await whatsapp.listTemplates({
       name: req.query.name,
