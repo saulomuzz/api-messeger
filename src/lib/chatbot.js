@@ -23,6 +23,8 @@ const HUMAN_KEYWORDS = [
 ];
 
 function isHumanRequest(input) {
+  // IDs de botões interativos (ex: aluno_ajuda, morador_portao) nunca ativam transferência
+  if (/^(aluno|morador|visitante|funcionario|prestador)_\w+$/.test(input)) return false;
   return HUMAN_KEYWORDS.some((k) => input === k || input.includes(k));
 }
 
@@ -228,8 +230,15 @@ function createChatbotService({ db }) {
 
     const state = session?.state || 'idle';
 
-    // Estado transferred: humano assumiu, chatbot silencia até TTL expirar
-    if (state === 'transferred') return true;
+    // Estado transferred: humano assumiu, chatbot silencia
+    // Permite sair com "sair/cancelar/0/menu"
+    if (state === 'transferred') {
+      if (isCancelRequest(input)) {
+        await clearSession(phone);
+        await reply(whatsapp, phone, '👋 Atendimento encerrado. Envie qualquer mensagem para ver o menu novamente.');
+      }
+      return true;
+    }
 
     // Cancelamento global (qualquer estado ativo)
     if (state !== 'idle' && isCancelRequest(input)) {
