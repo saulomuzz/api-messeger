@@ -255,7 +255,7 @@ function registerAdminRoutes(app, deps) {
   }));
 
   app.get('/admin/api/webhooks', requireAdmin, asyncHandler(async (req, res) => {
-    res.json({ data: await db.listWebhookEvents(100) });
+    res.json({ data: await db.listWebhookEvents(1000) });
   }));
 
   app.get('/admin/api/templates', requireAdmin, asyncHandler(async (req, res) => {
@@ -334,6 +334,64 @@ function registerAdminRoutes(app, deps) {
       details: req.body,
     });
     res.json({ data: result });
+  }));
+
+  // ── Gerenciamento de usuários admin ───────────────────────────────────────
+
+  app.get('/admin/api/users', requireAdmin, asyncHandler(async (req, res) => {
+    res.json({ data: await db.listAdminUsers() });
+  }));
+
+  app.post('/admin/api/users', requireAdmin, asyncHandler(async (req, res) => {
+    const { username, password } = req.body || {};
+    if (!username || !password) throw Object.assign(new Error('username e password obrigatórios'), { status: 400 });
+    if (password.length < 8) throw Object.assign(new Error('Senha deve ter ao menos 8 caracteres'), { status: 400 });
+    const user = await db.createAdminUser(username, password);
+    await db.createAdminAction({ adminUserId: req.adminUser.id, action: 'create_admin_user', targetType: 'admin_user', targetId: String(user.id), details: { username } });
+    res.json({ data: { id: user.id, username: user.username } });
+  }));
+
+  app.post('/admin/api/users/:id/password', requireAdmin, asyncHandler(async (req, res) => {
+    const userId = parseInt(req.params.id, 10);
+    const { new_password } = req.body || {};
+    if (!new_password || new_password.length < 8) throw Object.assign(new Error('Senha deve ter ao menos 8 caracteres'), { status: 400 });
+    const target = await db.findAdminUserById(userId);
+    if (!target) throw Object.assign(new Error('Usuário não encontrado'), { status: 404 });
+    await db.updateAdminPassword(userId, new_password);
+    await db.createAdminAction({ adminUserId: req.adminUser.id, action: 'change_user_password', targetType: 'admin_user', targetId: String(userId), details: { username: target.username } });
+    res.json({ data: { ok: true } });
+  }));
+
+  app.post('/admin/api/profile/password', requireAdmin, asyncHandler(async (req, res) => {
+    const { current_password, new_password } = req.body || {};
+    if (!current_password || !new_password) throw Object.assign(new Error('Preencha todos os campos'), { status: 400 });
+    if (new_password.length < 8) throw Object.assign(new Error('Nova senha deve ter ao menos 8 caracteres'), { status: 400 });
+    const user = await db.findAdminUserById(req.adminUser.id);
+    if (!verifyPassword(current_password, user.password_hash)) throw Object.assign(new Error('Senha atual incorreta'), { status: 400 });
+    await db.updateAdminPassword(req.adminUser.id, new_password);
+    await db.createAdminAction({ adminUserId: req.adminUser.id, action: 'change_own_password', targetType: 'admin_user', targetId: String(req.adminUser.id), details: {} });
+    res.json({ data: { ok: true } });
+  }));
+
+  app.post('/admin/api/users/:id/status', requireAdmin, asyncHandler(async (req, res) => {
+    const userId = parseInt(req.params.id, 10);
+    if (userId === req.adminUser.id) throw Object.assign(new Error('Não é possível alterar o status da sua própria conta'), { status: 400 });
+    const target = await db.findAdminUserById(userId);
+    if (!target) throw Object.assign(new Error('Usuário não encontrado'), { status: 404 });
+    const newStatus = target.status === 'active' ? 'inactive' : 'active';
+    await db.setAdminUserStatus(userId, newStatus);
+    await db.createAdminAction({ adminUserId: req.adminUser.id, action: 'set_user_status', targetType: 'admin_user', targetId: String(userId), details: { username: target.username, status: newStatus } });
+    res.json({ data: { status: newStatus } });
+  }));
+
+  app.delete('/admin/api/users/:id', requireAdmin, asyncHandler(async (req, res) => {
+    const userId = parseInt(req.params.id, 10);
+    if (userId === req.adminUser.id) throw Object.assign(new Error('Não é possível excluir sua própria conta'), { status: 400 });
+    const target = await db.findAdminUserById(userId);
+    if (!target) throw Object.assign(new Error('Usuário não encontrado'), { status: 404 });
+    await db.deleteAdminUser(userId);
+    await db.createAdminAction({ adminUserId: req.adminUser.id, action: 'delete_admin_user', targetType: 'admin_user', targetId: String(userId), details: { username: target.username } });
+    res.json({ data: { ok: true } });
   }));
 }
 
