@@ -503,9 +503,13 @@ async function createDatabase({ dbPath }) {
       );
       return result.lastID;
     },
-    async listWebhookEvents(limit = 100) {
-      const rows = await db.all('SELECT * FROM webhook_events ORDER BY created_at DESC LIMIT ?', [limit]);
+    async listWebhookEvents(limit = 100, offset = 0) {
+      const rows = await db.all('SELECT * FROM webhook_events ORDER BY created_at DESC LIMIT ? OFFSET ?', [limit, offset]);
       return rows.map(parseWebhookRow);
+    },
+    async countWebhookEvents() {
+      const row = await db.get('SELECT COUNT(*) AS total FROM webhook_events');
+      return row?.total ?? 0;
     },
     async listAutoReplies() {
       const rows = await db.all('SELECT * FROM webhook_auto_replies ORDER BY updated_at DESC');

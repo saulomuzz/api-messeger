@@ -255,7 +255,13 @@ function registerAdminRoutes(app, deps) {
   }));
 
   app.get('/admin/api/webhooks', requireAdmin, asyncHandler(async (req, res) => {
-    res.json({ data: await db.listWebhookEvents(1000) });
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const [data, total] = await Promise.all([
+      db.listWebhookEvents(limit, offset),
+      db.countWebhookEvents(),
+    ]);
+    res.json({ data, total, limit, offset });
   }));
 
   app.get('/admin/api/templates', requireAdmin, asyncHandler(async (req, res) => {
