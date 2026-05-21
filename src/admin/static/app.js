@@ -478,8 +478,12 @@ function describeWebhookMessage(item) {
   const value = item.payload?.entry?.[0]?.changes?.[0]?.value || {};
   const message = value.messages?.[0];
   if (message?.type === 'text') return message.text?.body || 'Texto recebido';
-  if (message?.type === 'button') return `Botão: ${message.button?.text || message.button?.payload || ''}`.trim();
-  if (message?.type === 'interactive') return 'Resposta interativa';
+  if (message?.type === 'button') return `↩️ ${message.button?.text || message.button?.payload || 'Botão'}`.trim();
+  if (message?.type === 'interactive') {
+    const reply = message.interactive?.button_reply || message.interactive?.list_reply;
+    const txt = reply?.title || reply?.id || '';
+    return txt ? `↩️ ${txt}` : '↩️ Resposta interativa';
+  }
   if (message?.type === 'image') return '🖼️ Imagem recebida';
   if (message?.type === 'document') return '📄 Documento recebido';
   if (message?.type === 'audio') return '🎵 Áudio recebido';
@@ -667,7 +671,11 @@ function renderConversationThread(conversations) {
     <div class="bubble-row ${item.direction}" data-bubble-id="${escapeHtml(item.id)}">
       <div class="bubble ${item.direction} ${extraClasses}">
         ${item.devMode ? `<div class="dev-badge">DEV → ${escapeHtml(item.devRedirectedTo || '')}</div>` : ''}
-        <div class="bubble-text">${msgTypeIcon(item.sublabel)} ${escapeHtml(item.text)}</div>
+        <div class="bubble-text">${
+          item.direction === 'inbound' && (item.sublabel === 'messages' || item.sublabel === 'webhook') && item.text.startsWith('↩️')
+            ? `<span class="bubble-btn-reply">${escapeHtml(item.text)}</span>`
+            : `${msgTypeIcon(item.sublabel)} ${escapeHtml(item.text)}`
+        }</div>
         <div class="bubble-meta">
           <span>${statusChip(item.status)} ${escapeHtml(item.sublabel)}</span>
           <span title="${escapeHtml(formatDate(item.timestamp))}">${escapeHtml(relativeTime(item.timestamp))} ${metaIdHtml}</span>
