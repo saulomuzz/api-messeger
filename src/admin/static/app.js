@@ -749,7 +749,11 @@ function renderConversationThread(conversations) {
 }
 
 function renderAudit(data) {
-  const conversations = buildConversations(data);
+  // Se já há dados paginados carregados, usa eles em vez do bootstrap
+  const sourceData = state.auditEvents.length > 0
+    ? { messages: data.messages || [], webhooks: state.auditEvents, actions: data.actions || [] }
+    : data;
+  const conversations = buildConversations(sourceData);
 
   // Filter bar
   const filterBar = byId('audit-filter-bar');
@@ -1138,16 +1142,20 @@ async function loadAuditPage(append = false) {
     }
     state.auditTotal = resp.total ?? state.auditEvents.length;
     state.auditOffset = state.auditEvents.length;
-    const conversations = buildConversations(state.auditEvents);
+    const auditData = {
+      messages: state.bootstrap?.messages || [],
+      webhooks: state.auditEvents,
+      actions: state.bootstrap?.actions || [],
+    };
+    const conversations = buildConversations(auditData);
     renderConversationList(conversations);
     renderConversationThread(conversations);
-    _updateLoadMoreBtn(conversations);
+    _updateLoadMoreBtn();
   } catch (e) {
     showMessage(e.message, 'error');
-    state.auditLoading = false;
-    _updateLoadMoreBtn();
   } finally {
     state.auditLoading = false;
+    _updateLoadMoreBtn();
   }
 }
 
