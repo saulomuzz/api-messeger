@@ -430,7 +430,12 @@ function renderAutoReplies(autoReplies) {
 // ── Audit helpers ─────────────────────────────────────────────────────────────
 
 function normalizeConversationKey(value) {
-  return String(value || '').trim() || 'unknown';
+  const s = String(value || '').trim() || 'unknown';
+  // Normaliza números BR: 13 dígitos com 9° dígito → 12 dígitos
+  if (s.length === 13 && s.startsWith('55') && s[4] === '9') {
+    return s.slice(0, 4) + s.slice(5);
+  }
+  return s;
 }
 
 function formatConversationName(key) {
