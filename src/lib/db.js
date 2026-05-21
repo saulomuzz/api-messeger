@@ -511,6 +511,65 @@ async function createDatabase({ dbPath }) {
       const row = await db.get('SELECT COUNT(*) AS total FROM webhook_events');
       return row?.total ?? 0;
     },
+    async listConversationSummaries(limit = 50, offset = 0) {
+      const rows = await db.all(`
+        WITH events AS (
+          SELECT COALESCE(NULLIF(from_number,''), source_ip, 'unknown') AS phone,
+                 created_at, 'inbound' AS direction, event_type AS sublabel,
+                 NULL AS status, payload_json
+          FROM webhook_events
+          UNION ALL
+          SELECT to_number AS phone, created_at, 'outbound' AS direction,
+                 message_type AS sublabel, status, payload_json
+          FROM message_audit
+        ),
+        grouped AS (
+          SELECT phone,
+                 SUM(CASE WHEN direction='inbound' THEN 1 ELSE 0 END) AS inbound_count,
+                 SUM(CASE WHEN direction='outbound' THEN 1 ELSE 0 END) AS outbound_count,
+                 SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed_count,
+                 MAX(created_at) AS last_at
+          FROM events GROUP BY phone
+        )
+        SELECT g.phone, g.inbound_count, g.outbound_count, g.failed_count, g.last_at,
+               e.direction AS last_direction, e.sublabel AS last_sublabel,
+               e.payload_json AS last_payload_json
+        FROM grouped g
+        LEFT JOIN events e ON e.phone = g.phone AND e.created_at = g.last_at
+        GROUP BY g.phone
+        ORDER BY g.last_at DESC
+        LIMIT ? OFFSET ?
+      `, [limit, offset]);
+      return rows.map((r) => ({ ...r, last_payload: safeJsonParse(r.last_payload_json) }));
+    },
+    async countConversations() {
+      const row = await db.get(`
+        SELECT COUNT(*) AS total FROM (
+          SELECT DISTINCT phone FROM (
+            SELECT COALESCE(NULLIF(from_number,''), source_ip, 'unknown') AS phone FROM webhook_events
+            UNION ALL SELECT to_number AS phone FROM message_audit
+          )
+        )
+      `);
+      return row?.total ?? 0;
+    },
+    async getConversationThread(phone) {
+      const p = String(phone || '').trim();
+      const [messages, webhooks] = await Promise.all([
+        db.all('SELECT * FROM message_audit WHERE to_number = ? ORDER BY created_at ASC', [p]),
+        db.all(
+          `SELECT * FROM webhook_events
+           WHERE COALESCE(NULLIF(from_number,''), source_ip, 'unknown') = ?
+           ORDER BY created_at ASC`,
+          [p]
+        ),
+      ]);
+      return {
+        phone: p,
+        messages: messages.map(parseMessageAuditRow),
+        webhooks: webhooks.map(parseWebhookRow),
+      };
+    },
     async listAutoReplies() {
       const rows = await db.all('SELECT * FROM webhook_auto_replies ORDER BY updated_at DESC');
       return rows.map((row) => ({
