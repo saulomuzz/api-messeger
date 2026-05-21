@@ -9,6 +9,10 @@ const state = {
   auditAutoRefreshTimer: null,
   auditLastRefresh: null,
   readConversations: new Set(),
+  auditEvents: [],
+  auditTotal: 0,
+  auditOffset: 0,
+  auditLoading: false,
 };
 
 async function api(url, options) {
@@ -117,6 +121,9 @@ function switchScreen(screen) {
     link.closest('.nxl-item')?.classList.toggle('active', active);
   });
   byId('breadcrumb-current').textContent = (screen || 'overview').replace(/-/g, ' ');
+  if (screen === 'audit' && state.auditEvents.length === 0) {
+    loadAuditPage(false);
+  }
 }
 
 function setSendTestMode(mode) {
@@ -766,7 +773,9 @@ function renderAudit(data) {
     refreshBtn.addEventListener('click', async () => {
       refreshBtn.disabled = true;
       refreshBtn.textContent = '↻ carregando…';
-      await loadBootstrap(false);
+      state.auditEvents = [];
+      state.auditOffset = 0;
+      await loadAuditPage(false);
       refreshBtn.disabled = false;
       refreshBtn.textContent = '↻ atualizar';
     });
@@ -787,7 +796,9 @@ function renderAudit(data) {
     function startAutoRefresh() {
       if (state.auditAutoRefreshTimer) return;
       state.auditAutoRefreshTimer = setInterval(async () => {
-        await loadBootstrap(false);
+        state.auditEvents = [];
+        state.auditOffset = 0;
+        await loadAuditPage(false);
         state.auditLastRefresh = new Date();
         updateAutoRefreshLabel();
       }, 30000);
@@ -1109,6 +1120,60 @@ function bindEvents() {
       if (screen === 'users') loadUsersScreen();
     });
   });
+}
+
+// ── Audit paginado ────────────────────────────────────────────────────────────
+
+async function loadAuditPage(append = false) {
+  if (state.auditLoading) return;
+  state.auditLoading = true;
+  _updateLoadMoreBtn();
+  try {
+    const offset = append ? state.auditOffset : 0;
+    const resp = await api(`/admin/api/webhooks?limit=100&offset=${offset}`);
+    if (append) {
+      state.auditEvents = [...state.auditEvents, ...resp.data];
+    } else {
+      state.auditEvents = resp.data;
+    }
+    state.auditTotal = resp.total ?? state.auditEvents.length;
+    state.auditOffset = state.auditEvents.length;
+    const conversations = buildConversations(state.auditEvents);
+    renderConversationList(conversations);
+    renderConversationThread(conversations);
+    _updateLoadMoreBtn(conversations);
+  } catch (e) {
+    showMessage(e.message, 'error');
+    state.auditLoading = false;
+    _updateLoadMoreBtn();
+  } finally {
+    state.auditLoading = false;
+  }
+}
+
+function _updateLoadMoreBtn(conversations) {
+  let btn = byId('audit-load-more-btn');
+  const listEl = byId('conversation-list');
+  if (!listEl) return;
+  if (!btn) {
+    btn = document.createElement('button');
+    btn.id = 'audit-load-more-btn';
+    btn.className = 'audit-load-more-btn';
+    listEl.insertAdjacentElement('afterend', btn);
+    btn.addEventListener('click', () => loadAuditPage(true));
+  }
+  const remaining = state.auditTotal - state.auditOffset;
+  if (state.auditLoading) {
+    btn.style.display = '';
+    btn.disabled = true;
+    btn.textContent = '⏳ Carregando...';
+  } else if (remaining > 0) {
+    btn.style.display = '';
+    btn.disabled = false;
+    btn.textContent = `↓ Carregar mais ${remaining} eventos`;
+  } else {
+    btn.style.display = 'none';
+  }
 }
 
 // ── Gerenciamento de usuários ─────────────────────────────────────────────────
