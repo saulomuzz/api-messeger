@@ -1104,8 +1104,91 @@ function bindEvents() {
   document.querySelectorAll('[data-screen-nav]').forEach((link) => {
     link.addEventListener('click', (event) => {
       event.preventDefault();
-      switchScreen(link.getAttribute('data-screen-nav'));
+      const screen = link.getAttribute('data-screen-nav');
+      switchScreen(screen);
+      if (screen === 'users') loadUsersScreen();
     });
+  });
+}
+
+// ── Gerenciamento de usuários ─────────────────────────────────────────────────
+
+async function loadUsersScreen() {
+  const tbody = document.querySelector('#users-table tbody');
+  if (!tbody) return;
+  try {
+    const { data } = await api('/admin/api/users');
+    if (!data.length) {
+      tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted py-4">Nenhum usuário.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = data.map((u) => `
+      <tr>
+        <td><strong>${escapeHtml(u.username)}</strong></td>
+        <td><span class="status-chip ${u.status === 'active' ? 'status-ok' : 'status-warn'}"><span class="dot"></span>${u.status === 'active' ? 'Ativo' : 'Inativo'}</span></td>
+        <td class="text-muted small">${u.last_login_at ? relativeTime(u.last_login_at) : '—'}</td>
+        <td class="text-end" style="white-space:nowrap">
+          <button class="btn btn-sm btn-outline-secondary me-1" onclick="onPromptUserPassword(${u.id},'${escapeHtml(u.username)}')">🔑 Senha</button>
+          <button class="btn btn-sm btn-outline-warning me-1" onclick="onToggleUserStatus(${u.id})">${u.status === 'active' ? 'Desativar' : 'Ativar'}</button>
+          <button class="btn btn-sm btn-outline-danger" onclick="onDeleteUser(${u.id},'${escapeHtml(u.username)}')">Excluir</button>
+        </td>
+      </tr>`).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="4" class="text-danger py-3">${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+async function onCreateUser() {
+  const username = getValue('new-user-username');
+  const password = byId('new-user-password')?.value || '';
+  if (!username || !password) return showMessage('Preencha usuário e senha', 'error');
+  await runAction(async () => {
+    await api('/admin/api/users', { method: 'POST', body: JSON.stringify({ username, password }) });
+    byId('new-user-username').value = '';
+    byId('new-user-password').value = '';
+    showMessage(`Usuário "${username}" criado com sucesso`);
+    loadUsersScreen();
+  });
+}
+
+async function onPromptUserPassword(userId, username) {
+  const pw = prompt(`Nova senha para "${username}" (mín. 8 caracteres):`);
+  if (!pw) return;
+  await runAction(async () => {
+    await api(`/admin/api/users/${userId}/password`, { method: 'POST', body: JSON.stringify({ new_password: pw }) });
+    showMessage(`Senha de "${username}" alterada`);
+  });
+}
+
+async function onToggleUserStatus(userId) {
+  await runAction(async () => {
+    const { data } = await api(`/admin/api/users/${userId}/status`, { method: 'POST', body: JSON.stringify({}) });
+    showMessage(`Usuário ${data.status === 'active' ? 'ativado' : 'desativado'}`);
+    loadUsersScreen();
+  });
+}
+
+async function onDeleteUser(userId, username) {
+  if (!confirm(`Excluir usuário "${username}"? Esta ação não pode ser desfeita.`)) return;
+  await runAction(async () => {
+    await api(`/admin/api/users/${userId}`, { method: 'DELETE' });
+    showMessage(`Usuário "${username}" excluído`);
+    loadUsersScreen();
+  });
+}
+
+async function onChangeOwnPassword() {
+  const current = byId('profile-current-pw')?.value || '';
+  const newPw = byId('profile-new-pw')?.value || '';
+  const confirm = byId('profile-confirm-pw')?.value || '';
+  if (!current || !newPw || !confirm) return showMessage('Preencha todos os campos', 'error');
+  if (newPw !== confirm) return showMessage('Nova senha e confirmação não conferem', 'error');
+  await runAction(async () => {
+    await api('/admin/api/profile/password', { method: 'POST', body: JSON.stringify({ current_password: current, new_password: newPw }) });
+    byId('profile-current-pw').value = '';
+    byId('profile-new-pw').value = '';
+    byId('profile-confirm-pw').value = '';
+    showMessage('Senha alterada com sucesso!');
   });
 }
 

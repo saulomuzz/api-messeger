@@ -625,6 +625,29 @@ async function createDatabase({ dbPath }) {
     async markAdminLogin(userId) {
       await db.run('UPDATE admin_users SET last_login_at = ?, updated_at = ? WHERE id = ?', [nowIso(), nowIso(), userId]);
     },
+    async listAdminUsers() {
+      return db.all('SELECT id, username, status, created_at, last_login_at FROM admin_users ORDER BY id');
+    },
+    async createAdminUser(username, password) {
+      const now = nowIso();
+      const result = await db.run(
+        `INSERT INTO admin_users (username, password_hash, status, created_at, updated_at) VALUES (?, ?, 'active', ?, ?)`,
+        [username.trim(), hashPassword(password), now, now]
+      );
+      return this.findAdminUserById(result.lastID);
+    },
+    async updateAdminPassword(userId, newPassword) {
+      await db.run('UPDATE admin_users SET password_hash = ?, updated_at = ? WHERE id = ?',
+        [hashPassword(newPassword), nowIso(), userId]);
+    },
+    async setAdminUserStatus(userId, status) {
+      await db.run('UPDATE admin_users SET status = ?, updated_at = ? WHERE id = ?',
+        [status, nowIso(), userId]);
+    },
+    async deleteAdminUser(userId) {
+      await db.run('DELETE FROM admin_sessions WHERE user_id = ?', [userId]);
+      await db.run('DELETE FROM admin_users WHERE id = ?', [userId]);
+    },
 
     // ── Chatbot sessions ──────────────────────────────────────────────────────
     async getChatbotSession(phone) {
