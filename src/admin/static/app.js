@@ -8,6 +8,7 @@ const state = {
   expandedBubble: null,
   auditAutoRefreshTimer: null,
   auditLastRefresh: null,
+  readConversations: new Set(),
 };
 
 async function api(url, options) {
@@ -628,7 +629,8 @@ function renderConversationList(conversations) {
     const initials = conversationInitials(conversation.key);
     const time = formatMsgTime(conversation.lastAt);
     const isFailed = conversation.previewStatus === 'failed';
-    const badge = conversation.inboundCount > 0
+    const isRead = state.readConversations.has(conversation.key);
+    const badge = !isRead && conversation.inboundCount > 0
       ? `<span class="wa-badge">${conversation.inboundCount}</span>`
       : conversation.failedCount > 0
         ? `<span class="wa-badge wa-badge-fail">${conversation.failedCount}</span>`
@@ -651,7 +653,9 @@ function renderConversationList(conversations) {
   }).join('');
   container.querySelectorAll('[data-conversation-key]').forEach((el) => {
     el.addEventListener('click', () => {
-      state.selectedConversationKey = el.getAttribute('data-conversation-key');
+      const key = el.getAttribute('data-conversation-key');
+      state.readConversations.add(key);
+      state.selectedConversationKey = key;
       state.expandedBubble = null;
       renderConversationList(conversations);
       renderConversationThread(conversations);

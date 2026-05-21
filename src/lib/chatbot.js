@@ -169,8 +169,9 @@ function createChatbotService({ db }) {
       phone,
       `Olá, ${name}! Sou o assistente da portaria. Como posso ajudar?`,
       [
-        { id: 'aluno_qr',       title: '🎫 Receber QR Code' },
-        { id: 'aluno_horarios', title: '📅 Meus horários'   },
+        { id: 'aluno_qr',       title: '🎫 Receber QR Code'  },
+        { id: 'aluno_horarios', title: '📅 Meus horários'    },
+        { id: 'aluno_ajuda',    title: '🆘 Preciso de ajuda' },
       ]
     );
   }
@@ -202,6 +203,11 @@ function createChatbotService({ db }) {
   function isOption2(input, state) {
     if (state === 'wait_aluno')   return input === '2' || input === 'aluno_horarios';
     if (state === 'wait_morador') return input === '2' || input === 'morador_qr';
+    return false;
+  }
+
+  function isOption3(input, state) {
+    if (state === 'wait_aluno') return input === '3' || input === 'aluno_ajuda';
     return false;
   }
 
@@ -294,6 +300,13 @@ function createChatbotService({ db }) {
         return true;
       }
 
+      if (isOption3(input, state)) {
+        await clearSession(phone);
+        await reply(whatsapp, phone, '🆘 Sua mensagem foi encaminhada para nossa equipe. Em breve entraremos em contato!');
+        await forwardToSupport(whatsapp, cfg, phone, 'Pedido de ajuda via chatbot', session?.person_type, session?.person_name);
+        return true;
+      }
+
       // Opção inválida → reenvia menu
       await showMenuAluno(whatsapp, phone, session.person_name || '');
       await saveSession(phone, 'wait_aluno', session.person_type, session.person_name, session.data);
@@ -304,7 +317,12 @@ function createChatbotService({ db }) {
     if (state === 'wait_morador') {
       if (isOption1(input, state)) {
         await clearSession(phone);
-        const res = await porteiro(cfg, 'POST', '/open-gate', { phone });
+        const res = await porteiro(cfg, 'POST', '/open-gate', {
+          phone,
+          device_id: parseInt(cfg.relay_device_id) || 0,
+          door_num: cfg.relay_door_num || 1,
+          delay: cfg.relay_delay || 5,
+        });
         if (res?.opened) {
           await reply(whatsapp, phone, '✅ Portão acionado!');
         } else {
