@@ -425,17 +425,43 @@ function normalizeConversationKey(value) {
 
 function formatConversationName(key) {
   if (!key || key === 'unknown') return 'Desconhecido';
-  // Brazilian number: 55 + 2-digit area + 8-9 digit number
-  const m = key.match(/^55(\d{2})9?(\d{8})$/);
-  if (m) return `(${m[1]}) ${m[2].slice(0, 4)}-${m[2].slice(4)}`;
+  const m = key.match(/^55(\d{2})9?(\d{4})(\d{4})$/);
+  if (m) return `(${m[1]}) ${m[2]}-${m[3]}`;
+  const m2 = key.match(/^(\d{2})9?(\d{4})(\d{4})$/);
+  if (m2) return `(${m2[1]}) ${m2[2]}-${m2[3]}`;
   return key;
 }
 
 function conversationInitials(key) {
+  const m = key.match(/^55(\d{2})/);
+  if (m) return m[1];
   const digits = key.replace(/\D/g, '');
-  if (digits.length >= 4) return digits.slice(-4, -2);
-  const name = formatConversationName(key).replace(/[^a-zA-Z0-9]/g, '');
-  return (name.slice(0, 2) || 'WA').toUpperCase();
+  if (digits.length >= 2) return digits.slice(0, 2);
+  return 'WA';
+}
+
+const AVATAR_COLORS = [
+  '#25D366','#128C7E','#075E54','#34B7F1',
+  '#9C27B0','#F57C00','#E91E63','#1565C0',
+  '#2E7D32','#00838F','#6A1B9A','#BF360C',
+];
+
+function avatarColor(key) {
+  let h = 0;
+  for (let i = 0; i < key.length; i++) h = (Math.imul(31, h) + key.charCodeAt(i)) | 0;
+  return AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
+}
+
+function formatMsgTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const now = new Date();
+  if (now.toDateString() === d.toDateString()) {
+    return d.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  }
+  const yest = new Date(now); yest.setDate(now.getDate() - 1);
+  if (yest.toDateString() === d.toDateString()) return 'ontem';
+  return d.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit' });
 }
 
 const MSG_TYPE_ICON = {
@@ -597,26 +623,35 @@ function renderConversationList(conversations) {
     state.selectedConversationKey = filtered[0].key;
   }
   container.innerHTML = filtered.map((conversation) => {
-    const failBadge = conversation.failedCount
-      ? `<span class="conv-fail-badge">${conversation.failedCount}</span>`
-      : '';
-    const previewStatusClass = conversation.previewStatus === 'failed' ? ' preview-failed' : '';
+    const isActive = conversation.key === state.selectedConversationKey;
+    const color = avatarColor(conversation.key);
+    const initials = conversationInitials(conversation.key);
+    const time = formatMsgTime(conversation.lastAt);
+    const isFailed = conversation.previewStatus === 'failed';
+    const badge = conversation.inboundCount > 0
+      ? `<span class="wa-badge">${conversation.inboundCount}</span>`
+      : conversation.failedCount > 0
+        ? `<span class="wa-badge wa-badge-fail">${conversation.failedCount}</span>`
+        : '';
+    const previewIcon = isFailed ? '✗ ' : '';
     return `
-    <div class="conversation-item ${conversation.key === state.selectedConversationKey ? 'active' : ''}" data-conversation-key="${escapeHtml(conversation.key)}">
-      <div class="conversation-avatar">${escapeHtml(conversationInitials(conversation.key))}</div>
-      <div class="flex-grow-1 min-w-0">
-        <div class="conversation-item-title">
-          <span class="text-truncate">${escapeHtml(conversation.title)}</span>
-          <span class="conv-time">${escapeHtml(relativeTime(conversation.lastAt))}</span>
+    <div class="wa-item${isActive ? ' active' : ''}" data-conversation-key="${escapeHtml(conversation.key)}">
+      <div class="wa-avatar" style="background:${color}">${escapeHtml(initials)}</div>
+      <div class="wa-body">
+        <div class="wa-top">
+          <span class="wa-name">${escapeHtml(conversation.title)}</span>
+          <span class="wa-time${isFailed ? ' wa-time-fail' : ''}">${escapeHtml(time)}</span>
         </div>
-        <div class="conversation-item-preview text-truncate${previewStatusClass}">${escapeHtml(conversation.preview)}</div>
+        <div class="wa-bottom">
+          <span class="wa-preview${isFailed ? ' wa-preview-fail' : ''}">${escapeHtml(previewIcon + conversation.preview)}</span>
+          ${badge}
+        </div>
       </div>
-      ${failBadge}
     </div>`;
   }).join('');
-  container.querySelectorAll('[data-conversation-key]').forEach((item) => {
-    item.addEventListener('click', () => {
-      state.selectedConversationKey = item.getAttribute('data-conversation-key');
+  container.querySelectorAll('[data-conversation-key]').forEach((el) => {
+    el.addEventListener('click', () => {
+      state.selectedConversationKey = el.getAttribute('data-conversation-key');
       state.expandedBubble = null;
       renderConversationList(conversations);
       renderConversationThread(conversations);
@@ -640,6 +675,11 @@ function renderConversationThread(conversations) {
     return;
   }
   title.textContent = conversation.title;
+  const avatarEl = byId('conversation-avatar');
+  if (avatarEl) {
+    avatarEl.style.background = avatarColor(conversation.key);
+    avatarEl.textContent = conversationInitials(conversation.key);
+  }
   subtitle.textContent = conversation.isGroup
     ? 'Timeline agrupada para um grupo WhatsApp.'
     : `${conversation.outboundCount} enviadas · ${conversation.inboundCount} recebidas${conversation.failedCount ? ` · <span style="color:#ef4444">${conversation.failedCount} falhas</span>` : ''}`;
