@@ -1150,6 +1150,7 @@ function buildConversationFromSummary(s) {
 function renderCurrentConvList() {
   const convObjects = state.conversationSummaries.map(buildConversationFromSummary);
   renderConversationList(convObjects);
+  _updateConvLoadMoreBtn();
 }
 
 function renderCurrentThread() {
@@ -1171,7 +1172,9 @@ function renderCurrentThread() {
 async function loadConversationList(append = false) {
   if (state.conversationLoading) return;
   state.conversationLoading = true;
-  _updateConvLoadMoreBtn();
+  // Disable existing btn during fetch (it may have been rendered inside list)
+  const existingBtn = byId('audit-load-more-btn');
+  if (existingBtn) { existingBtn.disabled = true; existingBtn.textContent = '⏳ Carregando...'; }
   try {
     const offset = append ? state.conversationOffset : 0;
     const resp = await api(`/admin/api/audit/conversations?limit=50&offset=${offset}`);
@@ -1182,32 +1185,37 @@ async function loadConversationList(append = false) {
     }
     state.conversationTotal = resp.total ?? state.conversationSummaries.length;
     state.conversationOffset = state.conversationSummaries.length;
-    renderCurrentConvList();
+    renderCurrentConvList(); // renders list + button
     // Auto-select first conversation or reload cached thread
     if (state.conversationSummaries.length) {
       const currentValid = state.selectedConversationKey &&
         state.conversationSummaries.some((s) => s.phone === state.selectedConversationKey);
       const targetPhone = currentValid ? state.selectedConversationKey : state.conversationSummaries[0].phone;
-      if (!currentValid) state.selectedConversationKey = targetPhone;
-      renderCurrentConvList();
+      if (!currentValid) {
+        state.selectedConversationKey = targetPhone;
+        renderCurrentConvList(); // re-render with active state
+      }
       if (!state.threadCache[targetPhone]) {
         loadAndShowThread(targetPhone);
       } else {
         renderCurrentThread();
+        _scrollThreadToBottom();
       }
     }
-    _updateConvLoadMoreBtn();
   } catch (e) {
     showMessage(e.message, 'error');
-  } finally {
     state.conversationLoading = false;
     _updateConvLoadMoreBtn();
+    return;
   }
+  state.conversationLoading = false;
+  _updateConvLoadMoreBtn();
 }
 
 async function loadAndShowThread(phone) {
   if (state.threadCache[phone]) {
     renderCurrentThread();
+    _scrollThreadToBottom();
     return;
   }
   state.threadLoading = true;
@@ -1220,31 +1228,38 @@ async function loadAndShowThread(phone) {
   } finally {
     state.threadLoading = false;
     renderCurrentThread();
+    _scrollThreadToBottom();
   }
 }
 
+function _scrollThreadToBottom() {
+  const threadEl = byId('conversation-thread');
+  if (threadEl) requestAnimationFrame(() => { threadEl.scrollTop = threadEl.scrollHeight; });
+}
+
 function _updateConvLoadMoreBtn() {
-  let btn = byId('audit-load-more-btn');
   const listEl = byId('conversation-list');
   if (!listEl) return;
+  // btn may have been wiped by renderConversationList's innerHTML reset
+  let btn = byId('audit-load-more-btn');
+  const remaining = state.conversationTotal - state.conversationOffset;
+  if (remaining <= 0 && !state.conversationLoading) {
+    if (btn) btn.remove();
+    return;
+  }
   if (!btn) {
     btn = document.createElement('button');
     btn.id = 'audit-load-more-btn';
     btn.className = 'audit-load-more-btn';
-    listEl.insertAdjacentElement('afterend', btn);
+    listEl.appendChild(btn);
     btn.addEventListener('click', () => loadConversationList(true));
   }
-  const remaining = state.conversationTotal - state.conversationOffset;
   if (state.conversationLoading) {
-    btn.style.display = '';
     btn.disabled = true;
     btn.textContent = '⏳ Carregando...';
-  } else if (remaining > 0) {
-    btn.style.display = '';
+  } else {
     btn.disabled = false;
     btn.textContent = `↓ Carregar mais ${remaining} conversas`;
-  } else {
-    btn.style.display = 'none';
   }
 }
 
