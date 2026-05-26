@@ -2,8 +2,10 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
+const axios = require('axios');
 
 const { verifyPassword } = require('./utils');
+const chatbotEvents = require('./chatbot-events');
 
 function readTemplate(name) {
   return fs.readFileSync(path.join(__dirname, '..', 'admin', 'templates', name), 'utf8');
@@ -278,6 +280,150 @@ function registerAdminRoutes(app, deps) {
     const thread = await db.getConversationThread(decodeURIComponent(req.params.phone));
     res.json(thread);
   }));
+
+  app.get('/admin/api/chatbot/flow', requireAdmin, asyncHandler(async (req, res) => {
+    const settings = await getPublicSettings(db);
+    res.json({ data: settings.chatbot.flow || {} });
+  }));
+
+  app.post('/admin/api/chatbot/flow', requireAdmin, asyncHandler(async (req, res) => {
+    const flow = req.body?.flow;
+    if (!flow || typeof flow !== 'object') {
+      throw Object.assign(new Error('flow inválido'), { status: 400 });
+    }
+    const nodeCount = (flow.nodes || []).length;
+    const snapshot = JSON.stringify(flow);
+    await saveSettings(db, { chatbot: { flow: snapshot } }, req.adminUser.username);
+    await db.saveFlowVersion({
+      label: `${nodeCount} nó${nodeCount !== 1 ? 's' : ''}`,
+      nodeCount,
+      snapshot,
+      createdBy: req.adminUser.username,
+    });
+    await db.createAdminAction({
+      adminUserId: req.adminUser.id,
+      action: 'save_chatbot_flow',
+      targetType: 'settings',
+      targetId: 'chatbot.flow',
+      details: { node_count: nodeCount },
+    });
+    res.json({ ok: true });
+  }));
+
+  app.get('/admin/api/chatbot/flow/versions', requireAdmin, asyncHandler(async (req, res) => {
+    const versions = await db.listFlowVersions();
+    res.json({ data: versions });
+  }));
+
+  app.post('/admin/api/chatbot/flow/versions/:id/restore', requireAdmin, asyncHandler(async (req, res) => {
+    const version = await db.getFlowVersion(Number(req.params.id));
+    if (!version) throw Object.assign(new Error('Versão não encontrada'), { status: 404 });
+    let flow;
+    try { flow = JSON.parse(version.snapshot); } catch { throw Object.assign(new Error('Snapshot corrompido'), { status: 500 }); }
+    await saveSettings(db, { chatbot: { flow: version.snapshot } }, req.adminUser.username);
+    await db.saveFlowVersion({
+      label: `Restaurado: ${version.label} (${version.created_at.slice(0, 16)})`,
+      nodeCount: (flow.nodes || []).length,
+      snapshot: version.snapshot,
+      createdBy: req.adminUser.username,
+    });
+    await db.createAdminAction({
+      adminUserId: req.adminUser.id,
+      action: 'restore_chatbot_flow',
+      targetType: 'settings',
+      targetId: 'chatbot.flow',
+      details: { restored_version_id: version.id, label: version.label },
+    });
+    res.json({ ok: true, flow });
+  }));
+
+  app.delete('/admin/api/chatbot/session/:phone', requireAdmin, asyncHandler(async (req, res) => {
+    const phone = req.params.phone;
+    await db.deleteChatbotSession(phone);
+    await db.createAdminAction({
+      adminUserId: req.adminUser.id,
+      action: 'clear_chatbot_session',
+      targetType: 'chatbot_session',
+      targetId: phone,
+      details: {},
+    });
+    res.json({ ok: true });
+  }));
+
+  // Proxy para simulador de fluxo — resolve templates server-side (token real) e chama API externa
+  app.post('/admin/api/chatbot/proxy', requireAdmin, asyncHandler(async (req, res) => {
+    const { method = 'GET', url, headers = {}, body, templateVars = {} } = req.body || {};
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ ok: false, error: 'URL obrigatória' });
+    }
+
+    // Resolve {{vars}} usando settings reais do banco + vars fornecidas pelo simulador
+    const settings = await getPublicSettings(db);
+    const cfg = settings.chatbot;
+    const vars = {
+      porteiro_url:    cfg.porteiro_url    || '',
+      porteiro_token:  cfg.porteiro_token  || '',
+      relay_device_id: String(cfg.relay_device_id || ''),
+      relay_door_num:  String(cfg.relay_door_num  || '1'),
+      relay_delay:     String(cfg.relay_delay     || '5'),
+      unknown_message: cfg.unknown_message || '',
+      ...templateVars,
+    };
+    const resolve = (text) =>
+      String(text || '').replace(/\{\{(\w[\w.]*)\}\}/g, (_, k) => vars[k] ?? '');
+
+    const resolvedUrl     = resolve(url);
+    const resolvedHeaders = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k, resolve(String(v))]));
+    const resolvedBody    = body && typeof body === 'object'
+      ? Object.fromEntries(Object.entries(body).map(([k, v]) => [k, resolve(String(v))]))
+      : null;
+
+    if (!resolvedUrl.startsWith('http')) {
+      return res.status(400).json({ ok: false, error: `URL inválida após resolução: "${resolvedUrl}"` });
+    }
+
+    const m = method.toUpperCase();
+    try {
+      const r = await axios({
+        method: m,
+        url: resolvedUrl,
+        headers: resolvedHeaders,
+        ...(m === 'GET' ? { params: resolvedBody } : { data: resolvedBody }),
+        timeout: 12000,
+        validateStatus: () => true,
+      });
+      res.json({ ok: r.status < 400, status: r.status, data: r.data });
+    } catch (e) {
+      res.json({ ok: false, status: null, data: null, error: e.message });
+    }
+  }));
+
+  // SSE — streaming live de eventos do chatbot
+  app.get('/admin/api/chatbot/live', requireAdmin, (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    if (res.socket) res.socket.setNoDelay(true);
+    res.flushHeaders();
+
+    const send = (event) => {
+      try { res.write(`data: ${JSON.stringify(event)}\n\n`); } catch {}
+    };
+
+    send({ type: 'connected', ts: Date.now() });
+
+    const heartbeat = setInterval(() => {
+      try { res.write(': heartbeat\n\n'); } catch {}
+    }, 20000);
+
+    chatbotEvents.on('flow', send);
+
+    req.on('close', () => {
+      chatbotEvents.off('flow', send);
+      clearInterval(heartbeat);
+    });
+  });
 
   app.get('/admin/api/templates', requireAdmin, asyncHandler(async (req, res) => {
     const data = await whatsapp.listTemplates({

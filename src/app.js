@@ -166,7 +166,12 @@ async function main() {
     return helmet({ crossOriginResourcePolicy: false })(req, res, next);
   });
   app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN, credentials: true }));
-  app.use(compression());
+  app.use(compression({
+    filter: (req, res) => {
+      if (req.path && req.path.endsWith('/live')) return false;
+      return compression.filter(req, res);
+    },
+  }));
   app.use(express.json({ limit: '2mb' }));
   app.use(express.urlencoded({ extended: false }));
   app.use(cookieParser());

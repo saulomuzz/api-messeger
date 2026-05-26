@@ -14,6 +14,11 @@
 
 const axios = require('axios');
 const { getPublicSettings } = require('./settings');
+const chatbotEvents = require('./chatbot-events');
+
+function emit(type, phone, extra = {}) {
+  chatbotEvents.emit('flow', { type, phone: phone ? `...${String(phone).slice(-4)}` : '?', phoneRaw: phone, ts: Date.now(), ...extra });
+}
 
 // Palavras-chave que disparam transferência para atendente humano
 const HUMAN_KEYWORDS = [
@@ -39,6 +44,22 @@ function parseSupportPhones(str) {
     .split(/[\n,;]+/)
     .map((s) => s.trim().replace(/\D/g, ''))
     .filter((s) => s.length >= 10);
+}
+
+// ── Lock por telefone (evita execuções concorrentes para o mesmo número) ────
+const _phoneLocks = new Map();
+async function withPhoneLock(phone, fn) {
+  const prev = _phoneLocks.get(phone);
+  if (prev) await prev.catch(() => {});
+  let resolve;
+  const lock = new Promise((r) => { resolve = r; });
+  _phoneLocks.set(phone, lock);
+  try {
+    return await fn();
+  } finally {
+    resolve();
+    if (_phoneLocks.get(phone) === lock) _phoneLocks.delete(phone);
+  }
 }
 
 function createChatbotService({ db }) {
@@ -213,16 +234,305 @@ function createChatbotService({ db }) {
     return false;
   }
 
-  // ── Máquina de estados ────────────────────────────────────────────────────
+  // ── Motor de fluxo customizado ────────────────────────────────────────────
 
-  async function handle(phone, text, whatsapp) {
-    const cfg = await getCfg();
-    if (!cfg.enabled) return false;
+  function resolveFlowTemplate(text, ctx) {
+    return String(text || '').replace(/\{\{(\w[\w.]*)\}\}/g, (_, key) => {
+      if (key.startsWith('session.')) return String(ctx.data?.[key.slice(8)] ?? '');
+      return String(ctx[key] ?? '');
+    });
+  }
 
+  async function sendFlowMenu(whatsapp, phone, node, ctx) {
+    const resolve = (t) => resolveFlowTemplate(t, ctx);
+    const bodyText = resolve(node.body || '') || 'Selecione uma opção:';
+    const buttons = (node.buttons || [])
+      .map((b) => ({ id: b.id, title: resolve(b.title || '').slice(0, 20) }))
+      .filter((b) => b.id && b.title);
+    if (!buttons.length) {
+      await reply(whatsapp, phone, bodyText);
+      return;
+    }
+    await replyButtons(whatsapp, phone, bodyText, buttons);
+  }
+
+  async function executeFlowNode(node, ctx, whatsapp, phone, cfg) {
+    const resolve = (t) => resolveFlowTemplate(t, ctx);
+
+    switch (node.type) {
+      case 'identify': {
+        const info = await porteiro(cfg, 'GET', '/identify', { phone });
+        if (!info) return '__abort__';
+        ctx.person_name = info.name || 'visitante';
+        ctx.person_type = info.type || 'unknown';
+        if (info.type === 'unknown') {
+          if (!node.next_unknown) {
+            if (cfg.unknown_message) await reply(whatsapp, phone, cfg.unknown_message);
+            if (cfg.support_forward_unknown) await forwardToSupport(whatsapp, cfg, phone, '', 'unknown', null);
+          }
+          return node.next_unknown || '__end__';
+        }
+        if (info.type === 'aluno') return node.next_aluno || node.next_known || '__end__';
+        return node.next_morador || node.next_known || '__end__';
+      }
+
+      case 'menu':
+        await sendFlowMenu(whatsapp, phone, node, ctx);
+        return '__wait__';
+
+      case 'message':
+        await reply(whatsapp, phone, resolve(node.text));
+        return node.next || '__end__';
+
+      case 'api_call': {
+        const url = resolve(node.url || '');
+        if (!url) return node.on_error || node.next || '__end__';
+        const method = (node.method || 'GET').toUpperCase();
+        let reqBody;
+        let reqParams;
+        if (node.body) {
+          try {
+            const raw = typeof node.body === 'string' ? node.body : JSON.stringify(node.body);
+            const parsed = JSON.parse(resolve(raw));
+            if (method === 'GET') reqParams = parsed;
+            else reqBody = parsed;
+          } catch { /* ignore malformed body */ }
+        }
+        let reqHeaders = {};
+        if (node.headers) {
+          try {
+            const raw = typeof node.headers === 'string' ? node.headers : JSON.stringify(node.headers);
+            reqHeaders = JSON.parse(resolve(raw));
+          } catch { reqHeaders = {}; }
+        }
+        try {
+          const r = await axios({ method, url, headers: reqHeaders, params: reqParams, data: reqBody, timeout: 10000 });
+          const val = node.response_path ? r.data?.[node.response_path] : r.data;
+          if (node.store_as) ctx.data[node.store_as] = val;
+          const ok = val !== null && val !== undefined && val !== false && val !== '';
+          return ok ? (node.next || '__end__') : (node.on_error || node.next || '__end__');
+        } catch (e) {
+          console.error('[chatbot/flow] api_call error', url, e.message);
+          if (node.store_as) ctx.data[node.store_as] = null;
+          return node.on_error || node.next || '__end__';
+        }
+      }
+
+      case 'condition': {
+        const val = String(ctx.data[node.variable] ?? '');
+        return val === String(node.equals ?? '')
+          ? (node.next_true || '__end__')
+          : (node.next_false || '__end__');
+      }
+
+      case 'transfer':
+        if (node.message) await reply(whatsapp, phone, resolve(node.message));
+        await forwardToSupport(whatsapp, cfg, phone, '', ctx.person_type, ctx.person_name);
+        return '__transfer__';
+
+      case 'encaminhar': {
+        if (node.message_user) await reply(whatsapp, phone, resolve(node.message_user));
+        if (node.destination === 'custom_phone' && node.custom_phone) {
+          const targetPhone = resolve(node.custom_phone).replace(/\D/g, '');
+          if (targetPhone) {
+            const agentMsg = resolve(node.message_agent || `📬 Mensagem de *${ctx.person_name || phone}* (${phone})`);
+            try { await reply(whatsapp, targetPhone, agentMsg); } catch (e) { console.error('[chatbot/encaminhar]', e.message); }
+          }
+          return node.next || '__end__';
+        }
+        const agentMsg = resolve(node.message_agent || '');
+        await forwardToSupport(whatsapp, cfg, phone, agentMsg, ctx.person_type, ctx.person_name);
+        return node.next || '__transfer__';
+      }
+
+      case 'horario': {
+        const now = new Date();
+        const cur = now.getHours() * 60 + now.getMinutes();
+        const from = (parseInt(node.hour_from ?? 8) * 60) + parseInt(node.min_from ?? 0);
+        const to   = (parseInt(node.hour_to ?? 18) * 60) + parseInt(node.min_to ?? 0);
+        const inside = from <= to ? (cur >= from && cur < to) : (cur >= from || cur < to);
+        if (!inside && node.message_outside) await reply(whatsapp, phone, resolve(node.message_outside));
+        return inside ? (node.next_inside || '__end__') : (node.next_outside || '__end__');
+      }
+
+      case 'end':
+        if (node.farewell) await reply(whatsapp, phone, resolve(node.farewell));
+        return '__end__';
+
+      default:
+        return '__end__';
+    }
+  }
+
+  async function handleFlow(phone, text, whatsapp, cfg) {
     const input = normalizeInput(text);
     let session = await getSession(phone);
 
-    // Sessão expirada → volta para idle
+    if (isExpired(session, cfg.session_ttl_min)) {
+      if (session) await clearSession(phone);
+      session = null;
+    }
+
+    const sessState = session?.state || 'idle';
+
+    emit('session', phone, { sessState });
+
+    if (sessState === 'transferred') {
+      if (isCancelRequest(input)) {
+        await clearSession(phone);
+        emit('end', phone, { reason: 'cancelado pelo usuário (transferred)' });
+        await reply(whatsapp, phone, '👋 Atendimento encerrado. Envie qualquer mensagem para ver o menu novamente.');
+      } else if (input) {
+        // Usuário continua enviando mensagens enquanto aguarda atendimento humano — reencaminhar ao suporte
+        await forwardToSupport(whatsapp, cfg, phone, text, session?.person_type, session?.person_name);
+        emit('result', phone, { nodeId: 'transferred', nodeType: 'transfer', outcome: 'relayed_to_support', nextNodeId: null });
+      }
+      return true;
+    }
+
+    // Ignora mensagens vazias (status webhooks, echoes) — não disparar o fluxo
+    if (!input && sessState !== 'idle') return true;
+    if (!input && !phone) return false;
+
+    if (sessState !== 'idle' && isCancelRequest(input)) {
+      await clearSession(phone);
+      emit('end', phone, { reason: 'sessão cancelada pelo usuário' });
+      await reply(whatsapp, phone, '👋 Sessão encerrada. Envie qualquer mensagem para recomeçar.');
+      return true;
+    }
+
+    if (sessState !== 'idle' && isHumanRequest(input)) {
+      emit('end', phone, { reason: 'transferido para suporte humano' });
+      await reply(whatsapp, phone, '👨‍💼 Vou conectar você com nossa equipe. Aguarde um momento.');
+      await forwardToSupport(whatsapp, cfg, phone, text, session?.person_type, session?.person_name);
+      await saveSession(phone, 'transferred', session?.person_type, session?.person_name, session?.data || {});
+      return true;
+    }
+
+    const nodeMap = {};
+    for (const n of (cfg.flow.nodes || [])) nodeMap[n.id] = n;
+
+    const ctx = {
+      phone,
+      person_name: session?.person_name || '',
+      person_type: session?.person_type || '',
+      porteiro_url: cfg.porteiro_url || '',
+      porteiro_token: cfg.porteiro_token || '',
+      relay_device_id: String(cfg.relay_device_id || ''),
+      relay_door_num: String(cfg.relay_door_num || '1'),
+      relay_delay: String(cfg.relay_delay || '5'),
+      unknown_message: cfg.unknown_message || '',
+      saudacao: (() => {
+        const h = new Date().getHours();
+        if (h >= 5 && h < 12) return 'Bom dia';
+        if (h >= 12 && h < 18) return 'Boa tarde';
+        if (h >= 18 && h < 22) return 'Boa noite';
+        return 'Boa madrugada';
+      })(),
+      saudacao_despedida: (() => {
+        const h = new Date().getHours();
+        if (h >= 5 && h < 12) return 'um Bom dia';
+        if (h >= 12 && h < 18) return 'uma Boa tarde';
+        if (h >= 18 && h < 22) return 'uma Boa noite';
+        return 'uma Boa madrugada';
+      })(),
+      data: { ...(session?.data || {}) },
+    };
+
+    let currentNodeId;
+
+    if (sessState === 'idle') {
+      currentNodeId = cfg.flow.entry;
+      emit('start', phone, { entry: currentNodeId });
+    } else if (sessState.startsWith('wait_menu_')) {
+      const menuNodeId = sessState.slice('wait_menu_'.length);
+      const menuNode = nodeMap[menuNodeId];
+      if (!menuNode) { await clearSession(phone); return false; }
+
+      // Ignora input vazio (webhook de status/echo) sem re-enviar o menu
+      if (!input) return true;
+
+      const buttons = menuNode.buttons || [];
+      let selectedNext = null;
+      const byId = buttons.find((b) => normalizeInput(b.id) === input);
+      if (byId) selectedNext = byId.next;
+      if (!selectedNext) {
+        const idx = parseInt(input, 10) - 1;
+        if (!isNaN(idx) && idx >= 0 && idx < buttons.length) selectedNext = buttons[idx].next;
+      }
+      if (!selectedNext) {
+        emit('menu_retry', phone, { nodeId: menuNodeId, input });
+        await sendFlowMenu(whatsapp, phone, menuNode, ctx);
+        await saveSession(phone, sessState, session?.person_type, session?.person_name, ctx.data);
+        return true;
+      }
+      emit('menu_select', phone, { nodeId: menuNodeId, input, next: selectedNext });
+      currentNodeId = selectedNext;
+    } else {
+      await clearSession(phone);
+      currentNodeId = cfg.flow.entry;
+      emit('start', phone, { entry: currentNodeId, reason: 'estado inválido — reiniciando' });
+    }
+
+    let depth = 0;
+    const visitedNodes = new Set();
+    while (currentNodeId && depth < 20) {
+      depth++;
+      // Detecção de ciclo: nó visitado duas vezes na mesma execução
+      if (visitedNodes.has(currentNodeId)) {
+        emit('error', phone, { error: `Ciclo detectado no nó "${currentNodeId}"` });
+        console.error('[chatbot/flow] ciclo detectado no nó', currentNodeId, '— abortando');
+        await reply(whatsapp, phone, '⚠️ Erro interno no fluxo (ciclo detectado). Sessão encerrada. Fale com o suporte.');
+        await clearSession(phone);
+        return true;
+      }
+      visitedNodes.add(currentNodeId);
+      const node = nodeMap[currentNodeId];
+      if (!node) {
+        emit('error', phone, { error: `Nó "${currentNodeId}" não encontrado no fluxo` });
+        break;
+      }
+
+      emit('node', phone, { nodeId: currentNodeId, nodeType: node.type, nodeLabel: node.label || currentNodeId });
+
+      const result = await executeFlowNode(node, ctx, whatsapp, phone, cfg);
+
+      emit('result', phone, { nodeId: currentNodeId, outcome: result, nextNodeId: (result && !result.startsWith('__')) ? result : null });
+
+      if (result === '__wait__') {
+        emit('wait', phone, { nodeId: currentNodeId, nodeLabel: node.label || currentNodeId });
+        await saveSession(phone, `wait_menu_${node.id}`, ctx.person_type, ctx.person_name, ctx.data);
+        return true;
+      }
+      if (result === '__end__') {
+        emit('end', phone, { reason: 'fluxo concluído' });
+        await clearSession(phone);
+        return true;
+      }
+      if (result === '__transfer__') {
+        emit('end', phone, { reason: 'transferido para suporte' });
+        await saveSession(phone, 'transferred', ctx.person_type, ctx.person_name, ctx.data);
+        return true;
+      }
+      if (result === '__abort__') {
+        emit('end', phone, { reason: 'abortado (erro de identificação)' });
+        return false;
+      }
+
+      currentNodeId = result || null;
+    }
+
+    emit('end', phone, { reason: depth >= 20 ? 'limite de profundidade atingido' : 'sem próximo nó' });
+    await clearSession(phone);
+    return true;
+  }
+
+  // ── Máquina de estados embutida ───────────────────────────────────────────
+
+  async function handleBuiltin(phone, text, whatsapp, cfg) {
+    const input = normalizeInput(text);
+    let session = await getSession(phone);
+
     if (isExpired(session, cfg.session_ttl_min)) {
       if (session) await clearSession(phone);
       session = null;
@@ -230,8 +540,6 @@ function createChatbotService({ db }) {
 
     const state = session?.state || 'idle';
 
-    // Estado transferred: humano assumiu, chatbot silencia
-    // Permite sair com "sair/cancelar/0/menu"
     if (state === 'transferred') {
       if (isCancelRequest(input)) {
         await clearSession(phone);
@@ -240,14 +548,12 @@ function createChatbotService({ db }) {
       return true;
     }
 
-    // Cancelamento global (qualquer estado ativo)
     if (state !== 'idle' && isCancelRequest(input)) {
       await clearSession(phone);
       await reply(whatsapp, phone, '👋 Sessão encerrada. Envie qualquer mensagem para recomeçar.');
       return true;
     }
 
-    // Transferência para humano (qualquer estado ativo)
     if (state !== 'idle' && isHumanRequest(input)) {
       await reply(whatsapp, phone, '👨‍💼 Vou conectar você com nossa equipe. Aguarde um momento.');
       await forwardToSupport(whatsapp, cfg, phone, text, session?.person_type, session?.person_name);
@@ -255,18 +561,13 @@ function createChatbotService({ db }) {
       return true;
     }
 
-    // ── IDLE: identifica e exibe menu ─────────────────────────────────────
     if (state === 'idle') {
       const info = await porteiro(cfg, 'GET', '/identify', { phone });
-      if (!info) return false; // porteiro indisponível — deixa auto-replies agirem
+      if (!info) return false;
 
       if (info.type === 'unknown') {
-        if (cfg.unknown_message) {
-          await reply(whatsapp, phone, cfg.unknown_message);
-        }
-        if (cfg.support_forward_unknown) {
-          await forwardToSupport(whatsapp, cfg, phone, text, 'unknown', null);
-        }
+        if (cfg.unknown_message) await reply(whatsapp, phone, cfg.unknown_message);
+        if (cfg.support_forward_unknown) await forwardToSupport(whatsapp, cfg, phone, text, 'unknown', null);
         return true;
       }
 
@@ -283,7 +584,6 @@ function createChatbotService({ db }) {
       return true;
     }
 
-    // ── WAIT_ALUNO ─────────────────────────────────────────────────────────
     if (state === 'wait_aluno') {
       if (isOption1(input, state)) {
         await clearSession(phone);
@@ -296,7 +596,6 @@ function createChatbotService({ db }) {
         }
         return true;
       }
-
       if (isOption2(input, state)) {
         await clearSession(phone);
         const res = await porteiro(cfg, 'GET', '/schedule', { phone });
@@ -308,21 +607,17 @@ function createChatbotService({ db }) {
         }
         return true;
       }
-
       if (isOption3(input, state)) {
         await clearSession(phone);
         await reply(whatsapp, phone, '🆘 Sua mensagem foi encaminhada para nossa equipe. Em breve entraremos em contato!');
         await forwardToSupport(whatsapp, cfg, phone, 'Pedido de ajuda via chatbot', session?.person_type, session?.person_name);
         return true;
       }
-
-      // Opção inválida → reenvia menu
       await showMenuAluno(whatsapp, phone, session.person_name || '');
       await saveSession(phone, 'wait_aluno', session.person_type, session.person_name, session.data);
       return true;
     }
 
-    // ── WAIT_MORADOR ───────────────────────────────────────────────────────
     if (state === 'wait_morador') {
       if (isOption1(input, state)) {
         await clearSession(phone);
@@ -340,7 +635,6 @@ function createChatbotService({ db }) {
         }
         return true;
       }
-
       if (isOption2(input, state)) {
         await clearSession(phone);
         const res = await porteiro(cfg, 'POST', '/send-qr', { phone });
@@ -352,14 +646,27 @@ function createChatbotService({ db }) {
         }
         return true;
       }
-
-      // Opção inválida → reenvia menu
       await showMenuMorador(whatsapp, phone, session.person_name || '');
       await saveSession(phone, 'wait_morador', session.person_type, session.person_name, session.data);
       return true;
     }
 
     return false;
+  }
+
+  // ── Dispatcher principal ──────────────────────────────────────────────────
+
+  async function handle(phone, text, whatsapp) {
+    if (!phone) return false;
+    return withPhoneLock(phone, async () => {
+      const cfg = await getCfg();
+      if (!cfg.enabled) return false;
+      emit('message', phone, { text: (text || '').slice(0, 120), mode: (cfg.flow?.nodes?.length > 0) ? 'flow' : 'builtin' });
+      if (cfg.flow && Array.isArray(cfg.flow.nodes) && cfg.flow.nodes.length > 0) {
+        return handleFlow(phone, text, whatsapp, cfg);
+      }
+      return handleBuiltin(phone, text, whatsapp, cfg);
+    });
   }
 
   return { handle };

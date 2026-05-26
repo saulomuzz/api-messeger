@@ -32,6 +32,7 @@ const SETTING_DEFINITIONS = {
   'chatbot.support_phones':        { env: 'CHATBOT_SUPPORT_PHONES',        secret: false, defaultValue: '' },
   'chatbot.support_forward_unknown': { env: 'CHATBOT_SUPPORT_FORWARD_UNKNOWN', secret: false, defaultValue: 'false' },
   'chatbot.debug_errors':          { env: 'CHATBOT_DEBUG_ERRORS',          secret: false, defaultValue: 'false' },
+  'chatbot.flow':                  { env: 'CHATBOT_FLOW',                  secret: false, defaultValue: '' },
 };
 
 async function resolveSettingValue(db, key) {
@@ -93,6 +94,7 @@ async function getPublicSettings(db) {
       support_phones: values['chatbot.support_phones'] || '',
       support_forward_unknown: values['chatbot.support_forward_unknown'] === 'true',
       debug_errors: values['chatbot.debug_errors'] === 'true',
+      flow: (() => { try { return JSON.parse(values['chatbot.flow'] || '{}'); } catch { return {}; } })(),
     },
   };
 }
@@ -132,6 +134,7 @@ function maskSettings(settings) {
       support_phones: settings.chatbot.support_phones,
       support_forward_unknown: settings.chatbot.support_forward_unknown,
       debug_errors: settings.chatbot.debug_errors,
+      flow: settings.chatbot.flow,
     },
   };
 }
@@ -214,6 +217,11 @@ async function saveSettings(db, payload, updatedBy) {
   if (chatbotPayload.debug_errors !== undefined) updates['chatbot.debug_errors'] = String(chatbotPayload.debug_errors ?? false);
   if (Object.prototype.hasOwnProperty.call(chatbotPayload, 'porteiro_token') && chatbotPayload.porteiro_token) {
     updates['chatbot.porteiro_token'] = chatbotPayload.porteiro_token;
+  }
+  if (chatbotPayload.flow !== undefined) {
+    updates['chatbot.flow'] = typeof chatbotPayload.flow === 'string'
+      ? chatbotPayload.flow
+      : JSON.stringify(chatbotPayload.flow);
   }
 
   for (const [key, value] of Object.entries(updates)) {
