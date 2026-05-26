@@ -22,3 +22,9 @@ tuya_devices_state.json
 
 # Vídeos temporários
 recordings/temp_videos/
+
+# Claude Code local config
+.claude/
+CLAUDE.md
+scripts/
+*.code-workspace
