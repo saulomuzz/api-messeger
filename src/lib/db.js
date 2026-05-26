@@ -248,6 +248,15 @@ async function createDatabase({ dbPath }) {
       updated_at  INTEGER NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS chatbot_flow_versions (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      label       TEXT    NOT NULL DEFAULT '',
+      node_count  INTEGER NOT NULL DEFAULT 0,
+      snapshot    TEXT    NOT NULL,
+      created_at  TEXT    NOT NULL,
+      created_by  TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_api_clients_token_hash ON api_clients(token_hash);
     CREATE INDEX IF NOT EXISTS idx_api_client_ips_client_id ON api_client_ips(client_id);
     CREATE INDEX IF NOT EXISTS idx_ip_reputation_category ON ip_reputation(category);
@@ -274,6 +283,25 @@ async function createDatabase({ dbPath }) {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, is_secret = excluded.is_secret, updated_at = excluded.updated_at, updated_by = excluded.updated_by`,
         [key, value, options.isSecret ? 1 : 0, now, options.updatedBy || null]
       );
+    },
+    async saveFlowVersion({ label, nodeCount, snapshot, createdBy }) {
+      const now = nowIso();
+      await db.run(
+        `INSERT INTO chatbot_flow_versions (label, node_count, snapshot, created_at, created_by) VALUES (?, ?, ?, ?, ?)`,
+        [label || '', nodeCount || 0, snapshot, now, createdBy || null]
+      );
+      // Keep only the 20 most recent versions
+      await db.run(
+        `DELETE FROM chatbot_flow_versions WHERE id NOT IN (SELECT id FROM chatbot_flow_versions ORDER BY id DESC LIMIT 20)`
+      );
+    },
+    async listFlowVersions() {
+      return db.all(
+        `SELECT id, label, node_count, created_at, created_by FROM chatbot_flow_versions ORDER BY id DESC LIMIT 20`
+      );
+    },
+    async getFlowVersion(id) {
+      return db.get(`SELECT * FROM chatbot_flow_versions WHERE id = ?`, [id]);
     },
     async insertAccessLog(entry) {
       await db.run(
