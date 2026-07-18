@@ -8,13 +8,20 @@ const state = {
   expandedBubble: null,
   auditAutoRefreshTimer: null,
   auditLastRefresh: null,
-  readConversations: new Set(),
+  readConversations: {}, // { [conversationKey]: lastAt visto pela última vez }
   conversationSummaries: [],
   conversationTotal: 0,
   conversationOffset: 0,
   conversationLoading: false,
   threadCache: {},
   threadLoading: false,
+  contactNames: {},
+  composerMode: 'text',
+  auditStatsRange: 'all',
+  auditLogOffset: 0,
+  auditLogLimit: 50,
+  auditLogTotal: 0,
+  auditLogFilters: { status: '', phone: '' },
 };
 
 // ── Flow editor state ─────────────────────────────────────────────────────
@@ -1878,11 +1885,14 @@ async function api(url, options) {
   const response = await fetch(url, {
     headers: { 'Content-Type': 'application/json' },
     credentials: 'same-origin',
+    cache: 'no-store',
     ...options,
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.error?.message || data.message || `HTTP ${response.status}`);
+    const err = new Error(data.error?.message || data.message || `HTTP ${response.status}`);
+    err.code = data.error?.code;
+    throw err;
   }
   return data;
 }
@@ -1980,8 +1990,11 @@ function switchScreen(screen) {
     link.closest('.nxl-item')?.classList.toggle('active', active);
   });
   byId('breadcrumb-current').textContent = (screen || 'overview').replace(/-/g, ' ');
-  if (screen === 'audit' && state.conversationSummaries.length === 0) {
+  if (screen === 'conversations' && state.conversationSummaries.length === 0) {
     loadConversationList(false);
+  }
+  if (screen === 'audit') {
+    loadAuditStatsScreen();
   }
 }
 
@@ -2304,6 +2317,11 @@ function formatConversationName(key) {
   return key;
 }
 
+function displayNameFor(phone) {
+  const key = normalizeConversationKey(phone);
+  return state.contactNames[key] || formatConversationName(key);
+}
+
 function conversationInitials(key) {
   const m = key.match(/^55(\d{2})/);
   if (m) return m[1];
@@ -2467,7 +2485,7 @@ function buildConversations(data) {
     if (!map.has(normalizedKey)) {
       map.set(normalizedKey, {
         key: normalizedKey,
-        title: formatConversationName(normalizedKey),
+        title: displayNameFor(normalizedKey),
         isGroup: normalizedKey.includes('@g.us'),
         items: [],
         lastAt: '',
@@ -2554,18 +2572,23 @@ function renderConversationList(conversations) {
   if (!state.selectedConversationKey || !filtered.some((item) => item.key === state.selectedConversationKey)) {
     state.selectedConversationKey = filtered[0].key;
   }
+  const byKey = new Map(filtered.map((c) => [c.key, c]));
   container.innerHTML = filtered.map((conversation) => {
     const isActive = conversation.key === state.selectedConversationKey;
     const color = avatarColor(conversation.key);
     const initials = conversationInitials(conversation.key);
     const time = formatMsgTime(conversation.lastAt);
     const isFailed = conversation.previewStatus === 'failed';
-    const isRead = state.readConversations.has(conversation.key);
-    const badge = !isRead && conversation.inboundCount > 0
-      ? `<span class="wa-badge">${conversation.inboundCount}</span>`
-      : conversation.failedCount > 0
-        ? `<span class="wa-badge wa-badge-fail">${conversation.failedCount}</span>`
-        : '';
+    const lastSeenAt = state.readConversations[conversation.key];
+    // Só mostra badge se houver atividade (mensagem/falha) mais recente do que a última vez que a conversa foi aberta
+    const hasUnseenActivity = !lastSeenAt || (conversation.lastAt && conversation.lastAt > lastSeenAt);
+    const badge = !hasUnseenActivity ? '' : (
+      conversation.inboundCount > 0
+        ? `<span class="wa-badge">${conversation.inboundCount}</span>`
+        : conversation.failedCount > 0
+          ? `<span class="wa-badge wa-badge-fail">${conversation.failedCount}</span>`
+          : ''
+    );
     const previewIcon = isFailed ? '✗ ' : '';
     return `
     <div class="wa-item${isActive ? ' active' : ''}" data-conversation-key="${escapeHtml(conversation.key)}">
@@ -2585,7 +2608,7 @@ function renderConversationList(conversations) {
   container.querySelectorAll('[data-conversation-key]').forEach((el) => {
     el.addEventListener('click', () => {
       const key = el.getAttribute('data-conversation-key');
-      state.readConversations.add(key);
+      state.readConversations[key] = byKey.get(key)?.lastAt || new Date().toISOString();
       state.selectedConversationKey = key;
       state.expandedBubble = null;
       renderCurrentConvList();
@@ -2607,6 +2630,9 @@ function renderConversationThread(conversations) {
     subtitle.textContent = 'Selecione um número à esquerda para inspecionar o histórico.';
     meta.textContent = '';
     thread.innerHTML = '<div class="conversation-empty">Nenhuma conversa disponível.</div>';
+    updateComposerState(null);
+    const renameBtn0 = byId('conversation-rename-btn');
+    if (renameBtn0) renameBtn0.style.display = 'none';
     return;
   }
   title.textContent = conversation.title;
@@ -2615,6 +2641,9 @@ function renderConversationThread(conversations) {
     avatarEl.style.background = avatarColor(conversation.key);
     avatarEl.textContent = conversationInitials(conversation.key);
   }
+  updateComposerState(conversation.key);
+  const renameBtn = byId('conversation-rename-btn');
+  if (renameBtn) renameBtn.style.display = '';
   subtitle.textContent = conversation.isGroup
     ? 'Timeline agrupada para um grupo WhatsApp.'
     : `${conversation.outboundCount} enviadas · ${conversation.inboundCount} recebidas${conversation.failedCount ? ` · <span style="color:#ef4444">${conversation.failedCount} falhas</span>` : ''}`;
@@ -3033,6 +3062,44 @@ function bindEvents() {
   byId('send-test-text')?.addEventListener('click', () => runAction(onSendTestText));
   byId('send-test-template')?.addEventListener('click', () => runAction(onSendTestTemplate));
   byId('save-auto-reply')?.addEventListener('click', () => runAction(onSaveAutoReply));
+
+  // Composer (Conversas)
+  byId('wa-composer-send-text')?.addEventListener('click', () => runAction(onComposerSendText));
+  byId('wa-composer-text')?.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      runAction(onComposerSendText);
+    }
+  });
+  byId('wa-composer-toggle-template')?.addEventListener('click', () => setComposerMode('template'));
+  byId('wa-composer-toggle-text')?.addEventListener('click', () => setComposerMode('text'));
+  byId('wa-composer-template-select')?.addEventListener('change', renderComposerTemplateParams);
+  byId('wa-composer-send-template')?.addEventListener('click', () => runAction(onComposerSendTemplate));
+  byId('conversation-rename-btn')?.addEventListener('click', () => runAction(onConversationRename));
+  byId('wa-jump-latest')?.addEventListener('click', () => _scrollThreadToBottom());
+  byId('conversation-thread')?.addEventListener('scroll', () => _updateJumpToLatestVisibility());
+
+  // Auditoria (estatísticas)
+  byId('audit-stats-refresh-btn')?.addEventListener('click', () => runAction(loadAuditStatsScreen));
+  byId('audit-stats-range')?.addEventListener('change', () => {
+    state.auditStatsRange = getValue('audit-stats-range') || 'all';
+    state.auditLogOffset = 0;
+    runAction(loadAuditStatsScreen);
+  });
+  byId('audit-log-filter-btn')?.addEventListener('click', () => {
+    state.auditLogFilters.status = getValue('audit-log-status');
+    state.auditLogFilters.phone = getValue('audit-log-phone');
+    state.auditLogOffset = 0;
+    runAction(loadAuditLogTable);
+  });
+  byId('audit-log-prev-btn')?.addEventListener('click', () => {
+    state.auditLogOffset = Math.max(0, state.auditLogOffset - state.auditLogLimit);
+    runAction(loadAuditLogTable);
+  });
+  byId('audit-log-next-btn')?.addEventListener('click', () => {
+    state.auditLogOffset += state.auditLogLimit;
+    runAction(loadAuditLogTable);
+  });
   byId('test_mode')?.addEventListener('change', () => setSendTestMode(getValue('test_mode')));
   byId('test_template_name')?.addEventListener('change', syncSelectedTemplateMeta);
   byId('dev_test_phone')?.addEventListener('input', () => {
@@ -3070,7 +3137,7 @@ function buildConversationFromSummary(s) {
     : describeWebhookMessage(fakeItem);
   return {
     key: String(s.phone),
-    title: formatConversationName(String(s.phone)),
+    title: displayNameFor(String(s.phone)),
     isGroup: String(s.phone).includes('@g.us'),
     items: [],
     lastAt: s.last_at,
@@ -3104,6 +3171,32 @@ function renderCurrentThread() {
   renderConversationThread(conversations);
 }
 
+async function resolveContactNamesFor(phones) {
+  const unique = [...new Set((phones || []).map(String))]
+    .filter((p) => !(normalizeConversationKey(p) in state.contactNames));
+  if (!unique.length) return;
+  try {
+    const resp = await api('/admin/api/contacts/resolve', {
+      method: 'POST',
+      body: JSON.stringify({ phones: unique }),
+    });
+    let changed = false;
+    for (const [phone, contact] of Object.entries(resp.data || {})) {
+      if (contact?.name) {
+        state.contactNames[normalizeConversationKey(phone)] = contact.name;
+        changed = true;
+      }
+    }
+    if (changed) {
+      renderCurrentConvList();
+      renderCurrentThread();
+    }
+  } catch (e) {
+    // Nome é um "nice to have" — não deve travar a tela de conversas.
+    console.warn('contacts resolve failed', e.message);
+  }
+}
+
 async function loadConversationList(append = false) {
   if (state.conversationLoading) return;
   state.conversationLoading = true;
@@ -3121,6 +3214,7 @@ async function loadConversationList(append = false) {
     state.conversationTotal = resp.total ?? state.conversationSummaries.length;
     state.conversationOffset = state.conversationSummaries.length;
     renderCurrentConvList(); // renders list + button
+    resolveContactNamesFor(state.conversationSummaries.map((s) => s.phone));
     // Auto-select first conversation or reload cached thread
     if (state.conversationSummaries.length) {
       const currentValid = state.selectedConversationKey &&
@@ -3169,7 +3263,260 @@ async function loadAndShowThread(phone) {
 
 function _scrollThreadToBottom() {
   const threadEl = byId('conversation-thread');
-  if (threadEl) requestAnimationFrame(() => { threadEl.scrollTop = threadEl.scrollHeight; });
+  if (!threadEl) return;
+  // Double rAF: garante que o layout já assentou (evita scrollHeight desatualizado)
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      threadEl.scrollTop = threadEl.scrollHeight;
+      _updateJumpToLatestVisibility();
+    });
+  });
+}
+
+function _updateJumpToLatestVisibility() {
+  const threadEl = byId('conversation-thread');
+  const jumpBtn = byId('wa-jump-latest');
+  if (!threadEl || !jumpBtn) return;
+  const distanceFromBottom = threadEl.scrollHeight - threadEl.scrollTop - threadEl.clientHeight;
+  jumpBtn.style.display = distanceFromBottom > 120 ? 'block' : 'none';
+}
+
+// ── Composer (enviar mensagem pela tela de Conversas) ─────────────────────────
+
+function updateComposerState(phone) {
+  const composer = byId('wa-composer');
+  if (!composer) return;
+  if (!phone) { composer.style.display = 'none'; return; }
+  composer.style.display = 'block';
+
+  const cached = state.threadCache[phone];
+  const webhooks = cached?.webhooks || [];
+  const lastInboundAt = webhooks.length ? webhooks[webhooks.length - 1].created_at : null;
+  const withinWindow = Boolean(lastInboundAt) && (Date.now() - new Date(lastInboundAt).getTime()) < 24 * 3600 * 1000;
+
+  const warningEl = byId('wa-composer-warning');
+  const textInput = byId('wa-composer-text');
+  const sendTextBtn = byId('wa-composer-send-text');
+  if (warningEl) {
+    warningEl.style.display = withinWindow ? 'none' : 'block';
+    if (!withinWindow) {
+      warningEl.textContent = '⚠️ Fora da janela de 24h do WhatsApp — este número não respondeu nas últimas 24h. Use um template aprovado (botão "📋 Template") para reabrir a conversa.';
+    }
+  }
+  if (textInput) textInput.disabled = !withinWindow;
+  if (sendTextBtn) sendTextBtn.disabled = !withinWindow;
+}
+
+function setComposerMode(mode) {
+  state.composerMode = mode;
+  const textRow = byId('wa-composer-text-row');
+  const templateRow = byId('wa-composer-template-row');
+  if (textRow) textRow.style.display = mode === 'text' ? 'flex' : 'none';
+  if (templateRow) templateRow.style.display = mode === 'template' ? 'flex' : 'none';
+  if (mode === 'template') loadComposerTemplates();
+}
+
+async function loadComposerTemplates() {
+  const select = byId('wa-composer-template-select');
+  if (!select) return;
+  if (!state.loadedTemplates.length) {
+    try {
+      const data = await api('/admin/api/templates');
+      state.loadedTemplates = data.data || [];
+    } catch (e) {
+      showMessage(e.message, 'error');
+      return;
+    }
+  }
+  select.innerHTML = state.loadedTemplates.map((item) =>
+    `<option value="${escapeHtml(item.name)}" data-language="${escapeHtml(item.language || '')}">${escapeHtml(item.name)}${item.language ? ` (${escapeHtml(item.language)})` : ''}</option>`
+  ).join('') || '<option value="">Nenhum template carregado</option>';
+  renderComposerTemplateParams();
+}
+
+function renderComposerTemplateParams() {
+  const select = byId('wa-composer-template-select');
+  const container = byId('wa-composer-template-params');
+  if (!select || !container) return;
+  const template = state.loadedTemplates.find((t) => t.name === select.value);
+  if (!template) { container.innerHTML = ''; return; }
+  const bodyComponent = (template.components || []).find((c) => String(c.type || '').toUpperCase() === 'BODY');
+  const variables = extractTemplateVariables(bodyComponent?.text);
+  const suggestedName = state.selectedConversationKey ? displayNameFor(state.selectedConversationKey) : '';
+  container.innerHTML = variables.map((index) => `
+    <input id="wa-composer-body-${index}" class="wa-composer-select" style="max-width:160px;display:inline-block"
+      placeholder="{{${index}}}" value="${index === 1 ? escapeHtml(suggestedName) : ''}">
+  `).join('');
+}
+
+function buildComposerTemplateComponents(template) {
+  if (!template) return [];
+  const bodyComponent = (template.components || []).find((c) => String(c.type || '').toUpperCase() === 'BODY');
+  const variables = extractTemplateVariables(bodyComponent?.text);
+  if (!variables.length) return [];
+  return [{
+    type: 'body',
+    parameters: variables.map((index) => ({ type: 'text', text: getValue(`wa-composer-body-${index}`) })),
+  }];
+}
+
+async function onComposerSendText() {
+  const phone = state.selectedConversationKey;
+  if (!phone) return;
+  const textEl = byId('wa-composer-text');
+  const text = (textEl?.value || '').trim();
+  if (!text) return;
+  const sendBtn = byId('wa-composer-send-text');
+  if (sendBtn) sendBtn.disabled = true;
+  try {
+    await api(`/admin/api/conversation/${encodeURIComponent(phone)}/send-text`, {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    });
+    if (textEl) textEl.value = '';
+    delete state.threadCache[phone];
+    await loadAndShowThread(phone);
+    showMessage('Mensagem enviada.');
+  } catch (e) {
+    if (e.code === 'outside_24h_window') setComposerMode('template');
+    showMessage(e.message, 'error');
+  } finally {
+    if (sendBtn) sendBtn.disabled = false;
+  }
+}
+
+async function onComposerSendTemplate() {
+  const phone = state.selectedConversationKey;
+  if (!phone) return;
+  const select = byId('wa-composer-template-select');
+  const name = select?.value;
+  if (!name) { showMessage('Selecione um template.', 'error'); return; }
+  const template = state.loadedTemplates.find((t) => t.name === name);
+  const language = template?.language || select.selectedOptions?.[0]?.dataset.language || 'pt_BR';
+  const btn = byId('wa-composer-send-template');
+  if (btn) btn.disabled = true;
+  try {
+    await api(`/admin/api/conversation/${encodeURIComponent(phone)}/send-template`, {
+      method: 'POST',
+      body: JSON.stringify({
+        template_name: name,
+        language_code: language,
+        components: buildComposerTemplateComponents(template),
+      }),
+    });
+    delete state.threadCache[phone];
+    await loadAndShowThread(phone);
+    showMessage('Template enviado.');
+    setComposerMode('text');
+  } catch (e) {
+    showMessage(e.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function onConversationRename() {
+  const phone = state.selectedConversationKey;
+  if (!phone) return;
+  const key = normalizeConversationKey(phone);
+  const current = state.contactNames[key] || '';
+  const name = prompt('Nome do contato:', current);
+  if (name === null || !name.trim()) return;
+  await runAction(async () => {
+    await api(`/admin/api/contacts/${encodeURIComponent(phone)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    state.contactNames[key] = name.trim();
+    renderCurrentConvList();
+    renderCurrentThread();
+    showMessage('Nome atualizado.');
+  });
+}
+
+// ── Auditoria (estatísticas) ───────────────────────────────────────────────────
+
+function setText(id, value) {
+  const el = byId(id);
+  if (el) el.textContent = value ?? '–';
+}
+
+function describeSource(row) {
+  if (row.client_name) return row.client_name;
+  return String(row.client_reference || '').split(':')[0] || 'desconhecido';
+}
+
+function renderAuditStatsCards(data) {
+  setText('audit-stat-sent', data.sent);
+  setText('audit-stat-received', data.received);
+  setText('audit-stat-failed', data.failed);
+  setText('audit-stat-pending', data.pending);
+  const container = byId('audit-stat-by-source');
+  if (!container) return;
+  container.innerHTML = (data.bySource || []).map((s) => `
+    <div class="mini-item d-flex justify-content-between align-items-center">
+      <strong>${escapeHtml(s.label)}</strong>
+      <span class="small text-muted">${s.total} total · <span style="color:#15803d">${s.sent || 0} ok</span>${s.failed ? ` · <span style="color:#991b1b">${s.failed} falhas</span>` : ''}</span>
+    </div>
+  `).join('') || '<div class="mini-item text-muted">Sem dados no período.</div>';
+}
+
+function renderAuditLogTable(rows) {
+  const tbody = document.querySelector('#audit-log-table tbody');
+  if (!tbody) return;
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-4">Nenhuma mensagem no período.</td></tr>';
+    return;
+  }
+  resolveContactNamesFor(rows.map((r) => r.to_number).filter(Boolean));
+  tbody.innerHTML = rows.map((row) => {
+    const statusVariant = row.status === 'sent' ? 'chip-sent' : row.status === 'failed' ? 'chip-failed' : row.status === 'pending' ? 'chip-pending' : 'chip-muted';
+    return `
+      <tr>
+        <td class="small" title="${escapeHtml(formatDate(row.created_at))}">${escapeHtml(relativeTime(row.created_at))}</td>
+        <td>${escapeHtml(displayNameFor(row.to_number))}</td>
+        <td class="small">${escapeHtml(describeSource(row))}</td>
+        <td class="small">${escapeHtml(row.message_type || '-')}</td>
+        <td><span class="audit-chip ${statusVariant}">${escapeHtml(row.status)}</span></td>
+      </tr>
+    `;
+  }).join('');
+}
+
+async function loadAuditLogTable() {
+  const params = new URLSearchParams();
+  params.set('range', state.auditStatsRange);
+  params.set('limit', String(state.auditLogLimit));
+  params.set('offset', String(state.auditLogOffset));
+  if (state.auditLogFilters.status) params.set('status', state.auditLogFilters.status);
+  if (state.auditLogFilters.phone) params.set('phone', state.auditLogFilters.phone);
+  try {
+    const resp = await api(`/admin/api/messages?${params.toString()}`);
+    state.auditLogTotal = resp.total || 0;
+    renderAuditLogTable(resp.data || []);
+    const pageInfo = byId('audit-log-pageinfo');
+    if (pageInfo) {
+      const from = resp.data.length ? state.auditLogOffset + 1 : 0;
+      const to = state.auditLogOffset + resp.data.length;
+      pageInfo.textContent = `${from}-${to} de ${state.auditLogTotal}`;
+    }
+    const prevBtn = byId('audit-log-prev-btn');
+    const nextBtn = byId('audit-log-next-btn');
+    if (prevBtn) prevBtn.disabled = state.auditLogOffset === 0;
+    if (nextBtn) nextBtn.disabled = state.auditLogOffset + resp.data.length >= state.auditLogTotal;
+  } catch (e) {
+    showMessage(e.message, 'error');
+  }
+}
+
+async function loadAuditStatsScreen() {
+  try {
+    const stats = await api(`/admin/api/audit/stats?range=${encodeURIComponent(state.auditStatsRange)}`);
+    renderAuditStatsCards(stats.data);
+  } catch (e) {
+    showMessage(e.message, 'error');
+  }
+  await loadAuditLogTable();
 }
 
 function _updateConvLoadMoreBtn() {

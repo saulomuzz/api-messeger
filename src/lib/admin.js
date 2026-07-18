@@ -18,12 +18,17 @@ function renderLogin(loginHtml, message = '') {
 }
 
 function registerAdminRoutes(app, deps) {
-  const { db, security, whatsapp, getPublicSettings, saveSettings, maskSettings } = deps;
+  const { db, security, whatsapp, contacts, getPublicSettings, saveSettings, maskSettings } = deps;
   const loginHtml = readTemplate('login.html');
   const dashboardHtml = readTemplate('dashboard.html');
   const asyncHandler = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
 
   app.use('/admin/static', express.static(path.join(__dirname, '..', 'admin', 'static')));
+
+  app.use('/admin/api', (req, res, next) => {
+    res.set('Cache-Control', 'no-store');
+    next();
+  });
 
   async function requireAdmin(req, res, next) {
     await db.purgeExpiredSessions();
@@ -252,8 +257,113 @@ function registerAdminRoutes(app, deps) {
     res.json({ ok: true });
   }));
 
+  function rangeToSinceIso(range) {
+    const days = { today: 0, '7d': 7, '30d': 30 }[range];
+    if (days === undefined) return null; // 'all' ou não informado
+    const since = new Date();
+    since.setUTCHours(0, 0, 0, 0);
+    if (days > 0) since.setUTCDate(since.getUTCDate() - days);
+    return since.toISOString();
+  }
+
   app.get('/admin/api/messages', requireAdmin, asyncHandler(async (req, res) => {
-    res.json({ data: await db.listMessageAudit(100) });
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+    const filters = {
+      status: req.query.status || undefined,
+      clientId: req.query.client_id ? Number(req.query.client_id) : undefined,
+      phone: req.query.phone || undefined,
+      sinceIso: rangeToSinceIso(req.query.range) || undefined,
+      limit,
+      offset,
+    };
+    const [data, total] = await Promise.all([
+      db.listMessageAuditFiltered(filters),
+      db.countMessageAuditFiltered(filters),
+    ]);
+    res.json({ data, total, limit, offset });
+  }));
+
+  app.get('/admin/api/audit/stats', requireAdmin, asyncHandler(async (req, res) => {
+    const sinceIso = rangeToSinceIso(req.query.range) || undefined;
+    res.json({ data: await db.getAuditStats({ sinceIso }) });
+  }));
+
+  app.post('/admin/api/contacts/resolve', requireAdmin, asyncHandler(async (req, res) => {
+    const phones = Array.isArray(req.body?.phones) ? req.body.phones.map(String) : [];
+    res.json({ data: await contacts.resolveContacts(phones) });
+  }));
+
+  app.patch('/admin/api/contacts/:phone', requireAdmin, asyncHandler(async (req, res) => {
+    const name = String(req.body?.name || '').trim();
+    if (!name) throw Object.assign(new Error('name é obrigatório'), { status: 400 });
+    const updated = await contacts.setManualName(req.params.phone, name);
+    await db.createAdminAction({
+      adminUserId: req.adminUser.id,
+      action: 'rename_contact',
+      targetType: 'contact',
+      targetId: req.params.phone,
+      details: { name },
+    });
+    res.json({ data: updated });
+  }));
+
+  app.post('/admin/api/conversation/:phone/send-text', requireAdmin, asyncHandler(async (req, res) => {
+    const phone = req.params.phone;
+    const text = String(req.body?.text || '').trim();
+    if (!text) throw Object.assign(new Error('text é obrigatório'), { status: 400 });
+
+    const lastInboundAt = await db.getLastInboundAt(phone);
+    const withinWindow = Boolean(lastInboundAt) && (Date.now() - new Date(lastInboundAt).getTime()) < 24 * 3600 * 1000;
+    if (!withinWindow) {
+      throw Object.assign(new Error(
+        'Fora da janela de 24h do WhatsApp: este número não enviou mensagem nas últimas 24h. Envie um template aprovado para reabrir a conversa.'
+      ), { status: 409, code: 'outside_24h_window' });
+    }
+
+    const result = await whatsapp.sendText({
+      clientId: null,
+      requestId: req.ctx.requestId,
+      ip: req.ctx.clientIp,
+      to: phone,
+      text,
+      clientReference: `admin:conversation:${req.adminUser.username}`,
+    });
+    await db.createAdminAction({
+      adminUserId: req.adminUser.id,
+      action: 'conversation_send_text',
+      targetType: 'message',
+      targetId: String(result.auditId),
+      details: { to: phone },
+    });
+    res.json({ data: result });
+  }));
+
+  app.post('/admin/api/conversation/:phone/send-template', requireAdmin, asyncHandler(async (req, res) => {
+    const phone = req.params.phone;
+    const templateName = req.body?.template_name;
+    const languageCode = req.body?.language_code;
+    if (!templateName || !languageCode) {
+      throw Object.assign(new Error('template_name e language_code são obrigatórios'), { status: 400 });
+    }
+    const result = await whatsapp.sendTemplate({
+      clientId: null,
+      requestId: req.ctx.requestId,
+      ip: req.ctx.clientIp,
+      to: phone,
+      templateName,
+      languageCode,
+      components: Array.isArray(req.body?.components) ? req.body.components : [],
+      clientReference: `admin:conversation:${req.adminUser.username}`,
+    });
+    await db.createAdminAction({
+      adminUserId: req.adminUser.id,
+      action: 'conversation_send_template',
+      targetType: 'message',
+      targetId: String(result.auditId),
+      details: { to: phone, template_name: templateName },
+    });
+    res.json({ data: result });
   }));
 
   app.get('/admin/api/webhooks', requireAdmin, asyncHandler(async (req, res) => {

@@ -111,6 +111,16 @@ function isIpInList(ip, list) {
   return (list || []).some((entry) => ipInCidr(ip, entry));
 }
 
+function normalizePhoneBR(value) {
+  const s = String(value || '').trim();
+  if (!s) return '';
+  // Números BR de 13 dígitos (com o 9º dígito) → normaliza para 12 dígitos
+  if (s.length === 13 && s.startsWith('55') && s[4] === '9') {
+    return s.slice(0, 4) + s.slice(5);
+  }
+  return s;
+}
+
 function safeJsonParse(value) {
   if (value === null || value === undefined || value === '') {
     return null;
@@ -154,6 +164,7 @@ module.exports = {
   isIpInList,
   maskSecret,
   normalizeIp,
+  normalizePhoneBR,
   nowIso,
   parseBoolean,
   parseList,

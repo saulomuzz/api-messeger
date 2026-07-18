@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 
-const { hashPassword, nowIso, safeJsonParse, sanitizePayload, sha256 } = require('./utils');
+const { hashPassword, normalizePhoneBR, nowIso, safeJsonParse, sanitizePayload, sha256 } = require('./utils');
 
 function openDatabase(dbPath) {
   return new Promise((resolve, reject) => {
@@ -72,6 +72,11 @@ function parseMessageAuditRow(row) {
     response: safeJsonParse(row.response_json),
     error: safeJsonParse(row.error_json),
   };
+}
+
+function normPhoneExpr(col) {
+  return `CASE WHEN LENGTH(${col})=13 AND SUBSTR(${col},1,2)='55' AND SUBSTR(${col},5,1)='9'
+          THEN SUBSTR(${col},1,4)||SUBSTR(${col},6) ELSE ${col} END`;
 }
 
 function parseWebhookRow(row) {
@@ -255,6 +260,19 @@ async function createDatabase({ dbPath }) {
       snapshot    TEXT    NOT NULL,
       created_at  TEXT    NOT NULL,
       created_by  TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS contacts (
+      phone            TEXT PRIMARY KEY,
+      name             TEXT,
+      person_type      TEXT,
+      person_id        INTEGER,
+      aluno_id         INTEGER,
+      source           TEXT NOT NULL DEFAULT 'porteiro',
+      manual_override  INTEGER NOT NULL DEFAULT 0,
+      resolved_at      TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL
     );
 
     CREATE INDEX IF NOT EXISTS idx_api_clients_token_hash ON api_clients(token_hash);
@@ -783,6 +801,123 @@ async function createDatabase({ dbPath }) {
         [messageId]
       );
       return Boolean(row);
+    },
+
+    // ── Contatos (nome resolvido via api-porteiro / manual) ─────────────────────
+    async getContact(phone) {
+      const p = normalizePhoneBR(phone);
+      if (!p) return null;
+      return db.get('SELECT * FROM contacts WHERE phone = ?', [p]);
+    },
+    async getContacts(phones) {
+      const norm = [...new Set((phones || []).map(normalizePhoneBR).filter(Boolean))];
+      if (!norm.length) return [];
+      const placeholders = norm.map(() => '?').join(',');
+      return db.all(`SELECT * FROM contacts WHERE phone IN (${placeholders})`, norm);
+    },
+    async upsertResolvedContact({ phone, name, personType, personId, alunoId, source }) {
+      const p = normalizePhoneBR(phone);
+      if (!p) return;
+      const now = nowIso();
+      await db.run(
+        `INSERT INTO contacts (phone, name, person_type, person_id, aluno_id, source, manual_override, resolved_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)
+         ON CONFLICT(phone) DO UPDATE SET
+           name        = CASE WHEN contacts.manual_override = 1 THEN contacts.name        ELSE excluded.name        END,
+           person_type = CASE WHEN contacts.manual_override = 1 THEN contacts.person_type ELSE excluded.person_type END,
+           person_id   = CASE WHEN contacts.manual_override = 1 THEN contacts.person_id   ELSE excluded.person_id   END,
+           aluno_id    = CASE WHEN contacts.manual_override = 1 THEN contacts.aluno_id    ELSE excluded.aluno_id    END,
+           source      = CASE WHEN contacts.manual_override = 1 THEN contacts.source      ELSE excluded.source      END,
+           resolved_at = excluded.resolved_at,
+           updated_at  = excluded.updated_at`,
+        [p, name || null, personType || null, personId || null, alunoId || null, source || 'porteiro', now, now, now]
+      );
+    },
+    async setManualContactName(phone, name) {
+      const p = normalizePhoneBR(phone);
+      if (!p) return;
+      const now = nowIso();
+      await db.run(
+        `INSERT INTO contacts (phone, name, source, manual_override, resolved_at, created_at, updated_at)
+         VALUES (?, ?, 'manual', 1, ?, ?, ?)
+         ON CONFLICT(phone) DO UPDATE SET name = excluded.name, source = 'manual', manual_override = 1, updated_at = excluded.updated_at`,
+        [p, name, now, now, now]
+      );
+    },
+
+    // ── Janela de 24h (WhatsApp) ─────────────────────────────────────────────────
+    async getLastInboundAt(phone) {
+      const p = normalizePhoneBR(phone);
+      if (!p) return null;
+      const row = await db.get(
+        `SELECT MAX(created_at) AS last_at FROM webhook_events WHERE from_number != '' AND ${normPhoneExpr('from_number')} = ?`,
+        [p]
+      );
+      return row?.last_at || null;
+    },
+
+    // ── Auditoria (estatísticas) ─────────────────────────────────────────────────
+    async getAuditStats({ sinceIso } = {}) {
+      const params = sinceIso ? [sinceIso] : [];
+      const where = sinceIso ? 'WHERE created_at >= ?' : '';
+      const [statusRows, inboundRow, sourceRows, clients] = await Promise.all([
+        db.all(`SELECT status, COUNT(*) AS count FROM message_audit ${where} GROUP BY status`, params),
+        db.get(`SELECT COUNT(*) AS count FROM webhook_events ${where}`, params),
+        db.all(
+          `SELECT client_id, client_reference, status, COUNT(*) AS count
+           FROM message_audit ${where} GROUP BY client_id, client_reference, status`,
+          params
+        ),
+        db.all('SELECT id, name FROM api_clients'),
+      ]);
+      const clientNameById = Object.fromEntries(clients.map((c) => [c.id, c.name]));
+      const statusCounts = { sent: 0, failed: 0, pending: 0 };
+      for (const row of statusRows) statusCounts[row.status] = row.count;
+
+      const bySource = {};
+      for (const row of sourceRows) {
+        const label = row.client_id
+          ? (clientNameById[row.client_id] || `cliente#${row.client_id}`)
+          : (String(row.client_reference || '').split(':')[0] || 'desconhecido');
+        if (!bySource[label]) bySource[label] = { label, sent: 0, failed: 0, pending: 0, total: 0 };
+        bySource[label][row.status] = (bySource[label][row.status] || 0) + row.count;
+        bySource[label].total += row.count;
+      }
+
+      return {
+        sent: statusCounts.sent || 0,
+        failed: statusCounts.failed || 0,
+        pending: statusCounts.pending || 0,
+        received: inboundRow?.count || 0,
+        bySource: Object.values(bySource).sort((a, b) => b.total - a.total),
+      };
+    },
+    async listMessageAuditFiltered({ status, clientId, sinceIso, phone, limit = 50, offset = 0 } = {}) {
+      const clauses = [];
+      const params = [];
+      if (status) { clauses.push('ma.status = ?'); params.push(status); }
+      if (clientId) { clauses.push('ma.client_id = ?'); params.push(clientId); }
+      if (sinceIso) { clauses.push('ma.created_at >= ?'); params.push(sinceIso); }
+      if (phone) { clauses.push(`${normPhoneExpr('ma.to_number')} = ?`); params.push(normalizePhoneBR(phone)); }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      const rows = await db.all(
+        `SELECT ma.*, ac.name AS client_name FROM message_audit ma
+         LEFT JOIN api_clients ac ON ac.id = ma.client_id
+         ${where} ORDER BY ma.created_at DESC LIMIT ? OFFSET ?`,
+        [...params, limit, offset]
+      );
+      return rows.map(parseMessageAuditRow);
+    },
+    async countMessageAuditFiltered({ status, clientId, sinceIso, phone } = {}) {
+      const clauses = [];
+      const params = [];
+      if (status) { clauses.push('status = ?'); params.push(status); }
+      if (clientId) { clauses.push('client_id = ?'); params.push(clientId); }
+      if (sinceIso) { clauses.push('created_at >= ?'); params.push(sinceIso); }
+      if (phone) { clauses.push(`${normPhoneExpr('to_number')} = ?`); params.push(normalizePhoneBR(phone)); }
+      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+      const row = await db.get(`SELECT COUNT(*) AS total FROM message_audit ${where}`, params);
+      return row?.total ?? 0;
     },
   };
 
