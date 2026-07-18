@@ -11,6 +11,7 @@ const { createDatabase } = require('./lib/db');
 const { getPublicSettings, saveSettings, maskSettings } = require('./lib/settings');
 const { createSecurityService } = require('./lib/security');
 const { createWhatsAppService } = require('./lib/whatsapp');
+const { createContactsService } = require('./lib/contacts');
 const { registerAdminRoutes } = require('./lib/admin');
 const {
   requestId,
@@ -104,6 +105,7 @@ async function main() {
   const db = await createDatabase({ dbPath: DB_PATH });
   const security = createSecurityService({ db });
   const whatsapp = createWhatsAppService({ db });
+  const contacts = createContactsService({ db });
 
   const app = express();
   app.disable('x-powered-by');
@@ -725,7 +727,7 @@ async function main() {
     res.status(200).json({ success: true });
   }));
 
-  registerAdminRoutes(app, { db, security, whatsapp, getPublicSettings, saveSettings, maskSettings });
+  registerAdminRoutes(app, { db, security, whatsapp, contacts, getPublicSettings, saveSettings, maskSettings });
 
   app.use((error, req, res, next) => {
     console.error('unhandled error', error);
