@@ -1,4 +1,5 @@
 const axios = require('axios');
+const crypto = require('crypto');
 
 const { getPublicSettings } = require('./settings');
 const { sanitizePayload } = require('./utils');
@@ -255,6 +256,41 @@ async function graphRequest({ method, path, data, params }) {
     return Boolean(config.webhook_verify_token) && token === config.webhook_verify_token;
   }
 
+  /**
+   * Valida a assinatura X-Hub-Signature-256 que a Meta envia em todo POST
+   * de webhook, calculada com o App Secret sobre o corpo bruto da requisição.
+   * Sem isso, qualquer requisicao POST para /webhook/whatsapp e aceita e
+   * processada (dispara auto-replies) sem confirmar que veio da Meta.
+   *
+   * Enquanto WHATSAPP_APP_SECRET nao estiver configurado, retorna true (nao
+   * quebra producao que ainda nao configurou o secret) mas avisa no log.
+   */
+  async function verifyWebhookSignature(rawBody, signatureHeader) {
+    const config = await getConfig();
+    const secret = config.app_secret;
+    if (!secret) {
+      console.warn('[whatsapp] WHATSAPP_APP_SECRET nao configurado — assinatura do webhook NAO esta sendo validada');
+      return true;
+    }
+    if (!signatureHeader || !signatureHeader.startsWith('sha256=')) {
+      return false;
+    }
+    const provided = signatureHeader.slice('sha256='.length);
+    let providedBuf;
+    let expectedBuf;
+    try {
+      providedBuf = Buffer.from(provided, 'hex');
+      expectedBuf = Buffer.from(
+        crypto.createHmac('sha256', secret).update(rawBody || Buffer.alloc(0)).digest('hex'),
+        'hex'
+      );
+    } catch {
+      return false;
+    }
+    if (providedBuf.length !== expectedBuf.length) return false;
+    return crypto.timingSafeEqual(providedBuf, expectedBuf);
+  }
+
   async function handleWebhook({ requestId, sourceIp, payload }) {
     const entry = payload.entry?.[0];
     const change = entry?.changes?.[0];
@@ -382,6 +418,7 @@ async function graphRequest({ method, path, data, params }) {
     sendText,
     uploadMedia,
     verifyWebhook,
+    verifyWebhookSignature,
   };
 }
 

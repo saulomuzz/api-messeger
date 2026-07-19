@@ -2030,6 +2030,7 @@ function fillSettings(settings) {
   setValue('w_phone_number_id', settings.whatsapp.phone_number_id);
   setValue('w_business_account_id', settings.whatsapp.business_account_id);
   setSecret('w_webhook_verify_token', settings.whatsapp.webhook_verify_token);
+  setSecret('w_app_secret', settings.whatsapp.app_secret);
   setValue('w_api_version', settings.whatsapp.api_version);
   setValue('w_webhook_domain', settings.whatsapp.webhook_domain);
   setSecret('abuse_key', settings.abuseipdb.api_key);
@@ -2814,6 +2815,7 @@ function buildSettingsPayload() {
       phone_number_id: getValue('w_phone_number_id'),
       business_account_id: getValue('w_business_account_id'),
       webhook_verify_token: getValue('w_webhook_verify_token'),
+      app_secret: getValue('w_app_secret'),
       api_version: getValue('w_api_version'),
       webhook_domain: getValue('w_webhook_domain'),
     },

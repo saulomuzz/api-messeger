@@ -7,6 +7,7 @@ const SETTING_DEFINITIONS = {
   'whatsapp.phone_number_id': { env: 'WHATSAPP_PHONE_NUMBER_ID', secret: false, defaultValue: '' },
   'whatsapp.business_account_id': { env: 'WHATSAPP_BUSINESS_ACCOUNT_ID', secret: false, defaultValue: '' },
   'whatsapp.webhook_verify_token': { env: 'WHATSAPP_WEBHOOK_VERIFY_TOKEN', secret: true, defaultValue: '' },
+  'whatsapp.app_secret': { env: 'WHATSAPP_APP_SECRET', secret: true, defaultValue: '' },
   'whatsapp.api_version': { env: 'WHATSAPP_API_VERSION', secret: false, defaultValue: 'v21.0' },
   'whatsapp.webhook_domain': { env: 'WHATSAPP_WEBHOOK_DOMAIN', secret: false, defaultValue: '' },
   'abuseipdb.api_key': { env: 'ABUSEIPDB_API_KEY', secret: true, defaultValue: '' },
@@ -59,6 +60,7 @@ async function getPublicSettings(db) {
       phone_number_id: values['whatsapp.phone_number_id'],
       business_account_id: values['whatsapp.business_account_id'],
       webhook_verify_token: values['whatsapp.webhook_verify_token'],
+      app_secret: values['whatsapp.app_secret'],
       api_version: values['whatsapp.api_version'],
       webhook_domain: values['whatsapp.webhook_domain'],
     },
@@ -107,6 +109,7 @@ function maskSettings(settings) {
       phone_number_id: settings.whatsapp.phone_number_id || '',
       business_account_id: settings.whatsapp.business_account_id || '',
       webhook_verify_token: settings.whatsapp.webhook_verify_token ? maskSecret(settings.whatsapp.webhook_verify_token) : '',
+      app_secret: settings.whatsapp.app_secret ? maskSecret(settings.whatsapp.app_secret) : '',
       api_version: settings.whatsapp.api_version || '',
       webhook_domain: settings.whatsapp.webhook_domain || '',
     },
@@ -186,6 +189,9 @@ async function saveSettings(db, payload, updatedBy) {
   }
   if (Object.prototype.hasOwnProperty.call(payload.whatsapp || {}, 'webhook_verify_token') && payload.whatsapp.webhook_verify_token) {
     updates['whatsapp.webhook_verify_token'] = payload.whatsapp.webhook_verify_token;
+  }
+  if (Object.prototype.hasOwnProperty.call(payload.whatsapp || {}, 'app_secret') && payload.whatsapp.app_secret) {
+    updates['whatsapp.app_secret'] = payload.whatsapp.app_secret;
   }
   if (Object.prototype.hasOwnProperty.call(payload.abuseipdb || {}, 'api_key') && payload.abuseipdb.api_key) {
     updates['abuseipdb.api_key'] = payload.abuseipdb.api_key;
