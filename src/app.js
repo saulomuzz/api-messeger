@@ -24,7 +24,7 @@ const {
 const PORT = Number(process.env.PORT || 3000);
 const APP_ROOT = path.resolve(__dirname, '..');
 const DB_PATH = process.env.SQLITE_PATH || path.join(APP_ROOT, 'data', 'app.sqlite');
-const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
+const CORS_ORIGIN = process.env.CORS_ORIGIN || '';
 const LEGACY_API_TOKEN = process.env.API_TOKEN || '';
 const ALLOWED_MEDIA_TYPES = new Set(['audio', 'document', 'image', 'sticker', 'video']);
 const CAPTION_MEDIA_TYPES = new Set(['document', 'image', 'video']);
@@ -167,14 +167,32 @@ async function main() {
     }
     return helmet({ crossOriginResourcePolicy: false })(req, res, next);
   });
-  app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN, credentials: true }));
+  // CORS so libera credentials para origens explicitas e conhecidas. Sem
+  // CORS_ORIGIN configurado (ou com o antigo default "*"), fica desabilitado:
+  // isso nao afeta chamadas servidor-a-servidor (api-porteiro, etc.), que
+  // nao passam pelo CORS de navegador de qualquer forma. Antes disso,
+  // origin:true + credentials:true refletia qualquer Origin da requisicao,
+  // permitindo que qualquer site fizesse requisicoes autenticadas (com
+  // cookie de sessao admin) contra a API.
+  app.use(cors(
+    CORS_ORIGIN && CORS_ORIGIN !== '*'
+      ? { origin: CORS_ORIGIN.split(',').map((s) => s.trim()), credentials: true }
+      : { origin: false }
+  ));
   app.use(compression({
     filter: (req, res) => {
       if (req.path && req.path.endsWith('/live')) return false;
       return compression.filter(req, res);
     },
   }));
-  app.use(express.json({ limit: '2mb' }));
+  app.use(express.json({
+    limit: '2mb',
+    // Guarda o corpo bruto para validar a assinatura X-Hub-Signature-256
+    // do webhook do WhatsApp (precisa dos bytes originais, nao do JSON reparseado).
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  }));
   app.use(express.urlencoded({ extended: false }));
   app.use(cookieParser());
 
@@ -717,6 +735,11 @@ async function main() {
   }));
 
   app.post('/webhook/whatsapp', asyncRoute(async (req, res) => {
+    const signatureValid = await whatsapp.verifyWebhookSignature(req.rawBody, req.get('X-Hub-Signature-256'));
+    if (!signatureValid) {
+      req.ctx.securityDecision = 'deny_invalid_webhook_signature';
+      return res.status(403).send('Forbidden');
+    }
     req.ctx.securityDecision = 'allow_webhook';
     const result = await whatsapp.handleWebhook({
       requestId: req.ctx.requestId,
