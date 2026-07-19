@@ -4,8 +4,12 @@ const path = require('path');
 const express = require('express');
 const axios = require('axios');
 
-const { verifyPassword } = require('./utils');
+const { verifyPassword, getClientIp } = require('./utils');
+const { createWindowLimiter } = require('./security');
 const chatbotEvents = require('./chatbot-events');
+
+const LOGIN_RATE_LIMIT = 5;
+const LOGIN_RATE_WINDOW_MS = 5 * 60 * 1000;
 
 function readTemplate(name) {
   return fs.readFileSync(path.join(__dirname, '..', 'admin', 'templates', name), 'utf8');
@@ -22,6 +26,7 @@ function registerAdminRoutes(app, deps) {
   const loginHtml = readTemplate('login.html');
   const dashboardHtml = readTemplate('dashboard.html');
   const asyncHandler = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+  const loginLimiter = createWindowLimiter();
 
   app.use('/admin/static', express.static(path.join(__dirname, '..', 'admin', 'static')));
 
@@ -52,6 +57,11 @@ function registerAdminRoutes(app, deps) {
   app.get('/admin/login', (req, res) => res.type('html').send(renderLogin(loginHtml)));
 
   app.post('/admin/login', asyncHandler(async (req, res) => {
+    const clientIp = getClientIp(req);
+    const rate = loginLimiter.check(`admin_login:${clientIp}`, LOGIN_RATE_LIMIT, LOGIN_RATE_WINDOW_MS);
+    if (!rate.ok) {
+      return res.status(429).type('html').send(renderLogin(loginHtml, 'Muitas tentativas. Aguarde alguns minutos e tente novamente.'));
+    }
     const { username, password } = req.body || {};
     const user = await db.findAdminUserByUsername(String(username || '').trim());
     if (!user || user.status !== 'active' || !verifyPassword(password, user.password_hash)) {
@@ -65,7 +75,7 @@ function registerAdminRoutes(app, deps) {
     res.cookie('admin_session', sessionToken, {
       httpOnly: true,
       sameSite: 'lax',
-      secure: false,
+      secure: true,
       expires: new Date(expiresAt),
     });
     res.redirect('/admin/dashboard');

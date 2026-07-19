@@ -185,4 +185,5 @@ function createSecurityService({ db }) {
 
 module.exports = {
   createSecurityService,
+  createWindowLimiter,
 };
