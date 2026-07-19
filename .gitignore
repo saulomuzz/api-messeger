@@ -28,3 +28,10 @@ recordings/temp_videos/
 CLAUDE.md
 scripts/
 *.code-workspace
+
+# Ferramentas de orquestracao local (ruflo/claude-flow/graphify) - cache/estado
+.claude-flow/
+.swarm/
+.hive-mind/
+graphify-out/
+ruvector.db
