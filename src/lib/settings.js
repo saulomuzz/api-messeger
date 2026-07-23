@@ -25,6 +25,8 @@ const SETTING_DEFINITIONS = {
   'chatbot.enabled':               { env: 'CHATBOT_ENABLED',               secret: false, defaultValue: 'false' },
   'chatbot.porteiro_url':          { env: 'CHATBOT_PORTEIRO_URL',          secret: false, defaultValue: '' },
   'chatbot.porteiro_token':        { env: 'CHATBOT_PORTEIRO_TOKEN',        secret: true,  defaultValue: '' },
+  'chatbot.bianca_url':            { env: 'CHATBOT_BIANCA_URL',            secret: false, defaultValue: '' },
+  'chatbot.bianca_token':          { env: 'CHATBOT_BIANCA_TOKEN',          secret: true,  defaultValue: '' },
   'chatbot.unknown_message':       { env: 'CHATBOT_UNKNOWN_MESSAGE',       secret: false, defaultValue: 'Olá! Seu número não está cadastrado em nosso sistema. Para mais informações, entre em contato com a administração.' },
   'chatbot.session_ttl_min':       { env: 'CHATBOT_SESSION_TTL_MIN',       secret: false, defaultValue: '5' },
   'chatbot.relay_device_id':       { env: 'CHATBOT_RELAY_DEVICE_ID',       secret: false, defaultValue: '' },
@@ -88,6 +90,8 @@ async function getPublicSettings(db) {
       enabled: values['chatbot.enabled'] === 'true',
       porteiro_url: values['chatbot.porteiro_url'] || '',
       porteiro_token: values['chatbot.porteiro_token'] || '',
+      bianca_url: values['chatbot.bianca_url'] || '',
+      bianca_token: values['chatbot.bianca_token'] || '',
       unknown_message: values['chatbot.unknown_message'] || '',
       session_ttl_min: parsePositiveInt(values['chatbot.session_ttl_min'], 5),
       relay_device_id: values['chatbot.relay_device_id'] || '',
@@ -129,6 +133,8 @@ function maskSettings(settings) {
       enabled: settings.chatbot.enabled,
       porteiro_url: settings.chatbot.porteiro_url,
       porteiro_token: settings.chatbot.porteiro_token ? maskSecret(settings.chatbot.porteiro_token) : '',
+      bianca_url: settings.chatbot.bianca_url,
+      bianca_token: settings.chatbot.bianca_token ? maskSecret(settings.chatbot.bianca_token) : '',
       unknown_message: settings.chatbot.unknown_message,
       session_ttl_min: settings.chatbot.session_ttl_min,
       relay_device_id: settings.chatbot.relay_device_id,
@@ -213,6 +219,7 @@ async function saveSettings(db, payload, updatedBy) {
   const chatbotPayload = payload.chatbot || {};
   if (chatbotPayload.enabled !== undefined) updates['chatbot.enabled'] = String(chatbotPayload.enabled ?? false);
   if (chatbotPayload.porteiro_url !== undefined) updates['chatbot.porteiro_url'] = chatbotPayload.porteiro_url || '';
+  if (chatbotPayload.bianca_url !== undefined) updates['chatbot.bianca_url'] = chatbotPayload.bianca_url || '';
   if (chatbotPayload.unknown_message !== undefined) updates['chatbot.unknown_message'] = chatbotPayload.unknown_message || '';
   if (chatbotPayload.session_ttl_min !== undefined) updates['chatbot.session_ttl_min'] = String(chatbotPayload.session_ttl_min || 5);
   if (chatbotPayload.relay_device_id !== undefined) updates['chatbot.relay_device_id'] = chatbotPayload.relay_device_id || '';
@@ -223,6 +230,9 @@ async function saveSettings(db, payload, updatedBy) {
   if (chatbotPayload.debug_errors !== undefined) updates['chatbot.debug_errors'] = String(chatbotPayload.debug_errors ?? false);
   if (Object.prototype.hasOwnProperty.call(chatbotPayload, 'porteiro_token') && chatbotPayload.porteiro_token) {
     updates['chatbot.porteiro_token'] = chatbotPayload.porteiro_token;
+  }
+  if (Object.prototype.hasOwnProperty.call(chatbotPayload, 'bianca_token') && chatbotPayload.bianca_token) {
+    updates['chatbot.bianca_token'] = chatbotPayload.bianca_token;
   }
   if (chatbotPayload.flow !== undefined) {
     updates['chatbot.flow'] = typeof chatbotPayload.flow === 'string'

@@ -236,9 +236,18 @@ function createChatbotService({ db }) {
 
   // ── Motor de fluxo customizado ────────────────────────────────────────────
 
+  function getSessionValue(ctx, path) {
+    let val = ctx.data;
+    for (const part of path.split('.')) {
+      if (val === null || val === undefined) return undefined;
+      val = val[part];
+    }
+    return val;
+  }
+
   function resolveFlowTemplate(text, ctx) {
     return String(text || '').replace(/\{\{(\w[\w.]*)\}\}/g, (_, key) => {
-      if (key.startsWith('session.')) return String(ctx.data?.[key.slice(8)] ?? '');
+      if (key.startsWith('session.')) return String(getSessionValue(ctx, key.slice(8)) ?? '');
       return String(ctx[key] ?? '');
     });
   }
@@ -284,6 +293,10 @@ function createChatbotService({ db }) {
         await reply(whatsapp, phone, resolve(node.text));
         return node.next || '__end__';
 
+      case 'input':
+        await reply(whatsapp, phone, resolve(node.prompt || ''));
+        return '__wait_input__';
+
       case 'api_call': {
         const url = resolve(node.url || '');
         if (!url) return node.on_error || node.next || '__end__';
@@ -319,7 +332,7 @@ function createChatbotService({ db }) {
       }
 
       case 'condition': {
-        const val = String(ctx.data[node.variable] ?? '');
+        const val = String(getSessionValue(ctx, node.variable || '') ?? '');
         return val === String(node.equals ?? '')
           ? (node.next_true || '__end__')
           : (node.next_false || '__end__');
@@ -418,6 +431,8 @@ function createChatbotService({ db }) {
       person_type: session?.person_type || '',
       porteiro_url: cfg.porteiro_url || '',
       porteiro_token: cfg.porteiro_token || '',
+      bianca_url: cfg.bianca_url || '',
+      bianca_token: cfg.bianca_token || '',
       relay_device_id: String(cfg.relay_device_id || ''),
       relay_door_num: String(cfg.relay_door_num || '1'),
       relay_delay: String(cfg.relay_delay || '5'),
@@ -468,6 +483,17 @@ function createChatbotService({ db }) {
       }
       emit('menu_select', phone, { nodeId: menuNodeId, input, next: selectedNext });
       currentNodeId = selectedNext;
+    } else if (sessState.startsWith('wait_input_')) {
+      const inputNodeId = sessState.slice('wait_input_'.length);
+      const inputNode = nodeMap[inputNodeId];
+      if (!inputNode) { await clearSession(phone); return false; }
+
+      // Ignora input vazio (webhook de status/echo) sem re-perguntar
+      if (!input) return true;
+
+      if (inputNode.store_as) ctx.data[inputNode.store_as] = (text || '').trim();
+      emit('input_captured', phone, { nodeId: inputNodeId, storeAs: inputNode.store_as });
+      currentNodeId = inputNode.next || '__end__';
     } else {
       await clearSession(phone);
       currentNodeId = cfg.flow.entry;
@@ -502,6 +528,11 @@ function createChatbotService({ db }) {
       if (result === '__wait__') {
         emit('wait', phone, { nodeId: currentNodeId, nodeLabel: node.label || currentNodeId });
         await saveSession(phone, `wait_menu_${node.id}`, ctx.person_type, ctx.person_name, ctx.data);
+        return true;
+      }
+      if (result === '__wait_input__') {
+        emit('wait', phone, { nodeId: currentNodeId, nodeLabel: node.label || currentNodeId });
+        await saveSession(phone, `wait_input_${node.id}`, ctx.person_type, ctx.person_name, ctx.data);
         return true;
       }
       if (result === '__end__') {
