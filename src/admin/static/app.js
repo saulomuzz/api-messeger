@@ -37,6 +37,7 @@ const FLOW_NODE_META = {
   identify: { color: '#3b82f6', icon: '🔍', label: 'Identificar',  inputs: 1, outputs: 3, outLabels: ['Aluno',    'Morador/Outros', 'Desconhecido'] },
   menu:     { color: '#10b981', icon: '📋', label: 'Menu',         inputs: 1, outputs: 1, outLabels: ['Botão 1'] },
   message:  { color: '#6b7280', icon: '💬', label: 'Mensagem',     inputs: 1, outputs: 1, outLabels: ['Próximo'] },
+  input:    { color: '#059669', icon: '⌨️', label: 'Capturar texto', inputs: 1, outputs: 1, outLabels: ['Próximo'] },
   api_call: { color: '#8b5cf6', icon: '🔌', label: 'API Call',     inputs: 1, outputs: 2, outLabels: ['Sucesso', 'Erro'] },
   condition:{ color: '#f59e0b', icon: '❓', label: 'Condição',     inputs: 1, outputs: 2, outLabels: ['Verdadeiro', 'Falso'] },
   transfer:   { color: '#ef4444', icon: '🧑‍💼', label: 'Suporte',     inputs: 1, outputs: 0, outLabels: [] },
@@ -534,6 +535,9 @@ function flowExtractConnections(node) {
     case 'message':
       push(1, node.next);
       break;
+    case 'input':
+      push(1, node.next);
+      break;
     case 'api_call':
       push(1, node.next);
       push(2, node.on_error);
@@ -632,6 +636,13 @@ function flowRenderProps() {
       <textarea id="fp_text" class="form-control form-control-sm" rows="4">${nd.text || ''}</textarea></div>
       <div class="mb-2"><label class="form-label small fw-semibold">Próximo nó</label>
       <select id="fp_next" class="form-select form-select-sm">${nodeOpts(true)}</select></div>`;
+  } else if (type === 'input') {
+    html += `<div class="mb-2"><label class="form-label small fw-semibold">Pergunta enviada ao usuário</label>
+      <textarea id="fp_prompt" class="form-control form-control-sm" rows="3">${nd.prompt || ''}</textarea></div>
+      <div class="mb-2"><label class="form-label small fw-semibold">Salvar resposta em (store_as)</label>
+      <input id="fp_store_as" class="form-control form-control-sm" value="${nd.store_as || ''}" placeholder="data_desejada"></div>
+      <div class="mb-2"><label class="form-label small fw-semibold">Próximo nó</label>
+      <select id="fp_next" class="form-select form-select-sm">${nodeOpts(true)}</select></div>`;
   } else if (type === 'api_call') {
     html += `<div class="mb-2"><label class="form-label small fw-semibold">Método</label>
       <select id="fp_method" class="form-select form-select-sm">
@@ -722,7 +733,9 @@ function flowRenderProps() {
       <span><code style="background:#fce7f3;color:#9d174d;padding:1px 5px;border-radius:4px">{{relay_device_id}}</code> <span style="color:#6b7280">ID do dispositivo</span></span>
       <span><code style="background:#fce7f3;color:#9d174d;padding:1px 5px;border-radius:4px">{{relay_door_num}}</code> <span style="color:#6b7280">Número do relay</span></span>
       <span><code style="background:#fce7f3;color:#9d174d;padding:1px 5px;border-radius:4px">{{relay_delay}}</code> <span style="color:#6b7280">Delay do relay (s)</span></span>
-      <span><code style="background:#ede9fe;color:#5b21b6;padding:1px 5px;border-radius:4px">{{session.varname}}</code> <span style="color:#6b7280">Variável da sessão (API Call → store_as)</span></span>
+      <span><code style="background:#fce7f3;color:#9d174d;padding:1px 5px;border-radius:4px">{{bianca_url}}</code> <span style="color:#6b7280">URL do app-bianca</span></span>
+      <span><code style="background:#fce7f3;color:#9d174d;padding:1px 5px;border-radius:4px">{{bianca_token}}</code> <span style="color:#6b7280">Token do app-bianca</span></span>
+      <span><code style="background:#ede9fe;color:#5b21b6;padding:1px 5px;border-radius:4px">{{session.varname}}</code> <span style="color:#6b7280">Variável da sessão (API Call → store_as; suporta caminho aninhado ex: session.aluno.nome)</span></span>
     </div>
   </div>`;
   bodyEl.innerHTML = html;
@@ -806,6 +819,10 @@ function flowApplyProps() {
     })).filter((b) => b.id);
   } else if (type === 'message') {
     nd.text = gv('fp_text') || '';
+    nd.next = gv('fp_next') || null;
+  } else if (type === 'input') {
+    nd.prompt = gv('fp_prompt') || '';
+    nd.store_as = gv('fp_store_as') || '';
     nd.next = gv('fp_next') || null;
   } else if (type === 'api_call') {
     nd.method = gv('fp_method') || 'POST';
@@ -909,6 +926,7 @@ function flowAddNode(type) {
     encaminhar: { destination: 'support', message_user: '', message_agent: '' },
     menu:       { body: '', buttons: [{ id: 'btn_1', title: 'Opção 1', next: null }] },
     message:    { text: '' },
+    input:      { prompt: '', store_as: '' },
     api_call:   { method: 'POST', url: '', headers: {}, body: {} },
     condition:  { variable: '', equals: '' },
     transfer:   { message: '' },
@@ -957,6 +975,8 @@ async function onSaveChatbotFlow() {
     } else if (type === 'menu') {
       (nd.buttons || []).forEach((b, i) => { b.next = getTargetId(`output_${i + 1}`); });
     } else if (type === 'message') {
+      nd.next = getTargetId('output_1');
+    } else if (type === 'input') {
       nd.next = getTargetId('output_1');
     } else if (type === 'api_call') {
       nd.next = getTargetId('output_1');
@@ -1024,6 +1044,92 @@ function flowLoadDefault() {
     }
   }
   flowUpdateEntrySelect('start');
+}
+
+function flowLoadBiancaTemplate() {
+  initFlowEditor();
+  if (!flowEditor) return;
+  if (!confirm('Carregar o fluxo de agenda/créditos/cancelamento (app-bianca)? O canvas atual será substituído.')) return;
+  flowEditor.clear();
+  flowSelectedDfId = null;
+
+  const biancaHeaders = { 'X-API-Key': '{{bianca_token}}' };
+
+  const nodes = [
+    { id:'b_identificar', label:'Identificar aluno (bianca)', type:'api_call', method:'GET',
+      url:'{{bianca_url}}/api/v1/aluno/identificar?telefone={{phone}}', headers: biancaHeaders, body:null,
+      store_as:'aluno', next:'b_check_encontrado', on_error:'b_erro_identificar', _pos_x:60, _pos_y:280 },
+    { id:'b_check_encontrado', label:'É aluno cadastrado?', type:'condition',
+      variable:'aluno.encontrado', equals:'true', next_true:'b_menu', next_false:'b_nao_encontrado', _pos_x:360, _pos_y:280 },
+    { id:'b_nao_encontrado', label:'Não é aluno', type:'message',
+      text:'Não encontramos seu cadastro como aluno. Se você acredita que isso é um erro, fale com a secretaria.', next:null, _pos_x:660, _pos_y:460 },
+    { id:'b_erro_identificar', label:'Erro ao identificar', type:'message',
+      text:'❌ Não consegui verificar seu cadastro agora. Tente novamente mais tarde.', next:null, _pos_x:60, _pos_y:460 },
+
+    { id:'b_menu', label:'Menu Aluno (bianca)', type:'menu',
+      body:'Olá, {{session.aluno.nome}}! O que você deseja fazer?',
+      buttons:[
+        { id:'btn_agenda',  title:'📅 Minhas aulas',    next:'b_agenda' },
+        { id:'btn_cancelar',title:'❌ Cancelar aula',   next:'b_cancelar_check' },
+        { id:'btn_creditos',title:'💳 Meus créditos',   next:'b_creditos' },
+      ], _pos_x:660, _pos_y:180 },
+
+    { id:'b_agenda', label:'Buscar agenda', type:'api_call', method:'GET',
+      url:'{{bianca_url}}/api/v1/aluno/agenda?telefone={{phone}}', headers: biancaHeaders, body:null,
+      response_path:'texto', store_as:'agenda_texto', next:'b_mostrar_agenda', on_error:'b_erro_agenda', _pos_x:960, _pos_y:0 },
+    { id:'b_mostrar_agenda', label:'Mostrar agenda', type:'message', text:'{{session.agenda_texto}}', next:null, _pos_x:1260, _pos_y:0 },
+    { id:'b_erro_agenda', label:'Erro agenda', type:'message', text:'❌ Não consegui buscar sua agenda agora. Tente novamente mais tarde.', next:null, _pos_x:1260, _pos_y:100 },
+
+    { id:'b_creditos', label:'Buscar créditos', type:'api_call', method:'GET',
+      url:'{{bianca_url}}/api/v1/aluno/creditos?telefone={{phone}}', headers: biancaHeaders, body:null,
+      response_path:'texto', store_as:'creditos_texto', next:'b_mostrar_creditos', on_error:'b_erro_creditos', _pos_x:960, _pos_y:200 },
+    { id:'b_mostrar_creditos', label:'Mostrar créditos', type:'message', text:'{{session.creditos_texto}}', next:null, _pos_x:1260, _pos_y:200 },
+    { id:'b_erro_creditos', label:'Erro créditos', type:'message', text:'❌ Não consegui consultar seus créditos agora. Tente novamente mais tarde.', next:null, _pos_x:1260, _pos_y:300 },
+
+    { id:'b_cancelar_check', label:'Buscar próxima aula', type:'api_call', method:'GET',
+      url:'{{bianca_url}}/api/v1/aluno/agenda?telefone={{phone}}', headers: biancaHeaders, body:null,
+      store_as:'cancel_agenda', next:'b_cancelar_tem_proxima', on_error:'b_erro_cancelar', _pos_x:960, _pos_y:400 },
+    { id:'b_cancelar_tem_proxima', label:'Tem aula pra cancelar?', type:'condition',
+      variable:'cancel_agenda.tem_proxima', equals:'true', next_true:'b_confirmar_cancelar', next_false:'b_sem_aula_cancelar', _pos_x:1260, _pos_y:400 },
+    { id:'b_sem_aula_cancelar', label:'Sem aula agendada', type:'message',
+      text:'Não encontrei nenhuma aula futura agendada para cancelar.', next:null, _pos_x:1560, _pos_y:500 },
+    { id:'b_confirmar_cancelar', label:'Confirmar cancelamento', type:'menu',
+      body:'Sua próxima aula é: {{session.cancel_agenda.proxima_aula_texto}}\nDeseja cancelar?',
+      buttons:[
+        { id:'btn_confirma_sim', title:'✅ Sim, cancelar', next:'b_executar_cancelamento' },
+        { id:'btn_confirma_nao', title:'❌ Não, voltar',   next:'b_menu' },
+      ], _pos_x:1560, _pos_y:340 },
+    { id:'b_executar_cancelamento', label:'Cancelar aula (bianca)', type:'api_call', method:'POST',
+      url:'{{bianca_url}}/api/v1/aluno/cancelar', headers: biancaHeaders,
+      body:{ telefone:'{{phone}}', aula_id:'{{session.cancel_agenda.proxima_aula_id}}', data_ocorrencia:'{{session.cancel_agenda.proxima_aula_data}}' },
+      store_as:'cancel_result', next:'b_mostrar_resultado_cancelamento', on_error:'b_erro_cancelar', _pos_x:1860, _pos_y:340 },
+    { id:'b_mostrar_resultado_cancelamento', label:'Resultado do cancelamento', type:'message',
+      text:'{{session.cancel_result.message}}', next:null, _pos_x:2160, _pos_y:340 },
+    { id:'b_erro_cancelar', label:'Erro ao cancelar', type:'message',
+      text:'❌ Não consegui processar o cancelamento agora. Tente novamente mais tarde ou fale com a secretaria.', next:null, _pos_x:1860, _pos_y:460 },
+
+    { id:'b_suporte', label:'Encaminhar suporte', type:'transfer',
+      message:'👨‍💼 Vou conectar você com nossa equipe. Aguarde um momento.', _pos_x:660, _pos_y:20 },
+  ];
+  // Botão "🆘 Atendente" do menu — adicionado após o array para reaproveitar o mesmo padrão de push() usado nos demais
+  nodes[4].buttons.push({ id:'btn_atendente', title:'🆘 Atendente', next:'b_suporte' });
+
+  const dfIdMap = {};
+  for (const node of nodes) {
+    const numOut = flowNodeOutputCount(node);
+    const meta = FLOW_NODE_META[node.type] || FLOW_NODE_META.message;
+    const dfId = flowEditor.addNode(node.type, meta.inputs, numOut, node._pos_x, node._pos_y, node.type, { ...node }, flowNodeHtml(node.type, node.label));
+    dfIdMap[node.id] = dfId;
+  }
+  for (const node of nodes) {
+    const srcDf = dfIdMap[node.id];
+    if (!srcDf) continue;
+    for (const { outIdx, targetId } of flowExtractConnections(node)) {
+      const dstDf = dfIdMap[targetId];
+      if (dstDf) try { flowEditor.addConnection(srcDf, dstDf, `output_${outIdx}`, 'input_1'); } catch {}
+    }
+  }
+  flowUpdateEntrySelect('b_identificar');
 }
 
 // ── Live Monitor ──────────────────────────────────────────────────────────
@@ -1639,15 +1745,29 @@ function simHighlightNode(logicalId) {
   }
 }
 
+function simSessionValue(key) {
+  let val = simState?.data;
+  for (const part of key.split('.')) {
+    if (val === null || val === undefined) return undefined;
+    val = val[part];
+  }
+  return val;
+}
+
 function simResolve(text) {
   if (!simState) return String(text || '');
   return String(text || '').replace(/\{\{(\w[\w.]*)\}\}/g, (_, key) => {
-    if (key.startsWith('session.')) return String(simState.data?.[key.slice(8)] ?? `[${key}]`);
+    if (key.startsWith('session.')) {
+      const val = simSessionValue(key.slice(8));
+      return val === undefined ? `[${key}]` : String(val);
+    }
     const m = {
       person_name: simState.person_name,
       phone: simState.phone,
       porteiro_url: simState.cfg?.porteiro_url || '[porteiro_url]',
       porteiro_token: '***',
+      bianca_url: simState.cfg?.bianca_url || '[bianca_url]',
+      bianca_token: '***',
       relay_device_id: String(simState.cfg?.relay_device_id || '1'),
       relay_door_num: String(simState.cfg?.relay_door_num || '1'),
       relay_delay: String(simState.cfg?.relay_delay || '5'),
@@ -1738,6 +1858,7 @@ function flowSimExec(nodeId) {
   if (t === 'identify')  return simExecIdentify(node);
   if (t === 'menu')      return simExecMenu(node);
   if (t === 'message')   return simExecMessage(node);
+  if (t === 'input')     return simExecInput(node);
   if (t === 'api_call')  return simExecApiCall(node);
   if (t === 'condition') return simExecCondition(node);
   if (t === 'transfer')  return simExecTransfer(node);
@@ -1779,6 +1900,27 @@ function simExecMessage(node) {
   simBubble(text.replace(/\n/g, '<br>'), 'bot');
   if (node.next) setTimeout(() => flowSimExec(node.next), 600);
   else simEnd('Conversa encerrada');
+}
+
+function simExecInput(node) {
+  const text = simResolve(node.prompt || '');
+  simBubble(text.replace(/\n/g, '<br>'), 'bot');
+  simSetInput(`<div class="d-flex gap-2"><input id="sim-text-input" class="form-control form-control-sm" placeholder="Digite a resposta..." onkeydown="if(event.key==='Enter')simSendTextInput()"><button class="btn btn-sm btn-primary" onclick="simSendTextInput()">➤</button></div>`);
+  simState._inputNode = node;
+  setTimeout(() => document.getElementById('sim-text-input')?.focus(), 50);
+}
+
+function simSendTextInput() {
+  const node = simState?._inputNode;
+  if (!node) return;
+  const el = document.getElementById('sim-text-input');
+  const val = (el?.value || '').trim();
+  if (!val) return;
+  simState._inputNode = null;
+  simBubble(val, 'user');
+  if (node.store_as) simState.data[node.store_as] = val;
+  simSetInput('');
+  setTimeout(() => flowSimExec(node.next), 300);
 }
 
 async function simExecApiCall(node) {
@@ -1864,7 +2006,7 @@ function simPrettyJson(val) {
 }
 
 function simExecCondition(node) {
-  const val = String(simState.data[node.variable] ?? '');
+  const val = String(simSessionValue(node.variable || '') ?? '');
   const eq = String(node.equals ?? '');
   const result = val === eq;
   simBubble(`❓ <code>${node.variable}</code> = <code>${val || '[não definido]'}</code> === <code>${eq}</code> → <b>${result ? 'VERDADEIRO ✅' : 'FALSO ❌'}</b>`, 'sys');
@@ -2045,6 +2187,8 @@ function fillSettings(settings) {
     setCheckbox('chatbot_enabled', settings.chatbot.enabled);
     setValue('chatbot_porteiro_url', settings.chatbot.porteiro_url);
     setSecret('chatbot_porteiro_token', settings.chatbot.porteiro_token);
+    setValue('chatbot_bianca_url', settings.chatbot.bianca_url);
+    setSecret('chatbot_bianca_token', settings.chatbot.bianca_token);
     setValue('chatbot_unknown_message', settings.chatbot.unknown_message);
     setValue('chatbot_session_ttl_min', settings.chatbot.session_ttl_min);
     setValue('chatbot_relay_device_id', settings.chatbot.relay_device_id);
@@ -3023,6 +3167,8 @@ async function onSaveChatbot() {
       enabled: getCheckbox('chatbot_enabled'),
       porteiro_url: getValue('chatbot_porteiro_url'),
       porteiro_token: getValue('chatbot_porteiro_token'),
+      bianca_url: getValue('chatbot_bianca_url'),
+      bianca_token: getValue('chatbot_bianca_token'),
       unknown_message: getValue('chatbot_unknown_message'),
       session_ttl_min: Number(getValue('chatbot_session_ttl_min') || 5),
       relay_device_id: getValue('chatbot_relay_device_id'),
