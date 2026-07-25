@@ -27,7 +27,7 @@ recordings/temp_videos/
 # Claude Code local config
 .claude/
 CLAUDE.md
-scripts/
+scripts/*
 !scripts/deploy-prd.sh
 *.code-workspace
 
