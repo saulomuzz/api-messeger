@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    container_name: api-messeger
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - SQLITE_PATH=/app/data/app.sqlite
+      - WHATSAPP_ACCESS_TOKEN=${WHATSAPP_ACCESS_TOKEN}
+      - WHATSAPP_PHONE_NUMBER_ID=${WHATSAPP_PHONE_NUMBER_ID}
+      - WHATSAPP_WEBHOOK_VERIFY_TOKEN=${WHATSAPP_WEBHOOK_VERIFY_TOKEN}
+      - ADMIN_USERNAME=${ADMIN_USERNAME}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - API_TOKEN=${API_TOKEN}
+      - ABUSEIPDB_API_KEY=${ABUSEIPDB_API_KEY:-}
+      - DEV_MODE_ENABLED=${DEV_MODE_ENABLED:-false}
+      - DEV_TEST_PHONE=${DEV_TEST_PHONE:-}
+    volumes:
+      - messeger_data:/app/data
+
+volumes:
+  messeger_data:
