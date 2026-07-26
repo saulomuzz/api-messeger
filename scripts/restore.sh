@@ -6,6 +6,7 @@
 # apos restaurar. Use isso ao trazer um backup de producao para popular
 # um ambiente de dev - nunca use ao restaurar em producao de verdade.
 set -eu
+umask 077
 
 PROJECT_DIR=${PROJECT_DIR:-/opt/api-messeger}
 ENV_FILE=${ENV_FILE:-.env}
