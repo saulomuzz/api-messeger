@@ -36,3 +36,4 @@ scripts/*
 .hive-mind/
 graphify-out/
 ruvector.db
+backups/
