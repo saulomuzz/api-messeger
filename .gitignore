@@ -28,6 +28,9 @@ recordings/temp_videos/
 CLAUDE.md
 scripts/*
 !scripts/deploy-prd.sh
+!scripts/backup.sh
+!scripts/restore.sh
+!scripts/sanitize.sql
 *.code-workspace
 
 # Ferramentas de orquestracao local (ruflo/claude-flow/graphify) - cache/estado
